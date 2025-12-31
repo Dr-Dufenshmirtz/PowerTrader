@@ -8,6 +8,7 @@ import os
 import sys
 import warnings
 import subprocess
+import time
 
 # Set to True to enable debug logging to launcher_debug.log
 DEBUG = False
@@ -27,6 +28,50 @@ warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 # Ensure we're in the correct directory
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
+
+# Single instance check
+def check_single_instance():
+    """Ensure only one instance of PowerTraderAI is running."""
+    lock_file = os.path.join(script_dir, ".powertrader.lock")
+    
+    # Check if lock file exists and is recent
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, 'r') as f:
+                pid = int(f.read().strip())
+            
+            # Check if process is still running (Windows-compatible)
+            import psutil
+            if psutil.pid_exists(pid):
+                try:
+                    process = psutil.Process(pid)
+                    # Check if it's actually a Python process
+                    if 'python' in process.name().lower():
+                        log_debug(f"Another instance already running (PID: {pid})")
+                        return False
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # Stale lock file - remove it
+            log_debug(f"Removing stale lock file (PID: {pid})")
+            os.remove(lock_file)
+        except Exception as e:
+            log_debug(f"Error checking lock file: {e}")
+            # Remove potentially corrupted lock file
+            try:
+                os.remove(lock_file)
+            except:
+                pass
+    
+    # Create new lock file with our PID
+    try:
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+        log_debug(f"Created lock file with PID: {os.getpid()}")
+        return True
+    except Exception as e:
+        log_debug(f"Failed to create lock file: {e}")
+        return True  # Allow to proceed even if lock file creation fails
 
 # Check if required packages are installed, install if needed
 def check_and_install_requirements():
@@ -241,6 +286,20 @@ def check_and_install_requirements():
 
 # Check requirements before importing pt_hub
 try:
+    # First check if another instance is running
+    if not check_single_instance():
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "PowerTraderAI Already Running",
+            "Another instance of PowerTraderAI is already running.\n\n"
+            "Please close the existing instance before starting a new one."
+        )
+        root.destroy()
+        sys.exit(0)
+    
     check_and_install_requirements()
 except Exception as e:
     import traceback
@@ -260,6 +319,7 @@ except Exception as e:
     sys.exit(1)
 
 if __name__ == "__main__":
+    lock_file = os.path.join(script_dir, ".powertrader.lock")
     try:
         app = pt_hub.PowerTraderHub()
         app.mainloop()
@@ -269,3 +329,11 @@ if __name__ == "__main__":
         traceback.print_exc()
         input("Press Enter to exit...")
         sys.exit(1)
+    finally:
+        # Clean up lock file on exit
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+                log_debug("Removed lock file on exit")
+        except Exception as e:
+            log_debug(f"Failed to remove lock file: {e}")

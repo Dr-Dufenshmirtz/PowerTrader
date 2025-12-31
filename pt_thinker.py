@@ -61,6 +61,14 @@ import hmac
 import json
 import uuid
 import logging
+import signal
+from contextlib import contextmanager
+
+# Ensure clean console output (avoid encoding issues)
+try:
+	sys.stdout.reconfigure(encoding='utf-8')
+except:
+	pass
 
 # third-party
 import requests
@@ -212,7 +220,70 @@ _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
+	"debug_mode": False,
 }
+
+def _is_debug_mode() -> bool:
+	"""Check if debug mode is enabled in gui_settings.json"""
+	try:
+		if not os.path.isfile(_GUI_SETTINGS_PATH):
+			return _gui_settings_cache["debug_mode"]
+		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+		debug = data.get("debug_mode", False)
+		_gui_settings_cache["debug_mode"] = bool(debug)
+		return bool(debug)
+	except Exception:
+		return _gui_settings_cache["debug_mode"]
+
+def debug_print(msg: str):
+	"""Print debug message only if debug mode is enabled"""
+	if _is_debug_mode():
+		print(msg)
+
+class NetworkTimeoutError(Exception):
+	"""Raised when a network call times out"""
+	pass
+
+@contextmanager
+def network_timeout(seconds: int, operation: str):
+	"""Context manager to timeout network operations"""
+	def timeout_handler(signum, frame):
+		raise NetworkTimeoutError(f"{operation} timed out after {seconds} seconds")
+	
+	# Windows doesn't support SIGALRM, so we'll use a different approach
+	if sys.platform == 'win32':
+		import threading
+		timer = None
+		try:
+			timer = threading.Timer(seconds, lambda: (_ for _ in ()).throw(NetworkTimeoutError(f"{operation} timed out after {seconds} seconds")))
+			timer.start()
+			yield
+		finally:
+			if timer:
+				timer.cancel()
+	else:
+		old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+		signal.alarm(seconds)
+		try:
+			yield
+		finally:
+			signal.alarm(0)
+			signal.signal(signal.SIGALRM, old_handler)
+
+def handle_network_error(operation: str, error: Exception):
+	"""Print network error and suggest enabling debug mode"""
+	print(f"\n{'='*60}")
+	print(f"NETWORK ERROR: {operation} failed")
+	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
+	print(f"")
+	print(f"The process will exit. Please check:")
+	print(f"  1. Your internet connection")
+	print(f"  2. API service status (KuCoin/Robinhood)")
+	print(f"  3. Enable debug_mode in gui_settings.json for more details")
+	print(f"{'='*60}\n")
+	time.sleep(3)
+	sys.exit(1)
 
 def _load_gui_coins() -> list:
 	"""
@@ -237,6 +308,10 @@ def _load_gui_coins() -> list:
 		coins = [str(c).strip().upper() for c in coins if str(c).strip()]
 		if not coins:
 			coins = list(_gui_settings_cache["coins"])
+
+		# Remove any non-alphanumeric characters (including hidden Unicode)
+		coins = [''.join(ch for ch in coin if ch.isalnum()) for coin in coins]
+		coins = [c for c in coins if c]  # Remove any empty strings
 
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
@@ -526,6 +601,7 @@ def find_purple_area(lines):
         return (purple_bottom, purple_top)
     return (None, None)
 def step_coin(sym: str):
+	debug_print(f"[DEBUG] {sym}: step_coin() called")
 	# run inside the coin folder so all existing file reads/writes stay relative + isolated
 	os.chdir(coin_folder(sym))
 	coin = sym + '-USDT'
@@ -598,6 +674,9 @@ def step_coin(sym: str):
 	last_difference_between = 0.0
 
 	# ====== ORIGINAL: fetch current candle for this timeframe index ======
+	debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]}...")
+	kucoin_retry_count = 0
+	kucoin_max_retries = 5
 	while True:
 		history_list = []
 		while True:
@@ -605,6 +684,10 @@ def step_coin(sym: str):
 				history = str(market.get_kline(coin, tf_choices[tf_choice_index])).replace(']]', '], ').replace('[[', '[')
 				break
 			except Exception as e:
+				kucoin_retry_count += 1
+				debug_print(f"[DEBUG] {sym}: KuCoin API error - {type(e).__name__}: {str(e)[:100]} - retrying in 3.5s...")
+				if kucoin_retry_count >= kucoin_max_retries:
+					handle_network_error(f"KuCoin market data fetch for {sym} ({tf_choices[tf_choice_index]})", e)
 				time.sleep(3.5)
 				if 'Requests' in str(e):
 					pass
@@ -626,8 +709,10 @@ def step_coin(sym: str):
 			continue
 
 	current_candle = 100 * ((closePrice - openPrice) / openPrice)
+	debug_print(f"[DEBUG] {sym}: Market data fetched successfully. Current candle: {current_candle:.4f}%")
 
 	# ====== ORIGINAL: load threshold + memories/weights and compute moves ======
+	debug_print(f"[DEBUG] {sym}: Loading neural training files...")
 	file = open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt', 'r')
 	perfect_threshold = float(file.read())
 	file.close()
@@ -665,6 +750,7 @@ def step_coin(sym: str):
 		high_moves = []
 		low_moves = []
 
+		debug_print(f"[DEBUG] {sym}: Processing {len(memory_list)} memory patterns...")
 		while True:
 			memory_pattern = memory_list[mem_ind].split('{}')[0].replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
 			check_dex = 0
@@ -773,6 +859,7 @@ def step_coin(sym: str):
 	tf_choice_index += 1
 
 	if tf_choice_index >= len(tf_choices):
+		debug_print(f"[DEBUG] {sym}: Full timeframe cycle complete. Generating messages...")
 		tf_choice_index = 0
 
 		# reset tf_update for this coin (but DO NOT block-wait; just detect updates and return)
@@ -780,11 +867,19 @@ def step_coin(sym: str):
 
 		# get current price ONCE per coin — use Robinhood's current ASK (same as rhcb trader buy price)
 		rh_symbol = f"{sym}-USD"
+		debug_print(f"[DEBUG] {sym}: Fetching current price from Robinhood for {rh_symbol}...")
+		retry_count = 0
+		max_retries = 5
 		while True:
 			try:
 				current = robinhood_current_ask(rh_symbol)
+				debug_print(f"[DEBUG] {sym}: Current price: ${current:.2f}")
 				break
-			except Exception:
+			except Exception as e:
+				retry_count += 1
+				debug_print(f"[DEBUG] {sym}: Robinhood API error (attempt {retry_count}/{max_retries}): {type(e).__name__}: {str(e)[:100]}")
+				if retry_count >= max_retries:
+					handle_network_error(f"Robinhood price fetch for {sym}", e)
 				time.sleep(1)
 				continue
 
@@ -1014,7 +1109,7 @@ def step_coin(sym: str):
 		# cache display text for this coin (main loop prints everything on one screen)
 		try:
 			display_cache[sym] = (
-				sym + '  ' + str(current) + '\n\n' +
+				sym + '  ' + str(current) + '\n' +
 				str(messages).replace("', '", "\n")
 			)
 
@@ -1142,10 +1237,18 @@ try:
 		# clear + re-print one combined screen (so you don't see old output above new)
 		os.system('cls' if os.name == 'nt' else 'clear')
 
+		# Print all coins' display output (use cached display from step_coin which includes symbol header)
 		for _sym in CURRENT_COINS:
-			print(display_cache.get(_sym, _sym + "  (no data yet)"))
-			print("\n" + ("-" * 60) + "\n")
-
+			print()  # Add spacing before each coin section
+			output = display_cache.get(_sym, _sym + "  (no data yet)")
+			# Strip BOM, zero-width spaces, and other invisible Unicode
+			output = output.replace('\ufeff', '').replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+			# Convert to ASCII only
+			output = output.encode('ascii', 'ignore').decode('ascii')
+			# Remove any remaining control characters except newline and tab
+			output = ''.join(ch for ch in output if ch.isprintable() or ch in '\n\t')
+			print(output)
+		
 		# small sleep so you don't peg CPU when running many coins
 		time.sleep(0.15)
 

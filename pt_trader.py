@@ -39,6 +39,12 @@ import base64
 import traceback
 from typing import Any, Dict, Optional
 
+# Ensure clean console output
+try:
+	sys.stdout.reconfigure(encoding='utf-8')
+except:
+	pass
+
 # third-party
 import requests
 from nacl.signing import SigningKey
@@ -52,6 +58,45 @@ from cryptography.hazmat.primitives import serialization
 # -----------------------------
 HUB_DATA_DIR = os.environ.get("POWERTRADER_HUB_DIR", os.path.join(os.path.dirname(__file__), "hub_data"))
 os.makedirs(HUB_DATA_DIR, exist_ok=True)
+
+# -----------------------------
+# DEBUG MODE SUPPORT
+# -----------------------------
+_GUI_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
+_debug_mode_cache = {"enabled": False}
+
+def _is_debug_mode() -> bool:
+	"""Check if debug mode is enabled in gui_settings.json"""
+	try:
+		if not os.path.isfile(_GUI_SETTINGS_PATH):
+			return _debug_mode_cache["enabled"]
+		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+		debug = data.get("debug_mode", False)
+		_debug_mode_cache["enabled"] = bool(debug)
+		return bool(debug)
+	except Exception:
+		return _debug_mode_cache["enabled"]
+
+def debug_print(msg: str):
+	"""Print debug message only if debug mode is enabled"""
+	if _is_debug_mode():
+		print(msg)
+
+def handle_network_error(operation: str, error: Exception):
+	"""Print network error and suggest enabling debug mode"""
+	print(f"\n{'='*60}")
+	print(f"NETWORK ERROR: {operation} failed")
+	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
+	print(f"")
+	print(f"The process will exit. Please check:")
+	print(f"  1. Your internet connection")
+	print(f"  2. API service status (Robinhood)")
+	print(f"  3. IP whitelist settings for Robinhood API")
+	print(f"  4. Enable debug_mode in gui_settings.json for more details")
+	print(f"{'='*60}\n")
+	time.sleep(3)
+	sys.exit(1)
 
 TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
 TRADE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "trade_history.jsonl")
@@ -663,23 +708,48 @@ class CryptoAPITrading:
         headers = self.get_authorization_header(method, path, body, timestamp)
         url = self.base_url + path
 
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, json=json.loads(body), timeout=10)
-
-            response.raise_for_status()
-            return response.json()
-        except requests.HTTPError as http_err:
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
             try:
-                # Parse and return the JSON error response
-                error_response = response.json()
-                return error_response  # Return the JSON error for further handling
-            except Exception:
-                return None
-        except Exception:
-            return None
+                if method == "GET":
+                    response = requests.get(url, headers=headers, timeout=15)
+                elif method == "POST":
+                    response = requests.post(url, headers=headers, json=json.loads(body), timeout=15)
+
+                response.raise_for_status()
+                return response.json()
+            except requests.HTTPError as http_err:
+                try:
+                    # Parse and return the JSON error response
+                    error_response = response.json()
+                    # Check if it's an auth/IP error that won't recover with retries
+                    if response.status_code in [401, 403]:
+                        return error_response
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        handle_network_error(f"Robinhood API {method} {path}", http_err)
+                    time.sleep(2)
+                except Exception:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        handle_network_error(f"Robinhood API {method} {path}", http_err)
+                    time.sleep(2)
+            except requests.Timeout as timeout_err:
+                retry_count += 1
+                debug_print(f"[DEBUG] TRADER: API timeout (attempt {retry_count}/{max_retries}): {path}")
+                if retry_count >= max_retries:
+                    handle_network_error(f"Robinhood API {method} {path} (timeout)", timeout_err)
+                time.sleep(2)
+            except Exception as e:
+                retry_count += 1
+                debug_print(f"[DEBUG] TRADER: API error (attempt {retry_count}/{max_retries}): {type(e).__name__}")
+                if retry_count >= max_retries:
+                    handle_network_error(f"Robinhood API {method} {path}", e)
+                time.sleep(2)
+        
+        return None
 
     def get_authorization_header(
             self, method: str, path: str, body: str, timestamp: int
@@ -827,6 +897,7 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        debug_print(f"[DEBUG] TRADER: Placing BUY order for {symbol}: ${amount_in_usd:.2f} USD")
         # Fetch the current price of the asset
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
         current_price = current_buy_prices[symbol]
@@ -902,6 +973,7 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        debug_print(f"[DEBUG] TRADER: Placing SELL order for {symbol}: {asset_quantity:.8f} units @ ${expected_price:.2f}" if expected_price else f"[DEBUG] TRADER: Placing SELL order for {symbol}: {asset_quantity:.8f} units")
         body = {
             "client_order_id": client_order_id,
             "side": side,
@@ -932,6 +1004,7 @@ class CryptoAPITrading:
         return response
 
     def manage_trades(self):
+        debug_print("[DEBUG] TRADER: Starting trade management cycle...")
         trades_made = False  # Flag to track if any trade was made in this iteration
 
         # Hot-reload coins list + paths from GUI settings while running
@@ -942,16 +1015,19 @@ class CryptoAPITrading:
             pass
 
         # Fetch account details
+        debug_print("[DEBUG] TRADER: Fetching account details...")
         account = self.get_account()
         # Fetch holdings
+        debug_print("[DEBUG] TRADER: Fetching current holdings...")
         holdings = self.get_holdings()
         # Fetch trading pairs
+        debug_print("[DEBUG] TRADER: Fetching trading pairs...")
         trading_pairs = self.get_trading_pairs()
 
         # Use the stored cost_basis instead of recalculating
         cost_basis = self.cost_basis
         # Fetch current prices
-        symbols = [holding["asset_code"] + "-USD" for holding in holdings.get("results", [])]
+        symbols = [holding["asset_code"] + "-USD" for holding in holdings.get("results", [])] if holdings else []
 
         # ALSO fetch prices for tracked coins even if not currently held (so GUI can show bid/ask lines)
         for s in crypto_symbols:
@@ -1032,7 +1108,8 @@ class CryptoAPITrading:
             }
 
         os.system('cls' if os.name == 'nt' else 'clear')
-        print("\n--- Account Summary ---")
+        print()
+        print("--- Account Summary ---")
         print(f"Total Account Value: ${total_account_value:.2f}")
         print(f"Holdings Value: ${holdings_sell_value:.2f}")
         print(f"Percent In Trade: {in_use:.2f}%")
@@ -1040,7 +1117,8 @@ class CryptoAPITrading:
             f"Trailing PM: start +{self.pm_start_pct_no_dca:.2f}% (no DCA) / +{self.pm_start_pct_with_dca:.2f}% (with DCA) "
             f"| gap {self.trailing_gap_pct:.2f}%"
         )
-        print("\n--- Current Trades ---")
+        print()
+        print("--- Current Trades ---")
 
         positions = {}
         for holding in holdings.get("results", []):

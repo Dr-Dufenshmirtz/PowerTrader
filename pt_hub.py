@@ -37,6 +37,7 @@ import subprocess
 import shutil
 import glob
 import bisect
+import psutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import tkinter as tk
@@ -1703,6 +1704,9 @@ class PowerTraderHub(tk.Tk):
         
         # Auto-start variable for menu checkbutton
         self.auto_start_var = tk.BooleanVar()
+        
+        # Debug mode variable for menu checkbutton
+        self.debug_mode_var = tk.BooleanVar()
 
         # Debounce map for panedwindow clamp operations
         self._paned_clamp_after_ids: Dict[str, str] = {}
@@ -1775,6 +1779,9 @@ class PowerTraderHub(tk.Tk):
         
         # Set auto-start variable after settings are loaded
         self.auto_start_var.set(bool(self.settings.get("auto_start_scripts", False)))
+        
+        # Set debug mode variable after settings are loaded
+        self.debug_mode_var.set(bool(self.settings.get("debug_mode", False)))
 
         # Refresh charts immediately when a timeframe is changed (don't wait for the 10s throttle).
         self.bind_all("<<TimeframeChanged>>", self._on_timeframe_changed)
@@ -2125,10 +2132,17 @@ class PowerTraderHub(tk.Tk):
             fg=DARK_FG,
             activebackground=DARK_SELECT_BG,
             activeforeground=DARK_SELECT_FG,
+            selectcolor=DARK_FG,
         )
         m_settings.add_command(label="Hub Settings...", command=self.open_settings_dialog)
         m_settings.add_command(label="Trading Settings...", command=self.open_trading_settings_dialog)
         m_settings.add_command(label="Training Settings...", command=self.open_training_settings_dialog)
+        m_settings.add_separator()
+        m_settings.add_checkbutton(
+            label="Debug Mode",
+            command=self.toggle_debug_mode,
+            variable=self.debug_mode_var
+        )
         menubar.add_cascade(label="Settings", menu=m_settings)
 
         m_file = tk.Menu(
@@ -2664,6 +2678,23 @@ class PowerTraderHub(tk.Tk):
         self.trainer_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
         trainer_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(0, 6))
 
+        # Auto-scroll to bottom when switching to a live output tab
+        def on_tab_selected(event):
+            try:
+                selected_tab = self.logs_nb.select()
+                selected_index = self.logs_nb.index(selected_tab)
+                # 0=Runner, 1=Trader, 2=Trainers
+                if selected_index == 0:
+                    self.runner_text.after(50, lambda: self.runner_text.yview_moveto(1.0))
+                elif selected_index == 1:
+                    self.trader_text.after(50, lambda: self.trader_text.yview_moveto(1.0))
+                elif selected_index == 2:
+                    self.trainer_text.after(50, lambda: self.trainer_text.yview_moveto(1.0))
+            except Exception:
+                pass
+        
+        self.logs_nb.bind("<<NotebookTabChanged>>", on_tab_selected)
+
         # Add left panes (no trades/history on the left anymore)
         # Default should match the screenshot: more room for Controls/Health + Neural Levels.
         left_split.add(top_controls, weight=1)
@@ -3166,17 +3197,59 @@ class PowerTraderHub(tk.Tk):
                         break
                     time.sleep(0.05)
                     continue
-                q.put(f"{prefix}{line.rstrip()}")
+                # Strip line and filter out any non-ASCII characters
+                line = line.rstrip()
+                # Remove BOM and invisible Unicode characters
+                line = line.replace('\ufeff', '').replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+                try:
+                    line = line.encode('ascii', 'ignore').decode('ascii')
+                    # Remove any control characters except printable + newline/tab
+                    line = ''.join(ch for ch in line if ch.isprintable() or ch in '\n\t')
+                except:
+                    pass
+                q.put(f"{prefix}{line}")
         except Exception:
             pass
         finally:
             q.put(f"{prefix}[process exited]")
+
+    def _is_process_already_running(self, script_name: str) -> bool:
+        """Check if a process with the given script name is already running"""
+        try:
+            current_pid = os.getpid()
+            script_basename = os.path.basename(script_name)
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # Skip the current process
+                    if proc.info['pid'] == current_pid:
+                        continue
+                    
+                    # Check if it's a Python process
+                    if proc.info['name'] and 'python' in proc.info['name'].lower():
+                        cmdline = proc.info.get('cmdline')
+                        if cmdline and any(script_basename in arg for arg in cmdline):
+                            return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except Exception:
+            pass
+        return False
 
     def _start_process(self, p: ProcInfo, log_q: Optional["queue.Queue[str]"] = None, prefix: str = "") -> None:
         if p.proc and p.proc.poll() is None:
             return
         if not os.path.isfile(p.path):
             messagebox.showerror("Missing script", f"Cannot find: {p.path}")
+            return
+
+        # Check if process is already running
+        if self._is_process_already_running(p.path):
+            messagebox.showwarning(
+                "Already Running",
+                f"{p.name} is already running in another instance.\n\n"
+                f"Please close the other instance before starting a new one."
+            )
             return
 
         env = os.environ.copy()
@@ -3246,6 +3319,20 @@ class PowerTraderHub(tk.Tk):
             _safe_write_json(SETTINGS_FILE, self.settings)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save auto-start setting:\n{e}")
+    
+    def toggle_debug_mode(self) -> None:
+        """Toggle debug mode setting and save to gui_settings.json."""
+        self.settings["debug_mode"] = bool(self.debug_mode_var.get())
+        try:
+            _safe_write_json(SETTINGS_FILE, self.settings)
+            status = "enabled" if self.debug_mode_var.get() else "disabled"
+            messagebox.showinfo(
+                "Debug Mode", 
+                f"Debug mode {status}.\n\n"
+                f"Restart running processes (Runner/Trader/Trainer) to apply changes."
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save debug mode setting:\n{e}")
 
     def _read_runner_ready(self) -> Dict[str, Any]:
         try:

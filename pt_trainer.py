@@ -42,12 +42,56 @@ import json
 import uuid
 import logging
 
+# Ensure clean console output
+try:
+	sys.stdout.reconfigure(encoding='utf-8')
+except:
+	pass
+
 # third-party
 import psutil
 from kucoin.client import Market
 
 # instantiate KuCoin market client (kept at top-level like original)
 market = Market(url='https://api.kucoin.com')
+
+# -----------------------------
+# DEBUG MODE SUPPORT
+# -----------------------------
+_GUI_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
+_debug_mode_cache = {"enabled": False}
+
+def _is_debug_mode() -> bool:
+	"""Check if debug mode is enabled in gui_settings.json"""
+	try:
+		if not os.path.isfile(_GUI_SETTINGS_PATH):
+			return _debug_mode_cache["enabled"]
+		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+		debug = data.get("debug_mode", False)
+		_debug_mode_cache["enabled"] = bool(debug)
+		return bool(debug)
+	except Exception:
+		return _debug_mode_cache["enabled"]
+
+def debug_print(msg: str):
+	"""Print debug message only if debug mode is enabled"""
+	if _is_debug_mode():
+		print(msg)
+
+def handle_network_error(operation: str, error: Exception):
+	"""Print network error and suggest enabling debug mode"""
+	print(f"\n{'='*60}")
+	print(f"NETWORK ERROR: {operation} failed")
+	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
+	print(f"")
+	print(f"The process will exit. Please check:")
+	print(f"  1. Your internet connection")
+	print(f"  2. KuCoin API service status")
+	print(f"  3. Enable debug_mode in gui_settings.json for more details")
+	print(f"{'='*60}\n")
+	time.sleep(3)
+	sys.exit(1)
 
 """
 <------------
@@ -311,6 +355,7 @@ the_big_index = 0
 # designed to be long-running and guarded by small I/O checkpoints so
 # external 'killer' files, status files, or restarts can be coordinated.
 while True:
+	# tf_choice is set inside the loop, so we'll add debug at the point where it's known
 	list_len = 0
 	restarting = 'no'
 	in_trade = 'no'
@@ -391,6 +436,7 @@ while True:
 	upordown4_4 = []
 	upordown5 = []
 	tf_choice = tf_choices[the_big_index]
+	debug_print(f"[DEBUG] TRAINER: Starting training cycle for {_arg_coin} on timeframe {tf_choice}...")
 	_mem = load_memory(tf_choice)
 	memory_list = _mem["memory_list"]
 	weight_list = _mem["weight_list"]
@@ -443,11 +489,19 @@ while True:
 	end_time = int(start_time-((1500*timeframe_minutes)*60))
 	perc_comp = format((len(history_list2)/how_far_to_look_back)*100,'.2f')
 	last_perc_comp = perc_comp+'kjfjakjdakd'
+	kucoin_retry_count = 0
+	kucoin_max_retries = 5
 	while True:
 		time.sleep(.5)
 		try:
+			debug_print(f"[DEBUG] TRAINER: Fetching historical data from KuCoin...")
 			history = str(market.get_kline(coin_choice,timeframe,startAt=end_time,endAt=start_time)).replace(']]','], ').replace('[[','[').split('], [')
+			kucoin_retry_count = 0  # Reset on success
 		except Exception as e:
+			kucoin_retry_count += 1
+			debug_print(f"[DEBUG] TRAINER: KuCoin error (attempt {kucoin_retry_count}/{kucoin_max_retries})")
+			if kucoin_retry_count >= kucoin_max_retries:
+				handle_network_error(f"KuCoin historical data fetch for {_arg_coin}", e)
 			PrintException()
 			time.sleep(3.5)
 			continue
@@ -463,8 +517,7 @@ while True:
 		print('gathering history')
 		current_change = len(history_list)-list_len
 		try:
-			print('\n\n\n\n')
-			print(current_change)
+			print('\n' + str(current_change))
 			if current_change < 1000:
 				break
 			else:
@@ -480,7 +533,6 @@ while True:
 		print(last_start_time)
 		print(start_time)
 		print(end_time)
-		print('\n')
 		if start_time <= last_start_time:
 			break
 		else:
@@ -825,8 +877,7 @@ while True:
 			perfect = []
 			while True:
 				try:
-					print('\n\n\n\n')
-					print(choice_index)
+					print(f'\n{choice_index}')
 					print(restarted_yet)
 					print(tf_list[restarted_yet])
 					try:
