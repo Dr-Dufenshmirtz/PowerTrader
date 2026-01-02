@@ -1,6 +1,9 @@
 # PowerTrader_AI
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
 
+**Version:** Enhanced Edition (2025)  
+**Features:** Debug mode, simulation mode, configurable themes, enhanced error handling, and comprehensive settings system.
+
 "It's an instance-based (kNN/kernel-style) predictor with online per-instance reliability weighting, used as a multi-timeframe trading signal." - ChatGPT on the type of AI used in this trading bot.
 
 So what exactly does that mean?
@@ -160,6 +163,75 @@ Changes to settings files take effect immediately for the trading bot (hot-reloa
 
 ---
 
+## Advanced Features
+
+### Debug Mode
+Enable detailed logging to troubleshoot issues or understand the bot's decision-making process:
+1. Open **Settings → Hub Settings**
+2. Enable **Debug Mode** checkbox
+3. Save settings
+
+Debug mode provides:
+- Detailed market data fetch logs
+- Pattern matching diagnostics
+- Training file validation messages
+- API call timing and retry information
+- State persistence confirmation
+
+All debug output appears in the Live Output tabs (Runner/Trader/Trainers) and does not clutter production logs when disabled.
+
+### Simulation Mode
+Test trading strategies without risking real money:
+1. Open **Settings → Trading Settings**
+2. Enable **Simulation Mode** checkbox
+3. Save settings
+
+Simulation mode:
+- Tags all trades with "SIM_" prefix
+- Excludes simulated trades from PnL calculations
+- Shows "SIMULATION" indicator in the Hub
+- Allows testing strategies with real market data
+- Can run alongside real trading (separate coins recommended)
+
+**Important:** Simulation mode still requires valid API credentials but will not execute real trades.
+
+### Theme Customization
+Customize the Hub's appearance:
+1. Edit `theme_settings.json` in your PowerTraderAI folder
+2. Modify colors for backgrounds, text, charts, and buttons
+3. Reload the Hub to apply changes
+
+Default themes included:
+- **Cyber** (default dark theme with green/cyan accents)
+- **Midnight** (blue-tinted dark theme)
+
+Create your own theme by copying and modifying the color values in `theme_settings.json`.
+
+### Enhanced Error Handling
+The Enhanced Edition includes robust error recovery:
+- **Circuit Breaker Pattern**: Prevents cascading failures when API is down
+- **Automatic Retry Logic**: Network requests retry with exponential backoff
+- **Training File Validation**: Detects and skips corrupted training data
+- **Graceful Degradation**: System continues operating even when individual components fail
+
+### Training Freshness Gates
+The system now enforces training freshness to prevent trading with outdated predictions:
+- Trainer writes timestamp when training starts
+- Hub and Runner check training age before allowing trades
+- Visual indicators show which coins need retraining
+- Configurable staleness threshold (default: 14 days)
+
+If a coin shows "NOT TRAINED / OUTDATED", run training before starting the bot.
+
+### Hot-Reload Configuration
+All configuration changes take effect without restarting:
+- Trading parameters update immediately
+- Coin list changes are detected on-the-fly
+- Theme updates apply after Hub reload
+- Debug mode toggles instantly
+
+---
+
 ## Adding more coins (later)
 
 1. Open **Settings → Hub Settings**
@@ -170,6 +242,42 @@ Changes to settings files take effect immediately for the trading bot (hot-reloa
 
 ---
 
+## Technical Improvements (Enhanced Edition)
+
+This version includes numerous stability and reliability improvements over the original:
+
+### Crash Prevention & Data Validation
+- **Zero-division protection** in all mathematical operations
+- **Training file validation** with format checking and bounds verification
+- **Weight list synchronization** to prevent index errors
+- **Empty data guards** to handle missing or incomplete data gracefully
+- **Corrupt data detection** with automatic skip and continue logic
+
+### Performance Enhancements
+- **Thread-safe directory switching** prevents cross-coin data contamination
+- **Memory caching** reduces redundant file I/O operations
+- **Configurable sleep timings** to balance performance vs API rate limits
+- **Chart downsampling** to 250 points max for smooth rendering
+- **Debounced UI updates** to prevent excessive redraws
+
+### Network Resilience
+- **Robinhood API retry logic** (5 attempts with exponential backoff)
+- **KuCoin fallback system** (client library → REST API)
+- **Circuit breaker pattern** to prevent cascading failures
+- **Invalid symbol cleanup** to handle malformed coin names
+- **Connection timeout handling** with automatic recovery
+
+### Code Quality
+- **Module docstrings** with repository and author information
+- **Type hints** for better IDE support and error detection
+- **Function documentation** explaining behavior and parameters
+- **DRY principle** applied with helper functions
+- **Consistent error handling** using specific exceptions
+
+All improvements maintain 100% backward compatibility with the original trading logic and produce identical results while providing enhanced reliability and maintainability.
+
+---
+
 ## Donate
 
 PowerTraderAI is COMPLETELY free and open source! If you want to support the project:
@@ -177,6 +285,13 @@ PowerTraderAI is COMPLETELY free and open source! If you want to support the pro
 - Cash App: **$garagesteve**
 - PayPal: **@garagesteve**
 - Patreon: **patreon.com/MakingMadeEasy**
+
+---
+
+## Contributors
+
+- **Stephen Hughes (garagesteve1155)** - Original author and maintainer
+- **Dr-Dufenshmirtz** - Enhanced Edition improvements
 
 ---
 

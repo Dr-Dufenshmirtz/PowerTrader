@@ -64,6 +64,7 @@ os.makedirs(HUB_DATA_DIR, exist_ok=True)
 # -----------------------------
 _GUI_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
 _debug_mode_cache = {"enabled": False}
+_simulation_mode_cache = {"enabled": False}
 
 def _is_debug_mode() -> bool:
 	"""Check if debug mode is enabled in gui_settings.json"""
@@ -78,25 +79,81 @@ def _is_debug_mode() -> bool:
 	except Exception:
 		return _debug_mode_cache["enabled"]
 
+def _is_simulation_mode() -> bool:
+	"""Check if simulation mode is enabled in gui_settings.json"""
+	try:
+		if not os.path.isfile(_GUI_SETTINGS_PATH):
+			return _simulation_mode_cache["enabled"]
+		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+		sim = data.get("simulation_mode", False)
+		_simulation_mode_cache["enabled"] = bool(sim)
+		return bool(sim)
+	except Exception:
+		return _simulation_mode_cache["enabled"]
+
+# Circuit breaker for network errors - prevents process exit on transient API failures
+_circuit_breaker = {
+	"is_open": False,
+	"consecutive_errors": 0,
+	"last_error_time": None,
+	"max_errors_before_open": 3,
+	"cooldown_seconds": 60
+}
+
 def debug_print(msg: str):
 	"""Print debug message only if debug mode is enabled"""
 	if _is_debug_mode():
 		print(msg)
 
+def sim_prefix() -> str:
+	"""Return [SIM] prefix if simulation mode is enabled"""
+	return "[SIM] " if _is_simulation_mode() else ""
+
 def handle_network_error(operation: str, error: Exception):
-	"""Print network error and suggest enabling debug mode"""
+	"""Set circuit breaker state instead of exiting on network errors"""
+	_circuit_breaker["consecutive_errors"] += 1
+	_circuit_breaker["last_error_time"] = time.time()
+	
 	print(f"\n{'='*60}")
-	print(f"NETWORK ERROR: {operation} failed")
+	print(f"NETWORK ERROR #{_circuit_breaker['consecutive_errors']}: {operation} failed")
 	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
+	
+	if _circuit_breaker["consecutive_errors"] >= _circuit_breaker["max_errors_before_open"]:
+		if not _circuit_breaker["is_open"]:
+			_circuit_breaker["is_open"] = True
+			print(f"")
+			print(f"CIRCUIT BREAKER ACTIVATED (after {_circuit_breaker['consecutive_errors']} consecutive errors)")
+			print(f"Trading PAUSED for {_circuit_breaker['cooldown_seconds']}s, but monitoring continues.")
+			print(f"Will auto-recover when API connectivity restored.")
+		else:
+			print(f"Circuit breaker still OPEN, trading paused.")
+	else:
+		print(f"Retrying... ({_circuit_breaker['max_errors_before_open'] - _circuit_breaker['consecutive_errors']} attempts left before circuit opens)")
+	
 	print(f"")
-	print(f"The process will exit. Please check:")
+	print(f"Please check:")
 	print(f"  1. Your internet connection")
 	print(f"  2. API service status (Robinhood)")
 	print(f"  3. IP whitelist settings for Robinhood API")
 	print(f"  4. Enable debug_mode in gui_settings.json for more details")
 	print(f"{'='*60}\n")
-	time.sleep(3)
-	sys.exit(1)
+	
+	debug_print(f"[DEBUG] TRADER: Circuit breaker state: {_circuit_breaker}")
+
+def reset_circuit_breaker():
+	"""Reset circuit breaker after successful API calls"""
+	if _circuit_breaker["is_open"] or _circuit_breaker["consecutive_errors"] > 0:
+		was_open = _circuit_breaker["is_open"]
+		_circuit_breaker["is_open"] = False
+		_circuit_breaker["consecutive_errors"] = 0
+		_circuit_breaker["last_error_time"] = None
+		if was_open:
+			print(f"\n{'='*60}")
+			print(f"CIRCUIT BREAKER CLOSED - API connectivity restored")
+			print(f"Resuming normal trading operations.")
+			print(f"{'='*60}\n")
+		debug_print(f"[DEBUG] TRADER: Circuit breaker reset after successful API call")
 
 TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
 TRADE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "trade_history.jsonl")
@@ -361,6 +418,9 @@ class CryptoAPITrading:
         self._dca_last_sell_ts = {}   # { "BTC": ts_of_last_sell }
         self._seed_dca_window_from_history()
 
+        # Track which DCA stages triggered in current iteration to prevent double-triggers
+        self._dca_triggered_this_cycle = {}  # { "BTC": set([0, 1, ...]) }
+
     def _atomic_write_json(self, path: str, data: dict) -> None:
         try:
             tmp = f"{path}.tmp"
@@ -412,10 +472,13 @@ class CryptoAPITrading:
         """
         ts = time.time()
         realized = None
+        is_simulation = (tag and "SIM_" in str(tag))
+        
         # Compute realized PnL for sells when we have both price and avg cost.
+        # Skip PnL accumulation for simulated trades to prevent fake profits
         # Guarded in a try/except to avoid one bad record from crashing the
         # trading process; failures here simply skip PnL aggregation.
-        if side.lower() == "sell" and price is not None and avg_cost_basis is not None:
+        if side.lower() == "sell" and price is not None and avg_cost_basis is not None and not is_simulation:
             try:
                 realized = (float(price) - float(avg_cost_basis)) * float(qty)
                 self._pnl_ledger["total_realized_profit_usd"] = float(self._pnl_ledger.get("total_realized_profit_usd", 0.0)) + float(realized)
@@ -558,10 +621,10 @@ class CryptoAPITrading:
             out = []
             seen = set()
             for v in vals:
-                k = round(float(v), 12)
-                if k in seen:
+                rounded_price = round(float(v), 12)
+                if rounded_price in seen:
                     continue
-                seen.add(k)
+                seen.add(rounded_price)
                 out.append(float(v))
             out.sort(reverse=True)
             return out
@@ -603,10 +666,10 @@ class CryptoAPITrading:
             out = []
             seen = set()
             for v in vals:
-                k = round(float(v), 12)
-                if k in seen:
+                rounded_price = round(float(v), 12)
+                if rounded_price in seen:
                     continue
-                seen.add(k)
+                seen.add(rounded_price)
                 out.append(float(v))
             out.sort()  # ascending order
             return out
@@ -619,6 +682,9 @@ class CryptoAPITrading:
         Initializes the DCA levels_triggered dictionary based on the number of buy orders
         that have occurred after the first buy order following the most recent sell order
         for each cryptocurrency.
+        
+        Preserves DCA state when no relevant orders found instead of resetting.
+        Only resets to [] if we confirm there's actually no holding (position fully closed).
         """
         holdings = self.get_holdings()
         if not holdings or "results" not in holdings:
@@ -627,12 +693,23 @@ class CryptoAPITrading:
 
         for holding in holdings.get("results", []):
             symbol = holding["asset_code"]
+            
+            # Check if we actually have a position before modifying DCA state
+            try:
+                holding_qty = float(holding.get("total_quantity", 0))
+            except (ValueError, TypeError):
+                holding_qty = 0.0
+            
+            debug_print(f"[DEBUG] TRADER: Initialize DCA for {symbol}, holding_qty={holding_qty}")
 
             full_symbol = f"{symbol}-USD"
             orders = self.get_orders(full_symbol)
 
             if not orders or "results" not in orders:
-                print(f"No orders found for {full_symbol}. Skipping.")
+                debug_print(f"[DEBUG] TRADER: No orders found for {full_symbol}, preserving DCA state")
+                # Preserve existing state if no orders data available
+                if symbol not in self.dca_levels_triggered:
+                    self.dca_levels_triggered[symbol] = []
                 continue
 
             # Filter for filled buy and sell orders
@@ -642,7 +719,10 @@ class CryptoAPITrading:
             ]
 
             if not filled_orders:
-                print(f"No filled buy or sell orders for {full_symbol}. Skipping.")
+                debug_print(f"[DEBUG] TRADER: No filled orders for {full_symbol}, preserving DCA state")
+                # Preserve existing state if no filled orders
+                if symbol not in self.dca_levels_triggered:
+                    self.dca_levels_triggered[symbol] = []
                 continue
 
             # Sort orders by creation time in ascending order (oldest first)
@@ -663,10 +743,17 @@ class CryptoAPITrading:
                     if order["side"] == "buy" and order["created_at"] > most_recent_sell_time
                 ]
                 if not relevant_buy_orders:
-                    print(f"No buy orders after the most recent sell for {full_symbol}.")
-                    self.dca_levels_triggered[symbol] = []
+                    # Only reset if we have no holding (position closed after sell)
+                    if holding_qty <= 0.0:
+                        debug_print(f"[DEBUG] TRADER: No holding for {symbol}, resetting DCA to []")
+                        self.dca_levels_triggered[symbol] = []
+                    else:
+                        debug_print(f"[DEBUG] TRADER: Have holding {holding_qty} but no buy orders after sell, preserving DCA state for {symbol}")
+                        # Preserve existing state - might be mid-transaction or data sync issue
+                        if symbol not in self.dca_levels_triggered:
+                            self.dca_levels_triggered[symbol] = []
                     continue
-                print(f"Most recent sell for {full_symbol} at {most_recent_sell_time}.")
+                debug_print(f"[DEBUG] TRADER: Most recent sell for {full_symbol} at {most_recent_sell_time}")
             else:
                 # If no sell orders, consider all buy orders
                 relevant_buy_orders = [
@@ -674,10 +761,16 @@ class CryptoAPITrading:
                     if order["side"] == "buy"
                 ]
                 if not relevant_buy_orders:
-                    print(f"No buy orders for {full_symbol}. Skipping.")
-                    self.dca_levels_triggered[symbol] = []
+                    # Only reset if we have no holding
+                    if holding_qty <= 0.0:
+                        debug_print(f"[DEBUG] TRADER: No holding and no buy orders for {symbol}, resetting DCA to []")
+                        self.dca_levels_triggered[symbol] = []
+                    else:
+                        debug_print(f"[DEBUG] TRADER: Have holding {holding_qty} but no buy orders found, preserving DCA state for {symbol}")
+                        if symbol not in self.dca_levels_triggered:
+                            self.dca_levels_triggered[symbol] = []
                     continue
-                print(f"No sell orders found for {full_symbol}. Considering all buy orders.")
+                debug_print(f"[DEBUG] TRADER: No sell orders found for {full_symbol}. Considering all buy orders.")
 
             # Ensure buy orders are sorted by creation time ascending
             relevant_buy_orders.sort(key=lambda x: x["created_at"])
@@ -697,6 +790,7 @@ class CryptoAPITrading:
             # Track DCA by stage index (0, 1, 2, ...) rather than % values.
             # This makes neural-vs-hardcoded clean, and allows repeating the -50% stage indefinitely.
             self.dca_levels_triggered[symbol] = list(range(triggered_levels_count))
+            debug_print(f"[DEBUG] TRADER: Initialized DCA stages for {symbol}: {triggered_levels_count} (holding_qty={holding_qty})")
             print(f"Initialized DCA stages for {symbol}: {triggered_levels_count}")
 
     def _seed_dca_window_from_history(self) -> None:
@@ -713,18 +807,32 @@ class CryptoAPITrading:
         self._dca_last_sell_ts = {}
 
         if not os.path.isfile(TRADE_HISTORY_PATH):
+            debug_print("[DEBUG] TRADER: No trade history file found for DCA window seeding")
             return
+
+        # Track validation stats for logging
+        total_lines = 0
+        skipped_empty = 0
+        skipped_invalid_json = 0
+        skipped_missing_fields = 0
+        skipped_invalid_timestamp = 0
+        processed_sells = 0
+        processed_dca_buys = 0
 
         try:
             with open(TRADE_HISTORY_PATH, "r", encoding="utf-8") as f:
                 for line in f:
+                    total_lines += 1
                     line = (line or "").strip()
                     if not line:
+                        skipped_empty += 1
                         continue
 
                     try:
                         obj = json.loads(line)
-                    except Exception:
+                    except Exception as e:
+                        skipped_invalid_json += 1
+                        debug_print(f"[DEBUG] TRADER: Invalid JSON in trade history line {total_lines}: {e}")
                         continue
 
                     ts = obj.get("ts", None)
@@ -733,23 +841,48 @@ class CryptoAPITrading:
                     sym_full = str(obj.get("symbol", "")).upper().strip()
                     base = sym_full.split("-")[0].strip() if sym_full else ""
                     if not base:
+                        skipped_missing_fields += 1
+                        debug_print(f"[DEBUG] TRADER: Missing symbol in trade history line {total_lines}")
                         continue
 
                     try:
                         ts_f = float(ts)
                     except Exception:
+                        skipped_invalid_timestamp += 1
+                        debug_print(f"[DEBUG] TRADER: Invalid timestamp in trade history line {total_lines}: {ts}")
                         continue
 
                     if side == "sell":
                         prev = float(self._dca_last_sell_ts.get(base, 0.0) or 0.0)
                         if ts_f > prev:
                             self._dca_last_sell_ts[base] = ts_f
+                            processed_sells += 1
 
                     elif side == "buy" and tag == "DCA":
                         self._dca_buy_ts.setdefault(base, []).append(ts_f)
+                        processed_dca_buys += 1
 
-        except Exception:
+        except Exception as e:
+            print(f"WARNING: Error reading trade history file: {e}")
+            debug_print(f"[DEBUG] TRADER: Trade history read error: {e}")
             return
+
+        # Log validation summary
+        debug_print(f"[DEBUG] TRADER: DCA window seeding complete:")
+        debug_print(f"  Total lines: {total_lines}")
+        debug_print(f"  Processed: {processed_dca_buys} DCA buys, {processed_sells} sells")
+        skipped_total = skipped_empty + skipped_invalid_json + skipped_missing_fields + skipped_invalid_timestamp
+        if skipped_total > 0:
+            print(f"WARNING: Skipped {skipped_total} invalid entries in trade history:")
+            if skipped_empty > 0:
+                debug_print(f"  - {skipped_empty} empty lines")
+            if skipped_invalid_json > 0:
+                print(f"  - {skipped_invalid_json} invalid JSON entries")
+                debug_print(f"    (Check trade_history.jsonl for corruption)")
+            if skipped_missing_fields > 0:
+                print(f"  - {skipped_missing_fields} entries with missing fields")
+            if skipped_invalid_timestamp > 0:
+                print(f"  - {skipped_invalid_timestamp} entries with invalid timestamps")
 
         # Keep only DCA buys after the last sell (current trade) and within rolling 24h
         for base, ts_list in list(self._dca_buy_ts.items()):
@@ -896,17 +1029,19 @@ class CryptoAPITrading:
             if not orders or "results" not in orders:
                 continue
 
-            # Get all filled buy orders, sorted from most recent to oldest
+            # Get all filled buy orders, sorted oldest to newest for proper LIFO reconstruction
             buy_orders = [
                 order for order in orders["results"]
                 if order["side"] == "buy" and order["state"] == "filled"
             ]
-            buy_orders.sort(key=lambda x: x["created_at"], reverse=True)
+            buy_orders.sort(key=lambda x: x["created_at"])
 
             remaining_quantity = current_quantities[asset_code]
             total_cost = 0.0
 
-            for order in buy_orders:
+            # Work backwards from newest orders since we need the most recent buys
+            # to match the current holdings (LIFO for reconstruction)
+            for order in reversed(buy_orders):
                 for execution in order.get("executions", []):
                     quantity = float(execution["quantity"])
                     price = float(execution["effective_price"])
@@ -931,6 +1066,85 @@ class CryptoAPITrading:
                 cost_basis[asset_code] = 0.0
 
         return cost_basis
+
+    def recalculate_single_cost_basis(self, symbol: str) -> Optional[float]:
+        """
+        Recalculate cost basis for a single symbol immediately after a trade.
+        Returns the new cost basis or None if calculation fails.
+        
+        This method allows immediate cost basis updates after each trade,
+        ensuring DCA and trailing PM calculations always use current values.
+        """
+        try:
+            asset_code = symbol.replace("-USD", "").strip()
+            debug_print(f"[DEBUG] TRADER: Recalculating cost basis for {asset_code}...")
+            
+            holdings = self.get_holdings()
+            if not holdings or "results" not in holdings:
+                debug_print(f"[DEBUG] TRADER: No holdings found for {asset_code}")
+                return None
+
+            # Find current quantity for this asset
+            current_quantity = 0.0
+            for holding in holdings.get("results", []):
+                if holding["asset_code"] == asset_code:
+                    current_quantity = float(holding["total_quantity"])
+                    break
+
+            if current_quantity <= 0:
+                # No longer holding this asset
+                if asset_code in self.cost_basis:
+                    del self.cost_basis[asset_code]
+                debug_print(f"[DEBUG] TRADER: Removed cost basis for {asset_code} (position closed)")
+                return None
+
+            # Get recent buy orders
+            orders = self.get_orders(symbol)
+            if not orders or "results" not in orders:
+                debug_print(f"[DEBUG] TRADER: No orders found for {symbol}")
+                return None
+
+            buy_orders = [
+                order for order in orders["results"]
+                if order["side"] == "buy" and order["state"] == "filled"
+            ]
+            # Sort oldest to newest for proper FIFO accounting
+            buy_orders.sort(key=lambda x: x["created_at"])
+
+            remaining_quantity = current_quantity
+            total_cost = 0.0
+
+            # Work backwards from newest orders since we need the most recent buys
+            # to match the current holdings (LIFO for reconstruction)
+            for order in reversed(buy_orders):
+                for execution in order.get("executions", []):
+                    quantity = float(execution["quantity"])
+                    price = float(execution["effective_price"])
+
+                    if remaining_quantity <= 0:
+                        break
+
+                    if quantity > remaining_quantity:
+                        total_cost += remaining_quantity * price
+                        remaining_quantity = 0
+                    else:
+                        total_cost += quantity * price
+                        remaining_quantity -= quantity
+
+                if remaining_quantity <= 0:
+                    break
+
+            if current_quantity > 0:
+                new_basis = total_cost / current_quantity
+                self.cost_basis[asset_code] = new_basis
+                debug_print(f"[DEBUG] TRADER: Updated cost basis for {asset_code}: ${new_basis:.2f}")
+                return new_basis
+            else:
+                return None
+
+        except Exception as e:
+            debug_print(f"[DEBUG] TRADER: Failed to recalculate cost basis for {symbol}: {e}")
+            return None
 
     def get_price(self, symbols: list) -> Dict[str, float]:
         buy_prices = {}
@@ -993,11 +1207,50 @@ class CryptoAPITrading:
         current_price = current_buy_prices[symbol]
         asset_quantity = amount_in_usd / current_price
 
+        # Simulation mode: skip actual trade execution
+        if _is_simulation_mode():
+            rounded_quantity = round(asset_quantity, 8)
+            fake_response = {
+                "id": f"sim_{uuid.uuid4()}",
+                "state": "filled",
+                "side": "buy",
+                "symbol": symbol
+            }
+            self._record_trade(
+                side="buy",
+                symbol=symbol,
+                qty=float(rounded_quantity),
+                price=float(current_price),
+                avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                tag=f"SIM_{tag}" if tag else "SIM_BUY",
+                order_id=fake_response["id"],
+            )
+            debug_print(f"[DEBUG] TRADER: [SIM] Buy order simulated, updating cost basis...")
+            time.sleep(2)
+            self.recalculate_single_cost_basis(symbol)
+            return fake_response
+
         max_retries = 5
         retries = 0
 
         while retries < max_retries:
             retries += 1
+            
+            # Refresh price if we've retried more than 2 times to avoid stale prices
+            if retries > 2:
+                debug_print(f"[DEBUG] TRADER: Retry {retries} - refreshing price for {symbol}")
+                try:
+                    fresh_buy_prices, fresh_sell_prices, fresh_valid = self.get_price([symbol])
+                    if symbol in fresh_buy_prices and fresh_buy_prices[symbol] > 0:
+                        current_price = fresh_buy_prices[symbol]
+                        asset_quantity = amount_in_usd / current_price
+                        debug_print(f"[DEBUG] TRADER: Updated price to ${current_price:.2f}, quantity to {asset_quantity:.8f}")
+                    else:
+                        debug_print(f"[DEBUG] TRADER: Failed to refresh price, using previous: ${current_price:.2f}")
+                except Exception as e:
+                    debug_print(f"[DEBUG] TRADER: Price refresh error: {e}")
+            
             try:
                 # Default precision to 8 decimals initially
                 rounded_quantity = round(asset_quantity, 8)
@@ -1030,6 +1283,10 @@ class CryptoAPITrading:
                         tag=tag,
                         order_id=order_id,
                     )
+                    # Immediately recalculate cost basis after successful buy
+                    debug_print(f"[DEBUG] TRADER: Buy order successful, updating cost basis...")
+                    time.sleep(2)  # Brief delay for order to fully settle
+                    self.recalculate_single_cost_basis(symbol)
                     return response  # Successfully placed order
 
             except Exception as e:
@@ -1064,6 +1321,30 @@ class CryptoAPITrading:
         tag: Optional[str] = None,
     ) -> Any:
         debug_print(f"[DEBUG] TRADER: Placing SELL order for {symbol}: {asset_quantity:.8f} units @ ${expected_price:.2f}" if expected_price else f"[DEBUG] TRADER: Placing SELL order for {symbol}: {asset_quantity:.8f} units")
+        
+        # Simulation mode: skip actual trade execution
+        if _is_simulation_mode():
+            fake_response = {
+                "id": f"sim_{uuid.uuid4()}",
+                "state": "filled",
+                "side": "sell",
+                "symbol": symbol
+            }
+            self._record_trade(
+                side="sell",
+                symbol=symbol,
+                qty=float(asset_quantity),
+                price=float(expected_price) if expected_price is not None else None,
+                avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                tag=f"SIM_{tag}" if tag else "SIM_SELL",
+                order_id=fake_response["id"],
+            )
+            debug_print(f"[DEBUG] TRADER: [SIM] Sell order simulated, updating cost basis...")
+            time.sleep(2)
+            self.recalculate_single_cost_basis(symbol)
+            return fake_response
+        
         body = {
             "client_order_id": client_order_id,
             "side": side,
@@ -1090,12 +1371,32 @@ class CryptoAPITrading:
                 tag=tag,
                 order_id=order_id,
             )
+            # Immediately recalculate cost basis after successful sell
+            debug_print(f"[DEBUG] TRADER: Sell order successful, updating cost basis...")
+            time.sleep(2)  # Brief delay for order to fully settle
+            self.recalculate_single_cost_basis(symbol)
 
         return response
 
     def manage_trades(self):
         debug_print("[DEBUG] TRADER: Starting trade management cycle...")
+        
+        # Check circuit breaker - skip trading but continue monitoring during network issues
+        if _circuit_breaker["is_open"]:
+            # Check if cooldown period has passed
+            if _circuit_breaker["last_error_time"]:
+                elapsed = time.time() - _circuit_breaker["last_error_time"]
+                if elapsed < _circuit_breaker["cooldown_seconds"]:
+                    debug_print(f"[DEBUG] TRADER: Circuit breaker open, skipping trade cycle ({int(_circuit_breaker['cooldown_seconds'] - elapsed)}s remaining)")
+                    return
+                else:
+                    debug_print(f"[DEBUG] TRADER: Circuit breaker cooldown expired, attempting to resume trading...")
+        
         trades_made = False  # Flag to track if any trade was made in this iteration
+
+        # Clear cycle-level DCA tracking at start of each iteration
+        self._dca_triggered_this_cycle = {}
+        debug_print("[DEBUG] TRADER: Cleared DCA cycle tracking for new iteration")
 
         # Hot-reload coins list + paths from GUI settings while running
         try:
@@ -1107,6 +1408,11 @@ class CryptoAPITrading:
         # Fetch account details
         debug_print("[DEBUG] TRADER: Fetching account details...")
         account = self.get_account()
+        
+        # Reset circuit breaker after successful API call
+        if account:
+            reset_circuit_breaker()
+        
         # Fetch holdings
         debug_print("[DEBUG] TRADER: Fetching current holdings...")
         holdings = self.get_holdings()
@@ -1223,6 +1529,31 @@ class CryptoAPITrading:
             current_sell_price = current_sell_prices.get(full_symbol, 0)
             avg_cost_basis = cost_basis.get(symbol, 0)
 
+            # Validate prices before any calculations to prevent division errors
+            if current_buy_price <= 0 or current_sell_price <= 0:
+                print(f"  WARNING: Invalid prices for {symbol} (buy: ${current_buy_price}, sell: ${current_sell_price}). Skipping trading decisions.")
+                debug_print(f"[DEBUG] TRADER: Skipping {symbol} - invalid prices detected")
+                # Still add to positions dict with zeros so GUI shows the holding exists
+                positions[symbol] = {
+                    "quantity": quantity,
+                    "avg_cost_basis": avg_cost_basis,
+                    "current_buy_price": 0.0,
+                    "current_sell_price": 0.0,
+                    "gain_loss_pct_buy": 0.0,
+                    "gain_loss_pct_sell": 0.0,
+                    "value_usd": 0.0,
+                    "dca_triggered_stages": len(self.dca_levels_triggered.get(symbol, [])),
+                    "next_dca_display": "Price unavailable",
+                    "dca_line_price": 0.0,
+                    "dca_line_source": "N/A",
+                    "dca_line_pct": 0.0,
+                    "trail_active": False,
+                    "trail_line": 0.0,
+                    "trail_peak": 0.0,
+                    "dist_to_trail_pct": 0.0,
+                }
+                continue  # Skip all trading logic for this symbol
+
             if avg_cost_basis > 0:
                 gain_loss_percentage_buy = ((current_buy_price - avg_cost_basis) / avg_cost_basis) * 100
                 gain_loss_percentage_sell = ((current_sell_price - avg_cost_basis) / avg_cost_basis) * 100
@@ -1278,13 +1609,28 @@ class CryptoAPITrading:
                     if len(neural_levels) >= neural_level_needed_disp:
                         neural_line_price = float(neural_levels[neural_level_needed_disp - 1])
                     
-                    # Sanity check: only use neural price if it's realistic (within 50% of current price)
+                    # Sanity check - only use neural price if it's realistic (within 15% of current price)
+                    # Tightened from 50% to 15% to catch corrupted data earlier
                     # Protects against corrupted data or missing files causing bad triggers
                     if neural_line_price > 0 and current_buy_price > 0:
                         price_deviation = abs(neural_line_price - current_buy_price) / current_buy_price
-                        if price_deviation > 0.5:
+                        if price_deviation > 0.15:  # Reject neural prices that deviate more than 15%
                             # Neural price is wildly off - ignore it and fall back to hardcoded
+                            debug_print(
+                                f"[DEBUG] TRADER: Rejecting neural DCA level N{neural_level_needed_disp} for {symbol}. "
+                                f"Price ${neural_line_price:.2f} deviates {price_deviation*100:.1f}% from current ${current_buy_price:.2f} (max 15%)"
+                            )
                             neural_line_price = 0.0
+
+                    # Only use neural if it's more conservative than hardcoded
+                    # For longs (DCAing down), "more conservative" means higher price (triggers later)
+                    # This prevents neural from triggering DCA too aggressively
+                    if neural_line_price > 0 and neural_line_price < hard_line_price:
+                        debug_print(
+                            f"[DEBUG] TRADER: Rejecting neural DCA level N{neural_level_needed_disp} for {symbol}. "
+                            f"Neural ${neural_line_price:.2f} is more aggressive than hardcoded ${hard_line_price:.2f}"
+                        )
+                        neural_line_price = 0.0
 
                     # Whichever is higher will be hit first as price drops
                     if neural_line_price > dca_line_price:
@@ -1426,36 +1772,78 @@ class CryptoAPITrading:
                     if new_line > state["line"]:
                         state["line"] = new_line
 
+                    # Validate PM line is above cost basis before executing sell
+                    # This protects against any race condition or stale cost basis data
+                    if state["line"] < avg_cost_basis:
+                        print(
+                            f"  WARNING: PM line {state['line']:.8f} is below cost basis {avg_cost_basis:.8f} for {symbol}. "
+                            f"Resetting to base PM line to prevent selling at loss."
+                        )
+                        debug_print(
+                            f"[DEBUG] TRADER: PM floor violation detected for {symbol}, "
+                            f"line={state['line']:.8f}, cost_basis={avg_cost_basis:.8f}, resetting line"
+                        )
+                        state["line"] = base_pm_line
+                        state["active"] = False  # Deactivate trailing to force recalibration
+                        state["was_above"] = False
+
                     # Forced sell on cross from ABOVE -> BELOW trailing line
                     if state["was_above"] and (current_sell_price < state["line"]):
-                        print(
-                            f"  Trailing PM hit for {symbol}. "
-                            f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
-                        )
-                        response = self.place_sell_order(
-                            str(uuid.uuid4()),
-                            "sell",
-                            "market",
-                            full_symbol,
-                            quantity,
-                            expected_price=current_sell_price,
-                            avg_cost_basis=avg_cost_basis,
-                            pnl_pct=gain_loss_percentage_sell,
-                            tag="TRAIL_SELL",
-                        )
+                        # Final validation before sell - ensure we're actually in profit
+                        expected_pnl_pct = ((current_sell_price - avg_cost_basis) / avg_cost_basis) * 100.0 if avg_cost_basis > 0 else 0.0
+                        
+                        if expected_pnl_pct < 0:
+                            print(
+                                f"  WARNING: Trailing PM would sell {symbol} at LOSS ({expected_pnl_pct:.2f}%). "
+                                f"Price={current_sell_price:.8f}, Cost={avg_cost_basis:.8f}. BLOCKING SELL."
+                            )
+                            debug_print(
+                                f"[DEBUG] TRADER: Blocked trailing sell at loss for {symbol}, "
+                                f"expected_pnl={expected_pnl_pct:.2f}%"
+                            )
+                            # Reset state to prevent repeated blocks
+                            state["active"] = False
+                            state["was_above"] = False
+                        else:
+                            print(
+                                f"{sim_prefix()}  Trailing PM hit for {symbol}. "
+                                f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}. "
+                                f"Expected PnL: {expected_pnl_pct:.2f}%"
+                            )
+                            debug_print(f"[DEBUG] TRADER: Executing trailing PM sell for {symbol}, expected_pnl={expected_pnl_pct:.2f}%")
+                            response = self.place_sell_order(
+                                str(uuid.uuid4()),
+                                "sell",
+                                "market",
+                                full_symbol,
+                                quantity,
+                                expected_price=current_sell_price,
+                                avg_cost_basis=avg_cost_basis,
+                                pnl_pct=gain_loss_percentage_sell,
+                                tag="TRAIL_SELL",
+                            )
 
-                        trades_made = True
-                        self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
+                            # Check if sell succeeded before clearing state
+                            if response and isinstance(response, dict) and "errors" not in response:
+                                trades_made = True
+                                self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
 
-                        # Trade ended -> reset rolling 24h DCA window for this coin
-                        self._reset_dca_window_for_trade(symbol, sold=True)
+                                # Trade ended -> reset rolling 24h DCA window for this coin
+                                self._reset_dca_window_for_trade(symbol, sold=True)
 
-                        print(f"  Successfully sold {quantity} {symbol}.")
-                        trading_cfg = _load_trading_config()
-                        post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 5)
-                        time.sleep(post_delay)
-                        holdings = self.get_holdings()
-                        continue
+                                print(f"{sim_prefix()}  Successfully sold {quantity} {symbol}.")
+                                debug_print(f"[DEBUG] TRADER: Trailing PM sell successful for {symbol}")
+                                trading_cfg = _load_trading_config()
+                                post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 5)
+                                time.sleep(post_delay)
+                                holdings = self.get_holdings()
+                                continue
+                            else:
+                                # Sell failed - reset was_above to prevent repeated attempts
+                                print(f"  WARNING: Trailing sell order failed for {symbol}. Resetting state to prevent re-trigger.")
+                                debug_print(f"[DEBUG] TRADER: Trailing PM sell failed for {symbol}, response: {response}")
+                                state["was_above"] = False
+                                # Don't continue - allow normal state update below to proceed
 
                 # Save this tick’s position relative to the line (needed for “above -> below” detection)
                 state["was_above"] = above_now
@@ -1486,6 +1874,13 @@ class CryptoAPITrading:
                 neural_hit = (gain_loss_percentage_buy < 0) and (neural_level_now >= neural_level_needed)
 
             if hard_hit or neural_hit:
+                # Check if this DCA stage already triggered this cycle
+                if symbol in self._dca_triggered_this_cycle:
+                    if current_stage in self._dca_triggered_this_cycle[symbol]:
+                        print(f"  Skipping DCA for {symbol} stage {current_stage + 1} - already triggered this cycle.")
+                        debug_print(f"[DEBUG] TRADER: DCA stage {current_stage + 1} already triggered for {symbol} this cycle")
+                        continue  # Skip to avoid double-triggering
+
                 if neural_hit and hard_hit:
                     reason = f"NEURAL L{neural_level_now}>=L{neural_level_needed} OR HARD {hard_level:.2f}%"
                 elif neural_hit:
@@ -1493,7 +1888,8 @@ class CryptoAPITrading:
                 else:
                     reason = f"HARD {hard_level:.2f}%"
 
-                print(f"  DCAing {symbol} (stage {current_stage + 1}) via {reason}.")
+                print(f"{sim_prefix()}  DCAing {symbol} (stage {current_stage + 1}) via {reason}.")
+                debug_print(f"[DEBUG] TRADER: Attempting DCA stage {current_stage + 1} for {symbol} via {reason}")
 
                 print(f"  Current Value: ${value:.2f}")
                 trading_cfg = _load_trading_config()
@@ -1526,6 +1922,10 @@ class CryptoAPITrading:
                         # record that we completed THIS stage (no matter what triggered it)
                         self.dca_levels_triggered.setdefault(symbol, []).append(current_stage)
 
+                        # Mark this stage as triggered in current cycle
+                        self._dca_triggered_this_cycle.setdefault(symbol, set()).add(current_stage)
+                        debug_print(f"[DEBUG] TRADER: Marked DCA stage {current_stage + 1} as triggered for {symbol} this cycle")
+
                         # Only record a DCA buy timestamp on success (so skips never advance anything)
                         self._note_dca_buy(symbol)
 
@@ -1534,9 +1934,9 @@ class CryptoAPITrading:
                         self.trailing_pm.pop(symbol, None)
 
                         trades_made = True
-                        print(f"  Successfully placed DCA buy order for {symbol}.")
+                        print(f"{sim_prefix()}  Successfully placed DCA buy order for {symbol}.")
                     else:
-                        print(f"  Failed to place DCA buy order for {symbol}.")
+                        print(f"{sim_prefix()}  Failed to place DCA buy order for {symbol}.")
                 else:
                     print(f"  Skipping DCA for {symbol}. Not enough funds.")
 
@@ -1602,6 +2002,16 @@ class CryptoAPITrading:
             base_symbol = crypto_symbols[start_index].upper().strip()
             full_symbol = f"{base_symbol}-USD"
 
+            # Re-fetch holdings before each entry check to prevent double-entry race
+            # This ensures we have fresh data if a previous order completed mid-loop
+            try:
+                holdings = self.get_holdings()
+                holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
+                debug_print(f"[DEBUG] TRADER: Refreshed holdings before checking entry for {base_symbol}")
+            except Exception as e:
+                debug_print(f"[DEBUG] TRADER: Failed to refresh holdings: {e}")
+                # Continue with existing holdings list if refresh fails
+
             # Skip if already held
             if full_symbol in holding_full_symbols:
                 start_index += 1
@@ -1640,7 +2050,7 @@ class CryptoAPITrading:
                 self.trailing_pm.pop(base_symbol, None)
 
                 print(
-                    f"Starting new trade for {full_symbol} (AI start signal long={buy_count}, short={sell_count}). "
+                    f"{sim_prefix()}Starting new trade for {full_symbol} (AI start signal long={buy_count}, short={sell_count}). "
                     f"Allocating ${allocation_in_usd:.2f}."
                 )
                 trading_cfg = _load_trading_config()
@@ -1651,24 +2061,20 @@ class CryptoAPITrading:
 
             start_index += 1
 
-        # If any trades were made, recalculate the cost basis
+        # Cost basis now recalculated immediately after each trade
+        # Only need to reinitialize DCA levels if trades were made
         if trades_made:
             trading_cfg = _load_trading_config()
             post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 5)
             time.sleep(post_delay)
-            print("Trades were made in this iteration. Recalculating cost basis...")
-            new_cost_basis = self.calculate_cost_basis()
-            if new_cost_basis:
-                self.cost_basis = new_cost_basis
-                print("Cost basis recalculated successfully.")
-            else:
-                print("Failed to recalculcate cost basis.")
+            debug_print("[DEBUG] TRADER: Trades made this cycle, reinitializing DCA levels...")
             self.initialize_dca_levels()
 
         # --- GUI HUB STATUS WRITE ---
         try:
             status = {
                 "timestamp": time.time(),
+                "simulation_mode": _is_simulation_mode(),
                 "account": {
                     "total_account_value": total_account_value,
                     "buying_power": buying_power,

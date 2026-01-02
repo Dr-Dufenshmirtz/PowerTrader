@@ -38,6 +38,7 @@ import shutil
 import glob
 import bisect
 import psutil
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import tkinter as tk
@@ -1752,6 +1753,9 @@ class PowerTraderHub(tk.Tk):
         
         # Debug mode variable for menu checkbutton
         self.debug_mode_var = tk.BooleanVar()
+        
+        # Simulation mode variable for menu checkbutton
+        self.simulation_mode_var = tk.BooleanVar()
 
         # Debounce map for panedwindow clamp operations
         self._paned_clamp_after_ids: Dict[str, str] = {}
@@ -1785,6 +1789,10 @@ class PowerTraderHub(tk.Tk):
 
         # cache latest trader status so charts can overlay buy/sell lines
         self._last_positions: Dict[str, dict] = {}
+
+        # Trading config cache (mtime-based to avoid repeated file reads)
+        self._cached_trading_config: Optional[dict] = None
+        self._cached_trading_config_mtime: Optional[float] = None
 
         # account value chart widget (created in _build_layout)
         self.account_chart = None
@@ -1827,6 +1835,9 @@ class PowerTraderHub(tk.Tk):
         
         # Set debug mode variable after settings are loaded
         self.debug_mode_var.set(bool(self.settings.get("debug_mode", False)))
+        
+        # Set simulation mode variable after settings are loaded
+        self.simulation_mode_var.set(bool(self.settings.get("simulation_mode", False)))
 
         # Refresh charts immediately when a timeframe is changed (don't wait for the 10s throttle).
         self.bind_all("<<TimeframeChanged>>", self._on_timeframe_changed)
@@ -2188,6 +2199,11 @@ class PowerTraderHub(tk.Tk):
             command=self.toggle_debug_mode,
             variable=self.debug_mode_var
         )
+        m_settings.add_checkbutton(
+            label="Simulation Mode",
+            command=self.toggle_simulation_mode,
+            variable=self.simulation_mode_var
+        )
         menubar.add_cascade(label="Settings", menu=m_settings)
 
         m_file = tk.Menu(
@@ -2488,6 +2504,15 @@ class PowerTraderHub(tk.Tk):
         # Account info (LEFT column, under status)
         acct_box = ttk.LabelFrame(controls_left, text="Account")
         acct_box.pack(fill="x", padx=6, pady=6)
+        
+        # Simulation mode banner (prominent warning)
+        self.lbl_simulation_banner = ttk.Label(
+            acct_box, 
+            text="", 
+            foreground="#FF8C00",  # Dark orange
+            font=("TkDefaultFont", 10, "bold")
+        )
+        self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4))
 
         self.lbl_acct_total_value = ttk.Label(acct_box, text="Total Account Value: N/A")
         self.lbl_acct_total_value.pack(anchor="w", padx=6, pady=(2, 0))
@@ -3193,7 +3218,10 @@ class PowerTraderHub(tk.Tk):
 
                     # sometimes it's already int/float-like, sometimes it's a string
                     return max(0, int(float(ms)))
-                except Exception:
+                except (ValueError, TypeError, IndexError) as e:
+                    # Debug: log minsize parsing errors
+                    if self.settings.get("debug_mode", False):
+                        print(f"[HUB DEBUG] Failed to parse minsize for pane {pane_id}: {e}")
                     return 0
 
             mins: List[int] = [_get_minsize(p) for p in panes]
@@ -3217,18 +3245,25 @@ class PowerTraderHub(tk.Tk):
 
                     try:
                         cur = int(pw.sashpos(i))
-                    except Exception:
+                    except (tk.TclError, ValueError, TypeError) as e:
+                        # Debug: log sash position read errors
+                        if self.settings.get("debug_mode", False):
+                            print(f"[HUB DEBUG] Failed to read sash position {i}: {e}")
                         continue
 
                     new = max(min_pos, min(max_pos, cur))
                     if new != cur:
                         try:
                             pw.sashpos(i, new)
-                        except Exception:
-                            pass
+                        except tk.TclError as e:
+                            # Debug: log sash position set errors (common during rapid resizing)
+                            if self.settings.get("debug_mode", False):
+                                print(f"[HUB DEBUG] Failed to set sash position {i} to {new}: {e}")
 
-        except Exception:
-            pass
+        except (tk.TclError, AttributeError) as e:
+            # Debug: log panedwindow clamping errors
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Panedwindow sash clamping error: {e}")
 
     # ---- process control ----
 
@@ -3250,11 +3285,15 @@ class PowerTraderHub(tk.Tk):
                     line = line.encode('ascii', 'ignore').decode('ascii')
                     # Remove any control characters except printable + newline/tab
                     line = ''.join(ch for ch in line if ch.isprintable() or ch in '\n\t')
-                except:
-                    pass
+                except (UnicodeError, AttributeError) as e:
+                    # Debug: log character filtering errors
+                    if self.settings.get("debug_mode", False):
+                        print(f"[HUB DEBUG] Character filtering failed in {prefix}: {e}")
                 q.put(f"{prefix}{line}")
-        except Exception:
-            pass
+        except Exception as e:
+            # Debug: log reader thread errors
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Reader thread error for {prefix}: {e}")
         finally:
             q.put(f"{prefix}[process exited]")
 
@@ -3378,6 +3417,22 @@ class PowerTraderHub(tk.Tk):
             )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save debug mode setting:\n{e}")
+    
+    def toggle_simulation_mode(self) -> None:
+        """Toggle simulation mode setting and save to gui_settings.json."""
+        self.settings["simulation_mode"] = bool(self.simulation_mode_var.get())
+        try:
+            _safe_write_json(SETTINGS_FILE, self.settings)
+            status = "enabled" if self.simulation_mode_var.get() else "disabled"
+            messagebox.showwarning(
+                "Simulation Mode", 
+                f"Simulation mode {status}.\n\n"
+                f"⚠️ When enabled, NO REAL TRADES will be executed.\n"
+                f"All trading logic runs normally but orders are simulated.\n\n"
+                f"Restart the Trader process to apply changes."
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save simulation mode setting:\n{e}")
 
     def _read_runner_ready(self) -> Dict[str, Any]:
         try:
@@ -3434,17 +3489,58 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+    def _compute_file_checksum(self, filepath: str) -> str:
+        """Compute SHA256 checksum of a file. Returns empty string on error."""
+        try:
+            sha256 = hashlib.sha256()
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(8192), b''):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+        except Exception as e:
+            # Debug: log checksum computation errors
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Checksum computation failed for {filepath}: {e}")
+            return ""
+
+    def _get_cached_trading_config(self) -> dict:
+        """
+        Get trading config with mtime-based caching.
+        Only reloads from disk when the file actually changes.
+        """
+        try:
+            mtime = os.path.getmtime(TRADING_SETTINGS_FILE) if os.path.isfile(TRADING_SETTINGS_FILE) else None
+        except Exception:
+            mtime = None
+
+        # Return cached config if mtime matches
+        if self._cached_trading_config_mtime == mtime and self._cached_trading_config is not None:
+            return self._cached_trading_config
+
+        # Reload config (file changed or first access)
+        config = _load_trading_config()
+        self._cached_trading_config = config
+        self._cached_trading_config_mtime = mtime
+
+        # Debug: log config reload events
+        if self.settings.get("debug_mode", False):
+            print(f"[HUB DEBUG] Trading config reloaded (mtime: {mtime})")
+
+        return config
+
     def _coin_is_trained(self, coin: str) -> bool:
         coin = coin.upper().strip()
         folder = self.coin_folders.get(coin, "")
         if not folder or not os.path.isdir(folder):
             return False
 
-        # If trainer reports it's currently training, it's not "trained" yet.
+        # If trainer reports it's currently training, stopped, or errored, it's not "trained" yet.
         try:
             st = _safe_read_json(os.path.join(folder, "trainer_status.json"))
-            if isinstance(st, dict) and str(st.get("state", "")).upper() == "TRAINING":
-                return False
+            if isinstance(st, dict):
+                state = str(st.get("state", "")).upper()
+                if state in ("TRAINING", "ERROR", "STOPPED"):
+                    return False
         except Exception:
             pass
 
@@ -3509,7 +3605,7 @@ class PowerTraderHub(tk.Tk):
 
     def _training_status_map(self) -> Dict[str, str]:
         """
-        Returns {coin: "TRAINED" | "TRAINING" | "NOT TRAINED"}.
+        Returns {coin: "TRAINED" | "TRAINING" | "ERROR" | "NOT TRAINED"}.
         """
         running = set(self._running_trainers())
         out: Dict[str, str] = {}
@@ -3519,6 +3615,21 @@ class PowerTraderHub(tk.Tk):
             elif self._coin_is_trained(c):
                 out[c] = "TRAINED"
             else:
+                # Check if there's an error or stopped state
+                try:
+                    folder = self.coin_folders.get(c, "")
+                    if folder:
+                        st = _safe_read_json(os.path.join(folder, "trainer_status.json"))
+                        if isinstance(st, dict):
+                            state = str(st.get("state", "")).upper()
+                            if state == "ERROR":
+                                out[c] = "ERROR"
+                                continue
+                            elif state == "STOPPED":
+                                out[c] = "STOPPED"
+                                continue
+                except Exception:
+                    pass
                 out[c] = "NOT TRAINED"
         return out
 
@@ -3552,19 +3663,33 @@ class PowerTraderHub(tk.Tk):
         trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
 
         # If coin folder doesn't exist yet, create it and copy the trainer script.
-        # (Also: overwrite to avoid running stale trainer copies in coin folders.)
+        # Also check version and force copy if mismatch or unreadable.
 
         if coin not in self.coin_folders:
             try:
                 if not os.path.isdir(coin_cwd):
                     os.makedirs(coin_cwd, exist_ok=True)
+            except Exception:
+                pass
 
-                # Copy trainer from MAIN folder to coin folder
-                src_main_trainer = os.path.join(self.project_dir, trainer_name)
-                dst_trainer_path = os.path.join(coin_cwd, trainer_name)
+        # Always ensure coin trainer is up to date with root trainer
+        src_main_trainer = os.path.join(self.project_dir, trainer_name)
+        dst_trainer_path = os.path.join(coin_cwd, trainer_name)
 
-                if os.path.isfile(src_main_trainer):
-                    shutil.copy2(src_main_trainer, dst_trainer_path)
+        # Copy from root if: 1) coin trainer missing, OR 2) checksum mismatch
+        should_copy = False
+        if not os.path.isfile(dst_trainer_path):
+            should_copy = True
+        elif os.path.isfile(src_main_trainer):
+            # Check if checksums match
+            root_checksum = self._compute_file_checksum(src_main_trainer)
+            coin_checksum = self._compute_file_checksum(dst_trainer_path)
+            if root_checksum != coin_checksum:
+                should_copy = True
+
+        if should_copy and os.path.isfile(src_main_trainer):
+            try:
+                shutil.copy2(src_main_trainer, dst_trainer_path)
             except Exception:
                 pass
 
@@ -3771,9 +3896,12 @@ class PowerTraderHub(tk.Tk):
         try:
             training_running = [c for c, s in status_map.items() if s == "TRAINING"]
             not_trained = [c for c, s in status_map.items() if s == "NOT TRAINED"]
+            errored = [c for c, s in status_map.items() if s == "ERROR"]
 
             if training_running:
                 self.lbl_training_overview.config(text=f"Training: RUNNING ({', '.join(training_running)})")
+            elif errored:
+                self.lbl_training_overview.config(text=f"Training: ERROR ({len(errored)} failed - check logs)")
             elif not_trained:
                 self.lbl_training_overview.config(text=f"Training: REQUIRED ({len(not_trained)} not trained)")
             else:
@@ -3905,6 +4033,12 @@ class PowerTraderHub(tk.Tk):
         data = _safe_read_json(self.trader_status_path)
         if not data:
             self.lbl_last_status.config(text="Last status: N/A (no trader_status.json yet)")
+            
+            # Hide simulation banner when no data
+            try:
+                self.lbl_simulation_banner.config(text="")
+            except Exception:
+                pass
 
             # account summary (right-side status area)
             try:
@@ -3932,6 +4066,16 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_last_status.config(text="Last status: (unknown timestamp)")
         except Exception:
             self.lbl_last_status.config(text="Last status: (timestamp parse error)")
+        
+        # Update simulation mode banner
+        try:
+            sim_mode = data.get("simulation_mode", False)
+            if sim_mode:
+                self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE - NO REAL TRADES ⚠️")
+            else:
+                self.lbl_simulation_banner.config(text="")
+        except Exception:
+            pass
 
         # --- account summary (same info the trader prints above current trades) ---
         acct = data.get("account", {}) or {}
@@ -3962,8 +4106,8 @@ class PowerTraderHub(tk.Tk):
             coins = getattr(self, "coins", None) or []
             n = len(coins) if len(coins) > 0 else 1
             
-            # Load trading config
-            trading_cfg = _load_trading_config()
+            # Load trading config (mtime-cached to avoid repeated file reads)
+            trading_cfg = self._get_cached_trading_config()
             alloc_pct = trading_cfg.get("position_sizing", {}).get("initial_allocation_pct", 0.005)
             min_alloc = trading_cfg.get("position_sizing", {}).get("min_allocation_usd", 0.5)
             multiplier = trading_cfg.get("dca", {}).get("position_multiplier", 2.0)
@@ -4359,19 +4503,23 @@ class PowerTraderHub(tk.Tk):
         if not hasattr(self, "_neural_overview_cache"):
             self._neural_overview_cache = {}  # path -> (mtime, value)
 
-        def _cached(path: str, loader, default: Any):
+        def _cached(path: str, loader, default: Any) -> Any:
+            """
+            Mtime-cached file loader. Returns the loaded value only.
+            Mtime tracking is internal to the cache.
+            """
             try:
                 mtime = os.path.getmtime(path)
             except Exception:
-                return default, None
+                return default
 
             hit = self._neural_overview_cache.get(path)
             if hit and hit[0] == mtime:
-                return hit[1], mtime
+                return hit[1]
 
             v = loader(path)
             self._neural_overview_cache[path] = (mtime, v)
-            return v, mtime
+            return v
 
         def _load_short_from_memory_json(path: str) -> int:
             try:
@@ -4400,22 +4548,28 @@ class PowerTraderHub(tk.Tk):
             # Long signal
             long_path = os.path.join(folder, "long_dca_signal.txt")
             if os.path.isfile(long_path):
-                long_sig, mt = _cached(long_path, read_int_from_file, 0)
-                if mt:
-                    mt_candidates.append(float(mt))
+                long_sig = _cached(long_path, read_int_from_file, 0)
+                try:
+                    mt_candidates.append(float(os.path.getmtime(long_path)))
+                except Exception:
+                    pass
 
             # Short signal (prefer txt; fallback to memory.json)
             short_txt = os.path.join(folder, "short_dca_signal.txt")
             if os.path.isfile(short_txt):
-                short_sig, mt = _cached(short_txt, read_int_from_file, 0)
-                if mt:
-                    mt_candidates.append(float(mt))
+                short_sig = _cached(short_txt, read_int_from_file, 0)
+                try:
+                    mt_candidates.append(float(os.path.getmtime(short_txt)))
+                except Exception:
+                    pass
             else:
                 mem = os.path.join(folder, "memory.json")
                 if os.path.isfile(mem):
-                    short_sig, mt = _cached(mem, _load_short_from_memory_json, 0)
-                    if mt:
-                        mt_candidates.append(float(mt))
+                    short_sig = _cached(mem, _load_short_from_memory_json, 0)
+                    try:
+                        mt_candidates.append(float(os.path.getmtime(mem)))
+                    except Exception:
+                        pass
 
             tile.set_values(long_sig, short_sig)
             
@@ -5489,12 +5643,20 @@ class PowerTraderHub(tk.Tk):
         dca_frame.columnconfigure(1, weight=1)
         
         dca_levels = cfg.get("dca", {}).get("levels", [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0])
+        
+        # Cap DCA levels displayed in UI to prevent layout issues with excessive levels
+        MAX_DCA_LEVELS_UI = 20
+        if len(dca_levels) > MAX_DCA_LEVELS_UI:
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] DCA levels truncated for UI display: {len(dca_levels)} -> {MAX_DCA_LEVELS_UI}")
+            dca_levels = dca_levels[:MAX_DCA_LEVELS_UI]
+        
         dca_level_vars = []
         dca_r = 0
         for i, level in enumerate(dca_levels):
-            var = tk.StringVar(value=str(level))
-            dca_level_vars.append(var)
-            add_row(dca_frame, dca_r, f"DCA Level {i+1} (%):", var)
+            dca_level_var = tk.StringVar(value=str(level))
+            dca_level_vars.append(dca_level_var)
+            add_row(dca_frame, dca_r, f"DCA Level {i+1} (%):", dca_level_var)
             dca_r += 1
 
         max_buys_var = tk.StringVar(value=str(cfg.get("dca", {}).get("max_buys_per_window", 2)))
@@ -5588,6 +5750,27 @@ class PowerTraderHub(tk.Tk):
                 post_trade = float(post_trade_var.get())
 
                 # Validation
+                # Check for duplicate levels
+                if len(dca_lvls) != len(set(dca_lvls)):
+                    # Find duplicates for error message
+                    seen = set()
+                    duplicates = set()
+                    for lvl in dca_lvls:
+                        if lvl in seen:
+                            duplicates.add(lvl)
+                        seen.add(lvl)
+                    
+                    # Debug: log duplicate detection
+                    if self.settings.get("debug_mode", False):
+                        print(f"[HUB DEBUG] Duplicate DCA levels detected: {sorted(duplicates)}")
+                    
+                    messagebox.showerror(
+                        "Validation Error",
+                        f"Duplicate DCA levels detected: {sorted(duplicates)}\n\n"
+                        f"Each DCA level must be unique."
+                    )
+                    return
+                
                 # DCA levels must be negative and in descending order (more negative)
                 for i, lvl in enumerate(dca_lvls):
                     if lvl >= 0:
