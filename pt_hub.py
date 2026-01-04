@@ -38,6 +38,10 @@ import shutil
 import glob
 import bisect
 import psutil
+
+# Ensure CREATE_NO_WINDOW is available (added in Python 3.7)
+if not hasattr(subprocess, 'CREATE_NO_WINDOW'):
+    subprocess.CREATE_NO_WINDOW = 0x08000000
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,6 +54,9 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import blended_transform_factory
 
+# Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
+VERSION = "26.010415"
+
 # Default theme colors (Modern Dark)
 DARK_BG = "#0D1117"
 DARK_BG2 = "#161B22"
@@ -57,7 +64,7 @@ DARK_PANEL = "#1A1F29"
 DARK_PANEL2 = "#21262D"
 DARK_BORDER = "#30363D"
 DARK_FG = "#E6EDF3"
-LIVE_OUTPUT_FG = "#E6EDF3"  # Live output text color (defaults to DARK_FG)
+LIVE_OUTPUT_FG = "#00E5FF"  # Live output text color (bright blue like button highlights)
 DARK_MUTED = "#8B949E"
 DARK_ACCENT = "#FFD54F"
 DARK_ACCENT2 = "#00E5FF"
@@ -501,18 +508,22 @@ DEFAULT_TRADING_CONFIG = {
 }
 
 # Default training config
+# Required timeframes that the Thinker uses for predictions and neural levels
+# These MUST be trained for the system to function properly
+REQUIRED_THINKER_TIMEFRAMES = [
+    "1hour",
+    "2hour",
+    "4hour",
+    "8hour",
+    "12hour",
+    "1day",
+    "1week"
+]
+
 DEFAULT_TRAINING_CONFIG = {
     "staleness_days": 14,
     "auto_train_when_stale": True,
-    "timeframes": [
-        "1hour",
-        "2hour",
-        "4hour",
-        "8hour",
-        "12hour",
-        "1day",
-        "1week"
-    ]
+    "timeframes": REQUIRED_THINKER_TIMEFRAMES
 }
 
 # Cache for trading config
@@ -1747,10 +1758,10 @@ class LogProc:
     is_trainer: bool = False
     coin: Optional[str] = None
 
-class PowerTraderHub(tk.Tk):
+class ApolloHub(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PowerTraderAI - Hub")
+        self.title(f"Apollo {VERSION.split('.')[0]}")
         self.geometry("1400x820")
 
         # Hard minimum window size so the UI can't be shrunk to a point where panes vanish.
@@ -1790,10 +1801,10 @@ class PowerTraderHub(tk.Tk):
         self.pnl_ledger_path = os.path.join(self.hub_dir, "pnl_ledger.json")
         self.account_value_history_path = os.path.join(self.hub_dir, "account_value_history.jsonl")
 
-        # file written by pt_thinker.py (runner readiness gate used for Start All)
+        # file written by pt_thinker.py (thinker readiness gate used for Start All)
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
 
-        # internal: when Start All is pressed, we start the runner first and only start the trader once ready
+        # internal: when Start All is pressed, we start the thinker first and only start the trader once ready
         self._auto_start_trader_pending = False
 
         # Autopilot mode state (orchestrates train → thinker → trader)
@@ -1827,7 +1838,7 @@ class PowerTraderHub(tk.Tk):
 
         # scripts
         self.proc_neural = ProcInfo(
-            name="Neural Runner",
+            name="Thinker",
             path=os.path.abspath(os.path.join(self.project_dir, self.settings["script_neural_runner2"]))
         )
         self.proc_trader = ProcInfo(
@@ -1867,6 +1878,9 @@ class PowerTraderHub(tk.Tk):
             self.start_all_scripts()
 
         self.after(250, self._tick)
+        
+        # Display bounce accuracy results on startup (after GUI is ready)
+        self.after(300, self._display_startup_bounce_accuracy)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2187,8 +2201,8 @@ class PowerTraderHub(tk.Tk):
         m_scripts.add_command(label="🚀 Autopilot", command=self.start_all_scripts)
         m_scripts.add_command(label="Stop All", command=self.stop_all_scripts)
         m_scripts.add_separator()
-        m_scripts.add_command(label="Start Neural Runner", command=self.start_neural)
-        m_scripts.add_command(label="Stop Neural Runner", command=self.stop_neural)
+        m_scripts.add_command(label="Start Thinker", command=self.start_neural)
+        m_scripts.add_command(label="Stop Thinker", command=self.stop_neural)
         m_scripts.add_separator()
         m_scripts.add_command(label="Start Trader", command=self.start_trader)
         m_scripts.add_command(label="Stop Trader", command=self.stop_trader)
@@ -2326,9 +2340,9 @@ class PowerTraderHub(tk.Tk):
         ))
 
         # ----------------------------
-        # LEFT: 1) Controls / Health (pane)
+        # LEFT: 1) Mission Control (pane)
         # ----------------------------
-        top_controls = ttk.LabelFrame(left_split, text="Controls / Health")
+        top_controls = ttk.LabelFrame(left_split, text="Mission Control")
 
         info_row = ttk.Frame(top_controls)
         info_row.pack(fill="x", expand=False, padx=6, pady=6)
@@ -2388,7 +2402,7 @@ class PowerTraderHub(tk.Tk):
         self.lbl_training_overview = ttk.Label(training_left, text="Training: N/A")
         self.lbl_training_overview.pack(anchor="w", padx=6, pady=(0, 2))
 
-        self.lbl_flow_hint = ttk.Label(training_left, text="Flow: Train → Autopilot")
+        self.lbl_flow_hint = ttk.Label(training_left, text="Next: TRAIN → THINK → TRADE")
         self.lbl_flow_hint.pack(anchor="w", padx=6, pady=(0, 6))
 
         self.training_list = tk.Listbox(
@@ -2421,8 +2435,8 @@ class PowerTraderHub(tk.Tk):
         )
         self.btn_toggle_all.pack(side="left")
 
-        # Neural and Trader status - displayed after Autopilot button
-        self.lbl_neural = ttk.Label(controls_left, text="Neural: stopped")
+        # Thinker and Trader status - displayed after Autopilot button
+        self.lbl_neural = ttk.Label(controls_left, text="Thinker: stopped")
         self.lbl_neural.pack(anchor="w", padx=6, pady=(6, 2))
 
         self.lbl_trader = ttk.Label(controls_left, text="Trader: stopped")
@@ -2577,7 +2591,7 @@ class PowerTraderHub(tk.Tk):
         # LEFT: 3) Live Output (pane)
         # ----------------------------
 
-        # Configurable font for live logs (Runner/Trader/Trainers)
+        # Configurable font for live logs (Thinker/Trader/Trainers)
         try:
             _base = tkfont.nametofont(LOG_FONT_FAMILY)
             self._live_log_font = _base.copy()
@@ -2589,9 +2603,9 @@ class PowerTraderHub(tk.Tk):
         self.logs_nb = ttk.Notebook(logs_frame)
         self.logs_nb.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Runner tab
+        # Thinker tab
         runner_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(runner_tab, text="Runner")
+        self.logs_nb.add(runner_tab, text="Thinker")
         self.runner_text = tk.Text(
             runner_tab,
             height=8,
@@ -2681,7 +2695,7 @@ class PowerTraderHub(tk.Tk):
             try:
                 selected_tab = self.logs_nb.select()
                 selected_index = self.logs_nb.index(selected_tab)
-                # 0=Runner, 1=Trader, 2=Trainers
+                # 0=Thinker, 1=Trader, 2=Trainers
                 if selected_index == 0:
                     self.runner_text.after(50, lambda: self.runner_text.yview_moveto(1.0))
                 elif selected_index == 1:
@@ -3232,6 +3246,7 @@ class PowerTraderHub(tk.Tk):
             if self.settings.get("debug_mode", False):
                 print(f"[HUB DEBUG] Reader thread error for {prefix}: {e}")
         finally:
+            q.put(f"{prefix}")  # Empty line before process exited
             q.put(f"{prefix}[process exited]")
 
     def _is_process_already_running(self, script_name: str) -> bool:
@@ -3277,6 +3292,10 @@ class PowerTraderHub(tk.Tk):
         env["POWERTRADER_HUB_DIR"] = self.hub_dir  # so rhcb writes where GUI reads
 
         try:
+            # Hide console window on Windows if flag is set (can be disabled in Apollo.pyw for debugging)
+            hide_console = os.environ.get('POWERTRADER_HIDE_CONSOLE', '1') == '1'
+            creation_flags = subprocess.CREATE_NO_WINDOW if (sys.platform == "win32" and hide_console) else 0
+            
             p.proc = subprocess.Popen(
                 [sys.executable, "-u", p.path],  # -u for unbuffered prints
                 cwd=self.project_dir,
@@ -3287,6 +3306,7 @@ class PowerTraderHub(tk.Tk):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                creationflags=creation_flags,
             )
             if log_q is not None:
                 t = threading.Thread(target=self._reader_thread, args=(p.proc, log_q, prefix), daemon=True)
@@ -3318,14 +3338,14 @@ class PowerTraderHub(tk.Tk):
             )
             return
         
-        # Reset runner-ready gate file (prevents stale "ready" from a prior run)
+        # Reset thinker-ready gate file (prevents stale "ready" from a prior run)
         try:
             with open(self.runner_ready_path, "w", encoding="utf-8") as f:
                 json.dump({"timestamp": time.time(), "ready": False, "stage": "starting"}, f)
         except Exception:
             pass
 
-        self._start_process(self.proc_neural, log_q=self.runner_log_q, prefix="[RUNNER] ")
+        self._start_process(self.proc_neural, log_q=self.runner_log_q, prefix="[THINKER] ")
 
     def start_trader(self) -> None:
         # Check training status before allowing manual start
@@ -3355,7 +3375,7 @@ class PowerTraderHub(tk.Tk):
         neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
         trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
 
-        # If anything is running (or we're waiting on runner readiness), toggle means "stop"
+        # If anything is running (or we're waiting on thinker readiness), toggle means "stop"
         if neural_running or trader_running or bool(getattr(self, "_auto_start_trader_pending", False)):
             self.stop_all_scripts()
             return
@@ -3380,7 +3400,7 @@ class PowerTraderHub(tk.Tk):
             messagebox.showinfo(
                 "Debug Mode", 
                 f"Debug mode {status}.\n\n"
-                f"Restart running processes (Runner/Trader/Trainer) to apply changes."
+                f"Restart running processes (Thinker/Trader/Trainer) to apply changes."
             )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save debug mode setting:\n{e}")
@@ -3427,7 +3447,7 @@ class PowerTraderHub(tk.Tk):
         if not bool(getattr(self, "_auto_start_trader_pending", False)):
             return
 
-        # If runner died, stop waiting
+        # If thinker died, stop waiting
         if not (self.proc_neural.proc and self.proc_neural.proc.poll() is None):
             self._auto_start_trader_pending = False
             return
@@ -3630,6 +3650,7 @@ class PowerTraderHub(tk.Tk):
         return config
 
     def _coin_is_trained(self, coin: str) -> bool:
+        """Check if coin has ALL required timeframes trained with valid memory files."""
         coin = coin.upper().strip()
         folder = self.coin_folders.get(coin, "")
         if not folder or not os.path.isdir(folder):
@@ -3645,6 +3666,7 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+        # Check timestamp is recent
         stamp_path = os.path.join(folder, "trainer_last_training_time.txt")
         try:
             if not os.path.isfile(stamp_path):
@@ -3654,9 +3676,28 @@ class PowerTraderHub(tk.Tk):
             ts = float(raw) if raw else 0.0
             if ts <= 0:
                 return False
-            return (time.time() - ts) <= (14 * 24 * 60 * 60)
+            if (time.time() - ts) > (14 * 24 * 60 * 60):
+                return False
         except Exception:
             return False
+        
+        # Verify ALL required timeframes have valid memory files
+        for tf in REQUIRED_THINKER_TIMEFRAMES:
+            memory_file = os.path.join(folder, f"memories_{tf}.dat")
+            weight_file = os.path.join(folder, f"memory_weights_{tf}.dat")
+            threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}.dat")
+            
+            # All three files must exist and be non-empty
+            for fpath in [memory_file, weight_file, threshold_file]:
+                if not os.path.isfile(fpath):
+                    return False
+                try:
+                    if os.path.getsize(fpath) < 10:  # At least 10 bytes
+                        return False
+                except Exception:
+                    return False
+        
+        return True
 
     def _get_stale_coins(self) -> List[str]:
         """Returns list of coins whose training is stale (older than staleness_days from training_settings.json)."""
@@ -3847,7 +3888,7 @@ class PowerTraderHub(tk.Tk):
         if not coin:
             return
 
-        # Stop the Neural Runner before any training starts (training modifies artifacts the runner reads)
+        # Stop the Thinker before any training starts (training modifies artifacts the thinker reads)
         self.stop_neural()
 
         # --- IMPORTANT ---
@@ -3906,9 +3947,9 @@ class PowerTraderHub(tk.Tk):
                 "trainer_status.json",
                 "trainer_last_start_time.txt",
                 "killer.txt",
-                "memories_*.txt",
-                "memory_weights_*.txt",
-                "neural_perfect_threshold_*.txt",
+                "memories_*.dat",
+                "memory_weights_*.dat",
+                "neural_perfect_threshold_*.dat",
             ]
 
             deleted = 0
@@ -3935,6 +3976,10 @@ class PowerTraderHub(tk.Tk):
         env["POWERTRADER_HUB_DIR"] = self.hub_dir
 
         try:
+            # Hide console window on Windows if flag is set (can be disabled in Apollo.pyw for debugging)
+            hide_console = os.environ.get('POWERTRADER_HIDE_CONSOLE', '1') == '1'
+            creation_flags = subprocess.CREATE_NO_WINDOW if (sys.platform == "win32" and hide_console) else 0
+            
             # Pass `coin` argument so trainer processes the correct market
             info.proc = subprocess.Popen(
                 [sys.executable, "-u", info.path, coin],
@@ -3946,6 +3991,7 @@ class PowerTraderHub(tk.Tk):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                creationflags=creation_flags,
             )
             t = threading.Thread(target=self._reader_thread, args=(info.proc, q, f"[{coin}] "), daemon=True)
             t.start()
@@ -3978,7 +4024,7 @@ class PowerTraderHub(tk.Tk):
         self.stop_neural()
         self.stop_trader()
 
-        # Also reset the runner-ready gate file (best-effort)
+        # Also reset the thinker-ready gate file (best-effort)
         try:
             with open(self.runner_ready_path, "w", encoding="utf-8") as f:
                 json.dump({"timestamp": time.time(), "ready": False, "stage": "stopped"}, f)
@@ -4061,6 +4107,87 @@ class PowerTraderHub(tk.Tk):
                 except Exception:
                     txt.see("end")
 
+    def _display_startup_bounce_accuracy(self) -> None:
+        """Display bounce accuracy results for all coins on Hub startup."""
+        try:
+            for coin in self.coins:
+                coin_folder = self.coin_folders.get(coin)
+                if not coin_folder:
+                    continue
+                
+                accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
+                if not os.path.isfile(accuracy_file):
+                    continue
+                
+                try:
+                    with open(accuracy_file, 'r', encoding='utf-8') as f:
+                        lines = f.read().strip().split('\n')
+                    
+                    if len(lines) < 2:
+                        continue
+                    
+                    # Parse file content
+                    timestamp = lines[0].replace('Last Updated: ', '').strip()
+                    average = lines[1].replace('Average: ', '').strip()
+                    
+                    # Build timeframe results string and check for suspicious accuracy
+                    tf_results = []
+                    suspicious_accuracy = False
+                    for line in lines[2:]:
+                        if ':' in line:
+                            tf_results.append(line.replace(': ', '=').strip())
+                            # Check if any timeframe has >= 99% accuracy
+                            try:
+                                accuracy_value = float(line.split(':')[1].strip().replace('%', ''))
+                                if accuracy_value >= 99.0:
+                                    suspicious_accuracy = True
+                            except:
+                                pass
+                    
+                    # Format and display
+                    msg = f"Bounce Accuracy Results ({coin})\n"
+                    msg += f"Last trained: {timestamp}\n"
+                    msg += f"Average accuracy: {average}\n"
+                    msg += f"Per timeframe: {', '.join(tf_results)}\n"
+                    
+                    # Add warning if suspicious accuracy detected
+                    if suspicious_accuracy:
+                        msg += f"⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.\n"
+                        msg += f"⚠ Please verify that training completed properly and memories were saved.\n"
+                        msg += f"\n\n"
+                    
+                    # Check if memory files are empty
+                    empty_memories = []
+                    try:
+                        for line in lines[2:]:
+                            if ':' in line:
+                                tf = line.split(':')[0].strip()
+                                memory_file = os.path.join(coin_folder, f"memories_{tf}.dat")
+                                if os.path.isfile(memory_file):
+                                    file_size = os.path.getsize(memory_file)
+                                    if file_size < 100:
+                                        empty_memories.append(tf)
+                                else:
+                                    empty_memories.append(tf)
+                        
+                        if empty_memories:
+                            msg += f"❌ ERROR: Memory files are empty or missing for: {', '.join(empty_memories)}\n"
+                            msg += f"❌ Training likely failed. Please retrain this coin.\n"
+                            msg += f"\n\n"
+                    except:
+                        pass
+                    
+                    # Insert into trainer log
+                    self.trainer_text.insert("end", msg)
+                    self.trainer_text.see("end")
+                
+                except Exception as e:
+                    # Silently skip files that can't be read
+                    pass
+        except Exception:
+            # Silently skip if there's any error
+            pass
+
     def _tick(self) -> None:
         # process labels
         neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
@@ -4139,7 +4266,7 @@ class PowerTraderHub(tk.Tk):
                     # Poll for completion
                     self.after(2000, self._poll_auto_retrain_completion)
 
-        self.lbl_neural.config(text=f"Neural: {'RUNNING' if neural_running else 'STOPPED'}")
+        self.lbl_neural.config(text=f"Thinker: {'RUNNING' if neural_running else 'STOPPED'}")
         self.lbl_trader.config(text=f"Trader: {'RUNNING' if trader_running else 'STOPPED'}")
 
         # Start All is now a toggle (Start/Stop)
@@ -4193,17 +4320,31 @@ class PowerTraderHub(tk.Tk):
             auto_mode_active = getattr(self, "_auto_mode_active", False)
             auto_mode_phase = getattr(self, "_auto_mode_phase", "")
             
+            # Determine the current workflow state and what's next
             if auto_mode_active and auto_mode_phase == "TRAINING":
                 pending = getattr(self, "_auto_mode_pending_coins", set())
-                self.lbl_flow_hint.config(text=f"Flow: AUTOPILOT TRAINING ({len(pending)} coins) → THINKER → TRADER")
+                self.lbl_flow_hint.config(text=f"Flow: TRAIN ({len(pending)} coins) → THINK → TRADE")
+            elif training_running:
+                # Training is actively running
+                self.lbl_flow_hint.config(text=f"Flow: TRAIN (in progress) → THINK → TRADE")
             elif not all_trained:
-                self.lbl_flow_hint.config(text="Flow: USE AUTOPILOT (will train if needed)")
+                # Training needed before anything else
+                self.lbl_flow_hint.config(text="Next: TRAIN → THINK → TRADE")
             elif self._auto_start_trader_pending:
-                self.lbl_flow_hint.config(text="Flow: THINKER STARTING → TRADER PENDING")
-            elif neural_running or trader_running:
-                self.lbl_flow_hint.config(text="Flow: AUTOPILOT RUNNING (use button to stop)")
+                # Training done, thinker starting
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK (starting) → TRADE")
+            elif neural_running and trader_running:
+                # Everything is running
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK ✓ → TRADE ✓")
+            elif neural_running:
+                # Only neural/thinker is running
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK (active) → TRADE")
+            elif trader_running:
+                # Only trader is running (unusual but possible)
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK → TRADE (active)")
             else:
-                self.lbl_flow_hint.config(text="Flow: AUTOPILOT READY")
+                # All trained, ready to start
+                self.lbl_flow_hint.config(text="Next: THINK → TRADE (training complete)")
         except Exception:
             pass
 
@@ -4296,7 +4437,7 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        self.status.config(text=f"{_now_str()} | hub_dir={self.hub_dir}")
+        self.status.config(text=f"{_now_str()} | v{VERSION} | main_dir={self.settings['main_neural_dir']}")
         self.after(int(float(self.settings.get("ui_refresh_seconds", 1.0)) * 1000), self._tick)
 
     def _refresh_trader_status(self) -> None:
@@ -6391,32 +6532,16 @@ class PowerTraderHub(tk.Tk):
         timeframes_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         timeframes_frame.columnconfigure(0, weight=1)
 
-        available_timeframes = [
-            "1min", "5min", "15min", "30min", "1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"
-        ]
-        
-        selected_timeframes = cfg.get("timeframes", ["1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"])
-        timeframe_vars = {}
-        
-        # Create checkboxes in a grid layout (4 columns)
-        tf_inner = ttk.Frame(timeframes_frame)
-        tf_inner.grid(row=0, column=0, sticky="w")
-        
-        for i, tf in enumerate(available_timeframes):
-            var = tk.BooleanVar(value=(tf in selected_timeframes))
-            timeframe_vars[tf] = var
-            col = i % 4
-            row = i // 4
-            chk = ttk.Checkbutton(tf_inner, text=tf, variable=var)
-            chk.grid(row=row, column=col, sticky="w", padx=(0, 20), pady=3)
-        
-        # Warning about noise sensitivity for small timeframes
+        # Timeframes are locked to the 7 required by Thinker
+        # Users can manually edit training_settings.json for debugging purposes
         ttk.Label(
             timeframes_frame,
-            text="⚠ Note: Timeframes less than 1 hour may result in buy and sell actions that react too quickly to noise.",
-            foreground="#ff9800",
-            wraplength=550
-        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+            text=f"Timeframes (locked): {', '.join(REQUIRED_THINKER_TIMEFRAMES)}\n\n"
+                 "These are the 7 timeframes required by the Thinker for predictions and neural levels.\n"
+                 "Advanced users can manually edit training_settings.json to change this for debugging.",
+            wraplength=550,
+            justify="left"
+        ).grid(row=0, column=0, sticky="w", pady=5)
 
         # Buttons at bottom
         btns_frame = ttk.Frame(frm)
@@ -6429,20 +6554,20 @@ class PowerTraderHub(tk.Tk):
                     messagebox.showerror("Validation Error", "Staleness threshold must be at least 1 day")
                     return
                 
-                # Get selected timeframes from checkboxes
-                selected = [tf for tf, var in timeframe_vars.items() if var.get()]
-                
-                if not selected:
-                    messagebox.showerror("Validation Error", "At least one timeframe must be selected.")
-                    return
+                # Read existing config to preserve timeframes (which may be manually edited)
+                existing_cfg = _safe_read_json(config_path) if os.path.isfile(config_path) else {}
+                timeframes = existing_cfg.get("timeframes", REQUIRED_THINKER_TIMEFRAMES)
                 
                 new_cfg = {
                     "staleness_days": staleness,
                     "auto_train_when_stale": bool(auto_train_var.get()),
-                    "timeframes": selected
+                    "timeframes": timeframes
                 }
                 _safe_write_json(config_path, new_cfg)
-                messagebox.showinfo("Saved", "Training settings saved.")
+                messagebox.showinfo(
+                    "Saved",
+                    "Training settings saved.\n\nStop and restart any active training for changes to take effect."
+                )
                 on_close()
             except ValueError as e:
                 messagebox.showerror("Invalid Input", f"Please enter a valid number for staleness days.\n\n{e}")
@@ -6458,14 +6583,12 @@ class PowerTraderHub(tk.Tk):
                 staleness_var.set(str(defaults.get("staleness_days", 14)))
                 auto_train_var.set(bool(defaults.get("auto_train_when_stale", False)))
                 
-                # Reset timeframe checkboxes
-                default_timeframes = defaults.get("timeframes", ["1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"])
-                for tf, var in timeframe_vars.items():
-                    var.set(tf in default_timeframes)
-                
-                # Save to file
+                # Save to file (includes resetting timeframes to required 7)
                 _safe_write_json(config_path, defaults)
-                messagebox.showinfo("Reset", "Training settings have been reset to defaults.")
+                messagebox.showinfo(
+                    "Reset",
+                    "Training settings have been reset to defaults.\n\nStop and restart any active training for changes to take effect."
+                )
                 on_close()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to reset settings:\n{e}")
@@ -6545,5 +6668,5 @@ class PowerTraderHub(tk.Tk):
         self.destroy()
 
 if __name__ == "__main__":
-    app = PowerTraderHub()
+    app = ApolloHub()
     app.mainloop()

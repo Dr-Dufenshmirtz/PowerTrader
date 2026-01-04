@@ -209,6 +209,7 @@ _last_threshold_written = {}  # tf_choice -> float
 _write_buffer = {
 	"thresholds": {},           # {timeframe: threshold_value}
 	"last_checkpoint_time": 0,  # timestamp of last safety checkpoint
+	"last_flush_time": 0,       # timestamp of last periodic flush
 }
 
 def _read_text(path):
@@ -227,22 +228,22 @@ def load_memory(tf_choice):
 		"dirty": False,
 	}
 	try:
-		data["memory_list"] = _read_text(f"memories_{tf_choice}.txt").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split('~')
+		data["memory_list"] = _read_text(f"memories_{tf_choice}.dat").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split('~')
 	except:
 		data["memory_list"] = []
 	# The memory files are plain-text caches written by the trainer. We
 	# normalize and split them into Python lists here to avoid repeated
 	# file I/O during inner loops of the training routine.
 	try:
-		data["weight_list"] = _read_text(f"memory_weights_{tf_choice}.txt").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
+		data["weight_list"] = _read_text(f"memory_weights_{tf_choice}.dat").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
 	except:
 		data["weight_list"] = []
 	try:
-		data["high_weight_list"] = _read_text(f"memory_weights_high_{tf_choice}.txt").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
+		data["high_weight_list"] = _read_text(f"memory_weights_high_{tf_choice}.dat").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
 	except:
 		data["high_weight_list"] = []
 	try:
-		data["low_weight_list"] = _read_text(f"memory_weights_low_{tf_choice}.txt").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
+		data["low_weight_list"] = _read_text(f"memory_weights_low_{tf_choice}.dat").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
 	except:
 		data["low_weight_list"] = []
 	_memory_cache[tf_choice] = data
@@ -256,24 +257,24 @@ def flush_memory(tf_choice, force=False):
 	if (not data.get("dirty")) and (not force):
 		return
 	try:
-		with open(f"memories_{tf_choice}.txt", "w+", encoding="utf-8") as f:
+		with open(f"memories_{tf_choice}.dat", "w+", encoding="utf-8") as f:
 			f.write("~".join([x for x in data["memory_list"] if str(x).strip() != ""]))
 	except:
 		pass
 	# flush_memory() batches writes to reduce disk churn. The `dirty` flag
 	# prevents redundant writes when nothing changed.
 	try:
-		with open(f"memory_weights_{tf_choice}.txt", "w+", encoding="utf-8") as f:
+		with open(f"memory_weights_{tf_choice}.dat", "w+", encoding="utf-8") as f:
 			f.write(" ".join([str(x) for x in data["weight_list"] if str(x).strip() != ""]))
 	except:
 		pass
 	try:
-		with open(f"memory_weights_high_{tf_choice}.txt", "w+", encoding="utf-8") as f:
+		with open(f"memory_weights_high_{tf_choice}.dat", "w+", encoding="utf-8") as f:
 			f.write(" ".join([str(x) for x in data["high_weight_list"] if str(x).strip() != ""]))
 	except:
 		pass
 	try:
-		with open(f"memory_weights_low_{tf_choice}.txt", "w+", encoding="utf-8") as f:
+		with open(f"memory_weights_low_{tf_choice}.dat", "w+", encoding="utf-8") as f:
 			f.write(" ".join([str(x) for x in data["low_weight_list"] if str(x).strip() != ""]))
 	except:
 		pass
@@ -286,7 +287,7 @@ def write_threshold_sometimes(tf_choice, perfect_threshold, loop_i, every=200):
 	if (loop_i % every != 0) and (last is not None) and (abs(perfect_threshold - last) < 0.05):
 		return
 	try:
-		with open(f"neural_perfect_threshold_{tf_choice}.txt", "w+", encoding="utf-8") as f:
+		with open(f"neural_perfect_threshold_{tf_choice}.dat", "w+", encoding="utf-8") as f:
 			f.write(str(perfect_threshold))
 		_last_threshold_written[tf_choice] = perfect_threshold
 	except:
@@ -311,7 +312,7 @@ def flush_all_buffers(force=True):
 	# 1. Write all buffered thresholds
 	for tf_choice, threshold_value in _write_buffer["thresholds"].items():
 		try:
-			with open(f"neural_perfect_threshold_{tf_choice}.txt", "w+", encoding="utf-8") as f:
+			with open(f"neural_perfect_threshold_{tf_choice}.dat", "w+", encoding="utf-8") as f:
 				f.write(str(threshold_value))
 			debug_print(f"[DEBUG] TRAINER: Wrote threshold for {tf_choice}: {threshold_value:.4f}")
 		except Exception as e:
@@ -363,6 +364,54 @@ def should_stop_training(loop_i, every=50):
 	except:
 		return False
 
+def estimate_cache_size_mb():
+	"""Estimate memory usage of the _memory_cache in MB."""
+	try:
+		total_size = 0
+		for tf_choice, data in _memory_cache.items():
+			# Estimate size: each list item is roughly len(str(item)) bytes
+			for item in data.get("memory_list", []):
+				total_size += len(str(item))
+			for item in data.get("weight_list", []):
+				total_size += len(str(item))
+			for item in data.get("high_weight_list", []):
+				total_size += len(str(item))
+			for item in data.get("low_weight_list", []):
+				total_size += len(str(item))
+		return total_size / (1024 * 1024)  # Convert to MB
+	except:
+		return 0.0
+
+def periodic_flush_if_needed(tf_choice, min_interval_seconds=10, max_memory_mb=50):
+	"""Smart periodic flush that balances memory usage and disk I/O.
+	
+	Flushes when:
+	- Memory cache exceeds max_memory_mb (prevents high RAM usage for slow timeframes like 1day)
+	- AND at least min_interval_seconds have passed since last flush (prevents disk thrashing for fast timeframes like 1hr)
+	
+	This ensures:
+	- 1day timeframe: Flushes when memory builds up, keeping RAM reasonable
+	- 1hr timeframe: Processes fast without excessive disk writes (respects time interval)
+	"""
+	current_time = time.time()
+	last_flush = _write_buffer.get("last_flush_time", 0)
+	time_since_flush = current_time - last_flush
+	
+	# Check if enough time has passed (prevent disk thrashing)
+	if time_since_flush < min_interval_seconds:
+		return False
+	
+	# Check if memory is getting high
+	cache_size_mb = estimate_cache_size_mb()
+	if cache_size_mb < max_memory_mb:
+		return False
+	
+	# Conditions met - flush now
+	debug_print(f"[DEBUG] TRAINER: Periodic flush triggered - cache size: {cache_size_mb:.1f}MB, time since last: {time_since_flush:.1f}s")
+	flush_all_buffers(force=True)
+	_write_buffer["last_flush_time"] = current_time
+	return True
+
 def PrintException():
 	exc_type, exc_obj, tb = sys.exc_info()
 	f = tb.tb_frame
@@ -383,7 +432,7 @@ def PrintException():
 	except Exception:
 		pass
 how_far_to_look_back = 100000
-number_of_candles = [2]
+# number_of_candles is initialized later after tf_choices is loaded (one entry per timeframe)
 number_of_candles_index = 0
 
 def _compute_file_checksum(filepath: str) -> str:
@@ -491,7 +540,11 @@ def restart_program():
 	python = sys.executable
 	os.execl(python, python, * sys.argv)
 
-import_path = os.path.join(os.path.dirname(__file__), "training_settings.json")
+# Look for training_settings.json in parent directory (project root), not coin subfolder
+# The Hub copies this trainer into coin folders (BTC/, ETH/, etc.), so parent dir is always the root
+_trainer_dir = os.path.dirname(os.path.abspath(__file__))
+_project_dir = os.path.dirname(_trainer_dir)
+import_path = os.path.join(_project_dir, "training_settings.json")
 default_timeframes = [
     "1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"
 ]
@@ -520,15 +573,34 @@ if os.path.isfile(import_path):
 else:
 	tf_choices = default_timeframes
 tf_minutes = [tf_minutes_map.get(tf, 60) for tf in tf_choices]
+
+# Initialize number_of_candles based on number of timeframes being trained
+# Each timeframe starts with minimum pattern size of 2 candles
+number_of_candles = [2] * len(tf_choices)
+
+# Debug print to confirm settings are loaded (will only show if debug mode is enabled)
+try:
+	if _is_debug_mode():
+		print(f"[DEBUG] TRAINER: Loaded training settings from: {import_path}")
+		print(f"[DEBUG] TRAINER: Active timeframes: {tf_choices}")
+		print(f"[DEBUG] TRAINER: Pattern sizes (number_of_candles): {number_of_candles}")
+except:
+	pass
 # --- GUI HUB INPUT (NO PROMPTS) ---
-# Usage: python pt_trainer.py BTC [reprocess_yes|reprocess_no]
-_arg_coin = "BTC"
+# Usage: python pt_trainer.py <COIN> [reprocess_yes|reprocess_no]
+# Coin argument is REQUIRED - no default fallback
+
+if len(sys.argv) < 2 or not str(sys.argv[1]).strip():
+	print("ERROR: Coin symbol required as first argument")
+	print("Usage: python pt_trainer.py <COIN> [reprocess_yes|reprocess_no]")
+	print("Example: python pt_trainer.py BTC")
+	sys.exit(1)
 
 try:
-	if len(sys.argv) > 1 and str(sys.argv[1]).strip():
-		_arg_coin = str(sys.argv[1]).strip().upper()
-except Exception:
-	_arg_coin = "BTC"
+	_arg_coin = str(sys.argv[1]).strip().upper()
+except Exception as e:
+	print(f"ERROR: Invalid coin argument: {e}")
+	sys.exit(1)
 
 coin_choice = _arg_coin + '-USDT'
 
@@ -586,6 +658,7 @@ except Exception:
 check_and_update_trainer_version()
 
 the_big_index = 0
+bounce_accuracy_dict = {}  # Store bounce accuracy for each timeframe
 # Main training loop note:
 # The primary loop below (`while True:`) resets per-iteration state and
 # then performs training/analysis for the configured `tf_choice`. It is
@@ -720,11 +793,35 @@ while True:
 	last_perc_comp = perc_comp+'kjfjakjdakd'
 	kucoin_retry_count = 0
 	kucoin_max_retries = 5
+	
+	# Calculate API delay based on number of coins to avoid exceeding rate limit
+	# KuCoin limit: 180 req/min = 3 per second
+	try:
+		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+			settings = json.load(f)
+			num_coins = len(settings.get("coins", []))
+			# Scale delay: 0.4s per coin so N coins collectively stay under 3 req/sec
+			api_delay = max(0.4, 0.4 * num_coins) if num_coins > 0 else 0.5
+	except Exception:
+		api_delay = 0.5  # Fallback to conservative delay
+	
 	while True:
-		time.sleep(.5)
+		time.sleep(api_delay)
 		try:
+			# Calculate time range details for debugging
+			time_range_days = (start_time - end_time) / 86400
+			from datetime import datetime
+			start_date = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+			end_date = datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+			
 			debug_print(f"[DEBUG] TRAINER: Fetching historical data from KuCoin...")
+			print(f"API Request: coin={coin_choice}, timeframe={timeframe}")
+			print(f"  Time range: {end_date} to {start_date} ({time_range_days:.1f} days)")
+			print(f"  Timestamps: startAt={end_time}, endAt={start_time}")
+			
 			kline_data = market.get_kline(coin_choice,timeframe,startAt=end_time,endAt=start_time)
+			
+			print(f"API Response type: {type(kline_data)}, length: {len(kline_data) if kline_data else 0}")
 			
 			# Validate response format
 			if kline_data:
@@ -732,12 +829,23 @@ while True:
 				if isinstance(kline_data, dict) and 'data' in kline_data:
 					print(f"Timeframe {timeframe}: Unwrapping KuCoin response wrapper")
 					kline_data = kline_data['data']
+					print(f"After unwrapping - type: {type(kline_data)}, length: {len(kline_data) if kline_data else 0}")
+				
+				# Check if we got empty data - this means we've reached the beginning of available history
+				if not kline_data or len(kline_data) == 0:
+					print(f"Reached beginning of available history for {timeframe} (no data before {end_date})")
+					print(f"Proceeding with {len(history_list)} candles collected so far...")
+					# Break out of the data collection loop - we have all available data
+					break
 				
 				# Validate first entry has minimum required fields
 				if kline_data and len(kline_data) > 0:
 					first_entry = kline_data[0]
 					if not isinstance(first_entry, (list, tuple)) or len(first_entry) < 5:
 						raise ValueError(f"Invalid candle format: expected at least 5 fields, got {len(first_entry) if isinstance(first_entry, (list, tuple)) else 'non-list'}")
+					print(f"First candle sample: timestamp={first_entry[0]}, open={first_entry[1]}, close={first_entry[2]}")
+			else:
+				raise ValueError(f"KuCoin returned None/null for {timeframe}")
 			
 			history = str(kline_data).replace(']]','], ').replace('[[','[').split('], [')
 			kucoin_retry_count = 0  # Reset on success
@@ -757,6 +865,40 @@ while True:
 				break
 			else:
 				continue
+		
+		# Validate that history_list contains valid candle data before continuing
+		if len(history_list) > 0:
+			# Check a sample entry to ensure it has proper format
+			sample_entry = str(history_list[-1]).replace('"','').replace("'","").split(", ")
+			try:
+				# Try to parse the first entry's timestamp to verify format
+				if len(sample_entry) < 5:
+					raise ValueError(f"Invalid candle format: expected at least 5 fields, got {len(sample_entry)}")
+				test_time = float(sample_entry[0].replace('[','').replace(']',''))
+				# If we can't convert to float or get empty/bracket-only strings, data is bad
+				if test_time <= 0:
+					raise ValueError("Invalid timestamp in candle data")
+			except (ValueError, IndexError) as e:
+				kucoin_retry_count += 1
+				print(f"WARNING: Received malformed data from API (batch had {len(history)} entries)")
+				print(f"Sample entry: {sample_entry}")
+				print(f"Retrying data fetch... (attempt {kucoin_retry_count}/{kucoin_max_retries})")
+				
+				# Check if we've exceeded max retries
+				if kucoin_retry_count >= kucoin_max_retries:
+					error_msg = f"ERROR: Failed to fetch valid data after {kucoin_max_retries} attempts for {timeframe} timeframe"
+					print(error_msg)
+					mark_training_error(f"Max retries exceeded for {timeframe}")
+					sys.exit(1)
+				
+				# Remove the bad data
+				history_list = history_list[:-len(history)]
+				time.sleep(3.5)
+				continue  # Retry the fetch
+		
+		# Reset retry counter on successful validation
+		kucoin_retry_count = 0
+		
 		perc_comp = format((len(history_list)/how_far_to_look_back)*100,'.2f')
 		print()
 		print('Gathering data...')
@@ -782,6 +924,16 @@ while True:
 			break
 		else:
 			continue
+	
+	# Final validation: Ensure we fetched sufficient valid data before proceeding
+	if len(history_list) < 100:  # Need at least 100 candles for meaningful training
+		error_msg = f"ERROR: Failed to fetch sufficient historical data for {_arg_coin} on {timeframe} timeframe. Only got {len(history_list)} candles (need at least 100)."
+		print(error_msg)
+		mark_training_error(f"Insufficient data for {timeframe}: {len(history_list)} candles")
+		sys.exit(1)
+	
+	print(f"Successfully fetched {len(history_list)} candles for {timeframe} timeframe")
+	
 	# Start from halfway point in history for all timeframes
 	index = int(len(history_list)/2)
 	price_list = []
@@ -790,6 +942,8 @@ while True:
 	open_price_list = []
 	volume_list = []
 	minutes_passed = 0
+	parse_error_count = 0
+	max_parse_errors = 50  # Allow some errors but not too many
 	try:
 		while True:
 			working_minute = str(history_list[index]).replace('"','').replace("'","").split(", ")
@@ -813,8 +967,16 @@ while True:
 					break
 				else:
 					continue
-			except:
-				PrintException()
+			except Exception as e:
+				parse_error_count += 1
+				if parse_error_count <= 3:  # Only print first few errors to avoid spam
+					print(f"WARNING: Failed to parse candle at index {index}: {working_minute}")
+					PrintException()
+				if parse_error_count > max_parse_errors:
+					error_msg = f"ERROR: Too many parse errors ({parse_error_count}) in historical data for {timeframe}. Data may be corrupted."
+					print(error_msg)
+					mark_training_error(f"Data corruption in {timeframe}: {parse_error_count} parse errors")
+					sys.exit(1)
 				index += 1
 				if index >= len(history_list):
 					break
@@ -824,6 +986,18 @@ while True:
 		price_list.reverse()
 		high_price_list.reverse()
 		low_price_list.reverse()
+		
+		# Report parsing results
+		successful_parses = len(price_list)
+		total_candles = len(history_list)
+		if parse_error_count > 0:
+			print(f"Parsed {successful_parses}/{total_candles} candles successfully ({parse_error_count} errors)")
+			parse_success_rate = (successful_parses / total_candles * 100) if total_candles > 0 else 0
+			if parse_success_rate < 80:  # Less than 80% success is concerning
+				error_msg = f"ERROR: Parse success rate too low ({parse_success_rate:.1f}%) for {timeframe}. Data quality insufficient for training."
+				print(error_msg)
+				mark_training_error(f"Low parse success rate for {timeframe}: {parse_success_rate:.1f}%")
+				sys.exit(1)
 		
 		# Validate we have historical data before proceeding
 		if len(price_list) == 0 or len(high_price_list) == 0 or len(low_price_list) == 0 or len(open_price_list) == 0:
@@ -835,6 +1009,12 @@ while True:
 		price = float(ticker_data[ticker_data.index('price:')+1])
 	except:
 		PrintException()
+	
+	# Debug output before starting training loop
+	print(f"DEBUG: Starting training for {tf_choice} (index {the_big_index}/{len(tf_choices)-1})")
+	print(f"DEBUG: Total candles collected: {len(price_list)}")
+	print(f"DEBUG: Existing memories: {len(memory_list)}")
+	
 	history_list = []
 	history_list2 = []
 	perfect_threshold = 1.0
@@ -988,6 +1168,37 @@ while True:
 				try:
 					print()
 					print(f'Timeframe: {timeframe}')
+					
+					# Rebuild price_change lists from current price_list2 at start of each iteration
+					# This ensures they stay in sync even if cleared at end of previous iteration
+					index = 0
+					price_change_list = []
+					while True:
+						if index >= len(price_list2) or index >= len(open_price_list2):
+							break
+						price_change = 100*((price_list2[index]-open_price_list2[index])/open_price_list2[index])
+						price_change_list.append(price_change)
+						index += 1
+					
+					index = 0
+					high_price_change_list = []
+					while True:
+						if index >= len(high_price_list2) or index >= len(open_price_list2):
+							break
+						high_price_change = 100*((high_price_list2[index]-open_price_list2[index])/open_price_list2[index])
+						high_price_change_list.append(high_price_change)
+						index += 1
+					
+					index = 0
+					low_price_change_list = []
+					while True:
+						if index >= len(low_price_list2) or index >= len(open_price_list2):
+							break
+						low_price_change = 100*((low_price_list2[index]-open_price_list2[index])/open_price_list2[index])
+						low_price_change_list.append(low_price_change)
+						index += 1
+					
+					debug_print(f"[DEBUG] TRAINER: Loop iteration - price_list2={len(price_list2)}, price_change_list={len(price_change_list)}")
 					try:
 						current_pattern_length = number_of_candles[number_of_candles_index]
 						index = (len(price_change_list))-(number_of_candles[number_of_candles_index]-1)
@@ -995,6 +1206,8 @@ while True:
 						history_pattern_start_index = (len(price_change_list))-((number_of_candles[number_of_candles_index]+candles_to_predict)*2)
 						history_pattern_index = history_pattern_start_index
 						while True:
+							if index < 0 or index >= len(price_change_list):
+								break
 							current_pattern.append(price_change_list[index])
 							index += 1
 							if len(current_pattern) >= (number_of_candles[number_of_candles_index]-1):
@@ -1008,6 +1221,8 @@ while True:
 						index = (len(high_price_change_list))-(number_of_candles[number_of_candles_index]-1)
 						high_current_pattern = []
 						while True:
+							if index < 0 or index >= len(high_price_change_list):
+								break
 							high_current_pattern.append(high_price_change_list[index])
 							index += 1
 							if len(high_current_pattern) >= (number_of_candles[number_of_candles_index]-1):
@@ -1021,6 +1236,8 @@ while True:
 						index = (len(low_price_change_list))-(number_of_candles[number_of_candles_index]-1)
 						low_current_pattern = []
 						while True:
+							if index < 0 or index >= len(low_price_change_list):
+								break
 							low_current_pattern.append(low_price_change_list[index])
 							index += 1
 							if len(low_current_pattern) >= (number_of_candles[number_of_candles_index]-1):
@@ -1029,6 +1246,21 @@ while True:
 								continue
 					except:
 						PrintException()
+					
+					# Debug: Show what was built
+					debug_print(f"[DEBUG] TRAINER: Patterns built - current={len(current_pattern)}, high={len(high_current_pattern)}, low={len(low_current_pattern)}, expected={number_of_candles[number_of_candles_index]-1}")
+					debug_print(f"[DEBUG] TRAINER: Lists sizes - price_change={len(price_change_list)}, high_price_change={len(high_price_change_list)}, low_price_change={len(low_price_change_list)}")
+					
+					# Validate patterns were built successfully before continuing
+					expected_length = number_of_candles[number_of_candles_index] - 1
+					if (len(current_pattern) < expected_length or 
+					    len(high_current_pattern) < expected_length or 
+					    len(low_current_pattern) < expected_length):
+						debug_print(f"[DEBUG] TRAINER: Insufficient pattern data - current:{len(current_pattern)}, high:{len(high_current_pattern)}, low:{len(low_current_pattern)}, expected:{expected_length}")
+						debug_print(f"[DEBUG] TRAINER: Skipping this iteration, waiting for more data...")
+						time.sleep(5)  # Prevents tight loop while waiting for candle data
+						continue  # Skip this iteration and wait for more candles
+					
 					history_diff = 1000000.0
 					memory_diff = 1000000.0
 					history_diffs = []
@@ -1082,6 +1314,9 @@ while True:
 								checks = []
 								check_dex = 0
 								while True:
+									# Check bounds before accessing
+									if check_dex >= len(current_pattern) or check_dex >= len(memory_pattern):
+										break
 									current_candle = float(current_pattern[check_dex])
 									memory_candle = float(memory_pattern[check_dex])
 									# Calculate difference with explicit zero-division protection
@@ -1093,10 +1328,6 @@ while True:
 										difference = abs((abs(current_candle - memory_candle) / avg_value) * 100)
 									checks.append(difference)
 									check_dex += 1
-									if check_dex >= len(current_pattern):
-										break
-									else:
-										continue
 								
 								# Protect against division by zero if checks list is empty
 								if len(checks) == 0:
@@ -1149,10 +1380,7 @@ while True:
 									continue
 						except:
 							PrintException()
-							memory_list = []
-							weight_list = []
-							high_weight_list = []
-							low_weight_list = []
+							# Don't break references to _mem cache - just reset working variables
 							which_memory_index = 'no'
 							perfect.append('no')
 							diffs_list = []
@@ -1201,18 +1429,20 @@ while True:
 					try:
 						index = 0
 						current_pattern_length = number_of_candles[number_of_candles_index]
-						index = (len(price_list2))-current_pattern_length
 						current_pattern = []
-						while True:
-							current_pattern.append(price_list2[index])
-							if len(current_pattern)>=number_of_candles[number_of_candles_index]:
-								break
-							else:
-								index += 1
-								if index >= len(price_list2):
+						# Check if price_list2 has enough elements
+						if len(price_list2) >= current_pattern_length:
+							index = (len(price_list2))-current_pattern_length
+							while True:
+								current_pattern.append(price_list2[index])
+								if len(current_pattern)>=number_of_candles[number_of_candles_index]:
 									break
 								else:
-									continue
+									index += 1
+									if index >= len(price_list2):
+										break
+									else:
+										continue
 					except:
 						PrintException()
 					# TROUBLESHOOTING TOGGLE: if 1==1 keeps this always enabled in production.
@@ -1237,7 +1467,10 @@ while True:
 								high_prediction_prices = [start_price,high_new_price]
 								low_prediction_prices = [start_price,low_new_price]
 							except:
-								start_price = current_pattern[len(current_pattern)-1]
+								if len(current_pattern) > 0:
+									start_price = current_pattern[len(current_pattern)-1]
+								else:
+									start_price = 0.0
 								new_price = start_price
 								prediction_prices = [start_price,start_price]
 								high_prediction_prices = [start_price,start_price]
@@ -1254,77 +1487,118 @@ while True:
 						low_all_predictions.append(low_prediction_prices)
 						index = 0
 						current_pattern_length = 3
-						index = (len(price_list2)-1)-current_pattern_length
 						current_pattern = []
-						while True:
-							current_pattern.append(price_list2[index])
-							index += 1
-							if index >= len(price_list2):
-								break
-							else:
-								continue
+						# Check if price_list2 has enough elements
+						if len(price_list2) > current_pattern_length:
+							index = (len(price_list2)-1)-current_pattern_length
+							while True:
+								current_pattern.append(price_list2[index])
+								index += 1
+								if index >= len(price_list2):
+									break
+								else:
+									continue
 						high_current_pattern_length = 3
-						high_index = (len(high_price_list2)-1)-high_current_pattern_length
 						high_current_pattern = []
-						while True:
-							high_current_pattern.append(high_price_list2[high_index])
-							high_index += 1
-							if high_index >= len(high_price_list2):
-								break
-							else:
-								continue
+						# Check if high_price_list2 has enough elements
+						if len(high_price_list2) > high_current_pattern_length:
+							high_index = (len(high_price_list2)-1)-high_current_pattern_length
+							while True:
+								high_current_pattern.append(high_price_list2[high_index])
+								high_index += 1
+								if high_index >= len(high_price_list2):
+									break
+								else:
+									continue
 						low_current_pattern_length = 3
-						low_index = (len(low_price_list2)-1)-low_current_pattern_length
 						low_current_pattern = []
-						while True:
-							low_current_pattern.append(low_price_list2[low_index])
-							low_index += 1
-							if low_index >= len(low_price_list2):
-								break
-							else:
-								continue
+						# Check if low_price_list2 has enough elements
+						if len(low_price_list2) > low_current_pattern_length:
+							low_index = (len(low_price_list2)-1)-low_current_pattern_length
+							while True:
+								low_current_pattern.append(low_price_list2[low_index])
+								low_index += 1
+								if low_index >= len(low_price_list2):
+									break
+								else:
+									continue
 						try:
 							which_pattern_length = 0
-							new_y = [start_price,new_price]
-							high_new_y = [start_price,high_new_price]
-							low_new_y = [start_price,low_new_price]
+							# Check if variables from earlier prediction exist, otherwise build from patterns
+							try:
+								new_y = [start_price,new_price]
+								high_new_y = [start_price,high_new_price]
+								low_new_y = [start_price,low_new_price]
+							except NameError:
+								# Variables not defined, use pattern fallback
+								if len(current_pattern) > 0:
+									new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
+								else:
+									new_y = [0.0, 0.0]
+								if len(high_current_pattern) > 0:
+									high_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, high_current_pattern[len(high_current_pattern)-1]]
+								else:
+									high_new_y = [0.0, 0.0]
+								if len(low_current_pattern) > 0:
+									low_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, low_current_pattern[len(low_current_pattern)-1]]
+								else:
+									low_new_y = [0.0, 0.0]
 						except:
 							PrintException()
-							new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
-							high_new_y = [current_pattern[len(current_pattern)-1],high_current_pattern[len(high_current_pattern)-1]]
-							low_new_y = [current_pattern[len(current_pattern)-1],low_current_pattern[len(low_current_pattern)-1]]
+							if len(current_pattern) > 0:
+								new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
+							else:
+								new_y = [0.0, 0.0]
+							if len(high_current_pattern) > 0:
+								high_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, high_current_pattern[len(high_current_pattern)-1]]
+							else:
+								high_new_y = [0.0, 0.0]
+							if len(low_current_pattern) > 0:
+								low_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, low_current_pattern[len(low_currentPattern)-1]]
+							else:
+								low_new_y = [0.0, 0.0]
 					else:
 						current_pattern_length = 3
-						index = (len(price_list2))-current_pattern_length
 						current_pattern = []
-						while True:
-							current_pattern.append(price_list2[index])
-							index += 1
-							if index >= len(price_list2):
-								break
-							else:
-								continue
+						# Check if price_list2 has enough elements
+						if len(price_list2) >= current_pattern_length:
+							index = (len(price_list2))-current_pattern_length
+							while True:
+								current_pattern.append(price_list2[index])
+								index += 1
+								if index >= len(price_list2):
+									break
+								else:
+									continue
 						high_current_pattern_length = 3
-						high_index = (len(high_price_list2)-1)-high_current_pattern_length
 						high_current_pattern = []
-						while True:
-							high_current_pattern.append(high_price_list2[high_index])
-							high_index += 1
-							if high_index >= len(high_price_list2):
-								break
-							else:
-								continue
+						# Check if high_price_list2 has enough elements
+						if len(high_price_list2) > high_current_pattern_length:
+							high_index = (len(high_price_list2)-1)-high_current_pattern_length
+							while True:
+								high_current_pattern.append(high_price_list2[high_index])
+								high_index += 1
+								if high_index >= len(high_price_list2):
+									break
+								else:
+									continue
 						low_current_pattern_length = 3
-						low_index = (len(low_price_list2)-1)-low_current_pattern_length
 						low_current_pattern = []
-						while True:
-							low_current_pattern.append(low_price_list2[low_index])
-							low_index += 1
-							if low_index >= len(low_price_list2):
-								break
-							else:
-								continue
-						new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
+						# Check if low_price_list2 has enough elements
+						if len(low_price_list2) > low_current_pattern_length:
+							low_index = (len(low_price_list2)-1)-low_current_pattern_length
+							while True:
+								low_current_pattern.append(low_price_list2[low_index])
+								low_index += 1
+								if low_index >= len(low_price_list2):
+									break
+								else:
+									continue
+						# Use last element if pattern exists, otherwise use a default
+						if len(current_pattern) > 0:
+							new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
+						else:
+							new_y = [0.0, 0.0]
 						number_of_candles_index += 1
 						if number_of_candles_index >= len(number_of_candles):
 							print("ERROR: Processed all number_of_candles without finding patterns. Training cannot complete.")
@@ -1336,8 +1610,15 @@ while True:
 					# The 'else' branch is a no-op - was used to disable stats during development.
 					# Change to 'if 1==0' to disable accuracy tracking for performance testing.
 					if 1==1:
-						high_current_price = high_current_pattern[len(high_current_pattern)-1]
-						low_current_price = low_current_pattern[len(low_current_pattern)-1]
+						# Safe access with fallback values
+						if len(high_current_pattern) > 0:
+							high_current_price = high_current_pattern[len(high_current_pattern)-1]
+						else:
+							high_current_price = 0.0
+						if len(low_current_pattern) > 0:
+							low_current_price = low_current_pattern[len(low_current_pattern)-1]
+						else:
+							low_current_price = 0.0
 						try:
 							try:
 								difference_of_actuals = last_actual-new_y[0]
@@ -1426,6 +1707,8 @@ while True:
 								accuracy = (sum(upordown4)/len(upordown4))*100
 								formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 								print(f'Bounce Accuracy for last 100 Over Limit Candles: {formatted}%')
+								# Store accuracy in dict for this timeframe
+								bounce_accuracy_dict[tf_choice] = accuracy
 							try:
 								print('current candle: '+str(len(price_list2)))
 							except:
@@ -1449,9 +1732,19 @@ while True:
 						last_low_move_weights = low_move_weights
 						last_perfect_dexs = perfect_dexs
 						last_perfect_diffs = perfect_diffs
-						percent_difference_of_now = ((new_y[1]-new_y[0])/abs(new_y[0]))*100
-						high_percent_difference_of_now = ((high_new_y[1]-high_new_y[0])/abs(high_new_y[0]))*100
-						low_percent_difference_of_now = ((low_new_y[1]-low_new_y[0])/abs(low_new_y[0]))*100
+						# Protect against division by zero
+						if abs(new_y[0]) > 0:
+							percent_difference_of_now = ((new_y[1]-new_y[0])/abs(new_y[0]))*100
+						else:
+							percent_difference_of_now = 0.0
+						if abs(high_new_y[0]) > 0:
+							high_percent_difference_of_now = ((high_new_y[1]-high_new_y[0])/abs(high_new_y[0]))*100
+						else:
+							high_percent_difference_of_now = 0.0
+						if abs(low_new_y[0]) > 0:
+							low_percent_difference_of_now = ((low_new_y[1]-low_new_y[0])/abs(low_new_y[0]))*100
+						else:
+							low_percent_difference_of_now = 0.0
 						high_baseline_price_change_pct = high_percent_difference_of_now
 						low_baseline_price_change_pct = low_percent_difference_of_now
 						baseline_price_change_pct = percent_difference_of_now
@@ -1485,13 +1778,20 @@ while True:
 					last_flipped = flipped
 					which_candle_of_the_prediction_index = 0
 					if 1 == 1:
-						current_pattern_ending = [current_pattern[len(current_pattern)-1]]
+						if len(current_pattern) > 0:
+							current_pattern_ending = [current_pattern[len(current_pattern)-1]]
+						else:
+							current_pattern_ending = [0.0]
 						while True:
 							try:
 								try:
 									# Grow by 1 candle at a time for maximum learning
 									price_list_length += 1
 									which_candle_of_the_prediction_index += 1
+									
+									# Periodic flush to manage memory (especially for slow timeframes like 1day)
+									periodic_flush_if_needed(tf_choice, min_interval_seconds=10, max_memory_mb=50)
+									
 									# Check if we've processed all candles for this timeframe
 									if len(price_list2) == len(price_list):
 										# OPTIMIZATION: Prune weak patterns before saving (keeps files lean)
@@ -1525,6 +1825,7 @@ while True:
 										
 										# Flush all buffered data before switching to next timeframe
 										debug_print(f"[DEBUG] TRAINER: Flushing buffers before timeframe switch (the_big_index: {the_big_index} -> {the_big_index + 1})")
+										print(f'DEBUG: Memory list size for {tf_choice} before flush: {len(_memory_cache.get(tf_choice, {}).get("memory_list", []))}')
 										flush_all_buffers(force=True)
 										
 										# Clear memory cache before switching timeframes to prevent cross-contamination
@@ -1532,6 +1833,7 @@ while True:
 										_memory_cache.clear()
 										the_big_index += 1
 										print('Moving to next timeframe')
+										print(f'DEBUG: Completed timeframe {tf_choice} - processed {len(price_list2)}/{len(price_list)} candles')
 										avg50 = []
 										sells_count = 0
 										prediction_prices_avg_list = []
@@ -1614,12 +1916,79 @@ while True:
 										list_len = 0
 										print(f'Timeframe index: {the_big_index}')
 										print(f'Total timeframes: {len(tf_choices)}')
+										print(f'DEBUG: the_big_index={the_big_index}, len(tf_choices)={len(tf_choices)}, len(number_of_candles)={len(number_of_candles)}')
+										print(f'DEBUG: Timeframes in bounce_accuracy_dict: {list(bounce_accuracy_dict.keys())}')
+										# Check if we should continue to next timeframe or exit
+										if the_big_index < len(tf_choices):
+											print(f'DEBUG: Breaking to restart outer loop for next timeframe')
+											break  # Restart outer while True loop with next timeframe
+										# Otherwise, we've processed all timeframes - proceed to exit
 										if the_big_index >= len(tf_choices):
 											if len(number_of_candles) == 1:
 												print("Finished processing all timeframes (number_of_candles has only one entry). Exiting.")
 												
 												# CRITICAL: Flush all buffered data (thresholds + memory/weights) before marking complete
 												flush_all_buffers(force=True)
+												
+												# Save and print bounce accuracy summary
+												try:
+													if bounce_accuracy_dict:
+														# Calculate average
+														avg_accuracy = sum(bounce_accuracy_dict.values()) / len(bounce_accuracy_dict)
+														
+														# Save to file
+														timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+														with open('bounce_accuracy.txt', 'w', encoding='utf-8') as f:
+															f.write(f'Last Updated: {timestamp}\n')
+															f.write(f'Average: {avg_accuracy:.2f}%\n')
+															for tf in tf_choices:
+																if tf in bounce_accuracy_dict:
+																	f.write(f'{tf}: {bounce_accuracy_dict[tf]:.2f}%\n')
+														
+														# Print summary
+														print()  # Empty line before bounce accuracy
+														print(f'Bounce Accuracy Results ({_arg_coin})')
+														print(f'Last trained: {timestamp}')
+														print(f'Average accuracy: {avg_accuracy:.2f}%')
+														tf_results = ', '.join([f'{tf}={bounce_accuracy_dict[tf]:.2f}%' for tf in tf_choices if tf in bounce_accuracy_dict])
+														print(f'Per timeframe: {tf_results}')
+														
+														# Check for suspicious accuracy (99-100% often indicates incomplete training)
+														suspicious_accuracy = False
+														for tf in tf_choices:
+															if tf in bounce_accuracy_dict and bounce_accuracy_dict[tf] >= 99.0:
+																suspicious_accuracy = True
+																break
+														
+														if suspicious_accuracy:
+															print()
+															print(f'⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.')
+															print(f'⚠ Please verify that training completed properly and memories were saved.')
+												except Exception as e:
+													print(f'Warning: Could not save bounce accuracy: {e}')
+												
+												# Check if memory files are empty (indicates training failure)
+												training_valid = True
+												empty_memories = []
+												try:
+													for tf in tf_choices:
+														memory_file = f"memories_{tf}.dat"
+														if os.path.isfile(memory_file):
+															file_size = os.path.getsize(memory_file)
+															if file_size < 100:  # Less than 100 bytes is effectively empty
+																empty_memories.append(tf)
+																training_valid = False
+														else:
+															# Memory file doesn't exist at all
+															empty_memories.append(tf)
+															training_valid = False
+													
+													if not training_valid:
+														print()
+														print(f'❌ ERROR: Training failed - memory files are empty or missing for: {", ".join(empty_memories)}')
+														print(f'❌ Training will be marked as FAILED. Please retry training.')
+												except Exception as e:
+													print(f'Warning: Could not validate memory files: {e}')
 												
 												try:
 													file = open('trainer_last_start_time.txt','w+')
@@ -1628,12 +1997,15 @@ while True:
 												except:
 													pass
 
-												# Mark training finished for the GUI
+												# Mark training finished (or failed) for the GUI
 												try:
 													_trainer_finished_at = int(time.time())
-													file = open('trainer_last_training_time.txt','w+')
-													file.write(str(_trainer_finished_at))
-													file.close()
+													
+													# Only write last_training_time if training was valid
+													if training_valid:
+														file = open('trainer_last_training_time.txt','w+')
+														file.write(str(_trainer_finished_at))
+														file.close()
 												except:
 													pass
 												try:
@@ -1641,22 +2013,33 @@ while True:
 														json.dump(
 															{
 																"coin": _arg_coin,
-																"state": "FINISHED",
+																"state": "FINISHED" if training_valid else "FAILED",
 																"started_at": _trainer_started_at,
 																"finished_at": _trainer_finished_at,
 																"timestamp": _trainer_finished_at,
+																"error": "Empty memory files" if not training_valid else None,
 															},
 															f,
 														)
 												except Exception:
 													pass
 
-												sys.exit(0)
+												sys.exit(0 if training_valid else 1)
 										else:
 											pass
 										break
 									else:
 										try:
+											# Rebuild all price lists with new window size
+											open_price_list2 = []
+											open_price_list_index = 0
+											while True:
+												open_price_list2.append(open_price_list[open_price_list_index])
+												open_price_list_index += 1
+												if open_price_list_index >= price_list_length:
+													break
+												else:
+													continue
 											price_list2 = []
 											price_list_index = 0
 											while True:
@@ -1684,16 +2067,31 @@ while True:
 													break
 												else:
 													continue
+											
+											# price_change lists will be rebuilt at start of next loop iteration
+											debug_print(f"[DEBUG] TRAINER: Window grown to size {price_list_length}, lists will sync on next iteration")
+											
 											price2 = price_list2[len(price_list2)-1]
 											high_price2 = high_price_list2[len(high_price_list2)-1]
 											low_price2 = low_price_list2[len(low_price_list2)-1]
 											highlowind = 0
-											this_differ = ((price2-new_y[1])/abs(new_y[1]))*100
-											high_this_differ = ((high_price2-new_y[1])/abs(new_y[1]))*100
-											low_this_differ = ((low_price2-new_y[1])/abs(new_y[1]))*100
-											this_diff = ((price2-new_y[0])/abs(new_y[0]))*100
-											high_this_diff = ((high_price2-new_y[0])/abs(new_y[0]))*100
-											low_this_diff = ((low_price2-new_y[0])/abs(new_y[0]))*100
+											# Protect against division by zero
+											if abs(new_y[1]) > 0:
+												this_differ = ((price2-new_y[1])/abs(new_y[1]))*100
+												high_this_differ = ((high_price2-new_y[1])/abs(new_y[1]))*100
+												low_this_differ = ((low_price2-new_y[1])/abs(new_y[1]))*100
+											else:
+												this_differ = 0.0
+												high_this_differ = 0.0
+												low_this_differ = 0.0
+											if abs(new_y[0]) > 0:
+												this_diff = ((price2-new_y[0])/abs(new_y[0]))*100
+												high_this_diff = ((high_price2-new_y[0])/abs(new_y[0]))*100
+												low_this_diff = ((low_price2-new_y[0])/abs(new_y[0]))*100
+											else:
+												this_diff = 0.0
+												high_this_diff = 0.0
+												low_this_diff = 0.0
 											difference_list = []
 											list_of_predictions = all_predictions
 											close_enough_counter = []
@@ -1702,10 +2100,17 @@ while True:
 												current_prediction_price = all_predictions[highlowind][which_candle_of_the_prediction_index]
 												high_current_prediction_price = high_all_predictions[highlowind][which_candle_of_the_prediction_index]
 												low_current_prediction_price = low_all_predictions[highlowind][which_candle_of_the_prediction_index]
-												perc_diff_now = ((current_prediction_price-new_y[0])/abs(new_y[0]))*100
-												perc_diff_now_actual = ((price2-new_y[0])/abs(new_y[0]))*100
-												high_perc_diff_now_actual = ((high_price2-new_y[0])/abs(new_y[0]))*100
-												low_perc_diff_now_actual = ((low_price2-new_y[0])/abs(new_y[0]))*100
+												# Protect against division by zero
+												if abs(new_y[0]) > 0:
+													perc_diff_now = ((current_prediction_price-new_y[0])/abs(new_y[0]))*100
+													perc_diff_now_actual = ((price2-new_y[0])/abs(new_y[0]))*100
+													high_perc_diff_now_actual = ((high_price2-new_y[0])/abs(new_y[0]))*100
+													low_perc_diff_now_actual = ((low_price2-new_y[0])/abs(new_y[0]))*100
+												else:
+													perc_diff_now = 0.0
+													perc_diff_now_actual = 0.0
+													high_perc_diff_now_actual = 0.0
+													low_perc_diff_now_actual = 0.0
 												# Calculate difference with explicit zero-division protection
 												avg_pred_price = (current_prediction_price + float(price2)) / 2
 												if avg_pred_price == 0.0:
@@ -1721,15 +2126,19 @@ while True:
 															debug_print(f"[DEBUG] TRAINER: No matching patterns for weight update - creating new memory")
 															
 															# Create new memory when no patterns match
-															all_current_patterns[highlowind].append(this_diff)
+															# CRITICAL: Create a COPY of the pattern with this_diff appended
+															# Do NOT modify all_current_patterns[highlowind] in place!
+															new_pattern = all_current_patterns[highlowind] + [this_diff]
 															
-															mem_entry = str(all_current_patterns[highlowind]).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
+															mem_entry = str(new_pattern).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
 															
+															# Add new pattern to memory cache
 															_mem["memory_list"].append(mem_entry)
-															_mem["weight_list"].append('1.0')
-															_mem["high_weight_list"].append('1.0')
-															_mem["low_weight_list"].append('1.0')
+															_mem["weight_list"].append(1.0)  # Start with neutral weight
+															_mem["high_weight_list"].append(1.0)
+															_mem["low_weight_list"].append(1.0)
 															_mem["dirty"] = True
+															debug_print(f"[DEBUG] TRAINER: Added new pattern to memory (total: {len(_mem['memory_list'])})")
 														else:
 															# Find the minimum length across all lists to avoid index errors
 															# Process as much valid data as possible even if lists got out of sync
@@ -1800,13 +2209,12 @@ while True:
 																else:
 																	new_weight = move_weights[indy]
 																
-																# Update cache directly (local lists are references to cached lists)
-																weight_list[perfect_dexs[indy]] = new_weight
-																high_weight_list[perfect_dexs[indy]] = high_new_weight
-																low_weight_list[perfect_dexs[indy]] = low_new_weight
+																# Update cache directly to ensure changes persist (don't rely on references)
+																_mem["weight_list"][perfect_dexs[indy]] = new_weight
+																_mem["high_weight_list"][perfect_dexs[indy]] = high_new_weight
+																_mem["low_weight_list"][perfect_dexs[indy]] = low_new_weight
 
 																# mark dirty (we will flush in batches)
-																# Note: _mem already loaded at top of outer training loop, no need to reload
 																_mem["dirty"] = True
 
 																indy += 1
@@ -1853,7 +2261,11 @@ while True:
 					history_list = []
 					price_change_list = []
 					current_pattern = []
-					break
+					# Only break if finished all timeframes, otherwise continue to next
+					if the_big_index >= len(tf_choices):
+						break
+					else:
+						continue
 				except (KeyboardInterrupt, SystemExit):
 					raise
 				except:

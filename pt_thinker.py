@@ -472,8 +472,14 @@ def _write_runner_ready(ready: bool, stage: str, ready_coins=None, total_coins: 
 for _sym in CURRENT_COINS:
 	os.makedirs(coin_folder(_sym), exist_ok=True)
 
+# Required timeframes that the Thinker uses for predictions and neural levels
+# These MUST be trained for the system to function properly
+REQUIRED_THINKER_TIMEFRAMES = [
+	'1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week'
+]
+
 distance = 0.5
-tf_choices = ['1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
+tf_choices = REQUIRED_THINKER_TIMEFRAMES
 
 def new_coin_state():
 	return {
@@ -506,6 +512,37 @@ def new_coin_state():
 states = {}
 
 display_cache = {sym: f"{sym}  (starting.)" for sym in CURRENT_COINS}
+
+def _validate_coin_training(coin: str) -> tuple:
+	"""Check if coin has all required timeframes trained. Returns (is_valid, missing_timeframes_list)."""
+	missing = []
+	folder = coin_folder(coin)
+	
+	if not os.path.isdir(folder):
+		return (False, REQUIRED_THINKER_TIMEFRAMES)
+	
+	for tf in REQUIRED_THINKER_TIMEFRAMES:
+		memory_file = os.path.join(folder, f"memories_{tf}.dat")
+		weight_file = os.path.join(folder, f"memory_weights_{tf}.dat")
+		threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}.dat")
+		
+		# Check if all three files exist and are non-empty
+		for fpath in [memory_file, weight_file, threshold_file]:
+			if not os.path.isfile(fpath):
+				if tf not in missing:
+					missing.append(tf)
+				break
+			try:
+				if os.path.getsize(fpath) < 10:  # At least 10 bytes
+					if tf not in missing:
+						missing.append(tf)
+					break
+			except Exception:
+				if tf not in missing:
+					missing.append(tf)
+				break
+	
+	return (len(missing) == 0, missing)
 
 # Track which coins have produced REAL predicted levels (not placeholder 0.0 / inf)
 _ready_coins = set()
@@ -834,7 +871,7 @@ def step_coin(sym: str):
 		debug_print(f"[DEBUG] {sym}: Loading neural training files...")
 		
 		# Check if training files exist before attempting to open
-		threshold_file = 'neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt'
+		threshold_file = 'neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.dat'
 		if not os.path.exists(threshold_file):
 			debug_print(f"[DEBUG] {sym}: Training file missing: {threshold_file}")
 			training_issues[tf_choice_index] = 1
@@ -851,10 +888,10 @@ def step_coin(sym: str):
 			training_issues[tf_choice_index] = 0
 
 			# Validate all required training files exist
-			memories_file = 'memories_' + tf_choices[tf_choice_index] + '.txt'
-			weights_file = 'memory_weights_' + tf_choices[tf_choice_index] + '.txt'
-			weights_high_file = 'memory_weights_high_' + tf_choices[tf_choice_index] + '.txt'
-			weights_low_file = 'memory_weights_low_' + tf_choices[tf_choice_index] + '.txt'
+			memories_file = 'memories_' + tf_choices[tf_choice_index] + '.dat'
+			weights_file = 'memory_weights_' + tf_choices[tf_choice_index] + '.dat'
+			weights_high_file = 'memory_weights_high_' + tf_choices[tf_choice_index] + '.dat'
+			weights_low_file = 'memory_weights_low_' + tf_choices[tf_choice_index] + '.dat'
 			
 			if not os.path.exists(memories_file):
 				debug_print(f"[DEBUG] {sym}: Training file missing: {memories_file}")
@@ -997,7 +1034,7 @@ def step_coin(sym: str):
 			perfects[tf_choice_index] = 'inactive'
 
 		# keep threshold persisted (original behavior)
-		with open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt', 'w+') as file:
+		with open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.dat', 'w+') as file:
 			file.write(str(perfect_threshold))
 
 		# ====== ORIGINAL: compute new high/low predictions ======
@@ -1432,6 +1469,29 @@ try:
 
 		# clear + re-print one combined screen (so you don't see old output above new)
 		os.system('cls' if os.name == 'nt' else 'clear')
+
+		# Validate training status and display persistent warning if incomplete
+		training_warnings = []
+		for _sym in coins_this_iteration:
+			is_valid, missing_tfs = _validate_coin_training(_sym)
+			if not is_valid:
+				training_warnings.append(f"{_sym}: Missing {', '.join(missing_tfs)}")
+
+		if training_warnings:
+			print("="*70)
+			print("⚠ WARNING: INCOMPLETE TRAINING DETECTED ⚠")
+			print("="*70)
+			print("The following coins are missing required timeframe training:")
+			print()
+			for warning in training_warnings:
+				print(f"  • {warning}")
+			print()
+			print("Required timeframes:", ", ".join(REQUIRED_THINKER_TIMEFRAMES))
+			print()
+			print("Predictions may be inaccurate or use placeholder values.")
+			print("Please complete training for all coins before trading.")
+			print("="*70)
+			print()
 
 		# Print all coins' display output (use cached display from step_coin which includes symbol header)
 		for _sym in coins_this_iteration:
