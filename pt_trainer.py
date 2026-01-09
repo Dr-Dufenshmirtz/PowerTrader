@@ -1477,10 +1477,10 @@ while True:
 						debug_print(f"[DEBUG] TRAINER: Using fallback k = 3 (dataset_size={dataset_size} too small)")
 					
 					# Adaptive target percentage based on pattern complexity
-					# Formula: 0.01 × sqrt(pattern_size)
+					# Formula: 0.0001 × sqrt(pattern_size)
 					# Rationale: Larger patterns have more information content, need higher coverage
-					# Examples: pattern_size=2 → 1.41%, pattern_size=3 → 1.73%, pattern_size=5 → 2.24%
-					target_percentage = 0.01 * math.sqrt(pattern_size)
+					# Examples: pattern_size=2 → 0.0141%, pattern_size=3 → 0.0173%, pattern_size=5 → 0.0224%
+					target_percentage = 0.0001 * math.sqrt(pattern_size)
 					debug_print(f"[DEBUG] TRAINER: Adaptive target_percentage = {target_percentage*100:.2f}% (pattern_size={pattern_size})")
 					
 					# Target matches: min of adaptive % of dataset or dynamic k
