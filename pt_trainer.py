@@ -1093,6 +1093,7 @@ while True:
 	price_change_list = []
 	high_price_change_list = []
 	low_price_change_list = []
+	avg_volatility = 4.0  # Initialize with default, will be updated as data accumulates
 	debug_print(f"[DEBUG] TRAINER: Initialized empty price_change lists, starting with price_list_length={price_list_length}")
 	debug_print(f"[DEBUG] TRAINER: Total historical candles available: {len(price_list)}")
 	debug_print(f"[DEBUG] TRAINER: Starting perfect_threshold: {perfect_threshold}")
@@ -1123,14 +1124,18 @@ while True:
 			# Append ALL missing elements if window grew (avoids recalculation = O(n) instead of O(n²))
 			while len(price_list2) > len(price_change_list):
 				new_index = len(price_change_list)
-				if new_index < len(price_list2):
-					# Calculate close-to-close returns for proper volatility measurement
-					if new_index > 0 and price_list2[new_index-1] != 0:
-						price_change = 100*((price_list2[new_index]-price_list2[new_index-1])/price_list2[new_index-1])
+				if new_index < len(price_list2) and new_index < len(high_price_list2) and new_index < len(low_price_list2):
+					# Calculate high-low range volatility (true intraday range for 24/7 crypto markets)
+					high = high_price_list2[new_index]
+					low = low_price_list2[new_index]
+					if high > 0 and low > 0 and high >= low:
+						# Normalize by midpoint: range as % of typical price
+						midpoint = (high + low) / 2.0
+						price_change = 100.0 * ((high - low) / midpoint)
 					else:
-						price_change = 0.0  # First candle or division by zero
+						price_change = 0.0  # Invalid data or zero prices
 					price_change_list.append(price_change)
-					debug_print(f"[DEBUG] TRAINER: Added price_change[{new_index}] = {price_change:.4f}")
+					debug_print(f"[DEBUG] TRAINER: Added price_change[{new_index}] = {price_change:.4f} (high-low range)")
 			
 			while len(high_price_list2) > len(high_price_change_list):
 				new_index = len(high_price_change_list)
@@ -1427,19 +1432,20 @@ while True:
 						current_accuracy = 0.0
 					
 					# Calculate recent volatility for adaptive parameters
-					# Use RMS (root mean square) of recent price changes as volatility measure
+					# Use RMS (root mean square) of high-low range as volatility measure
+					# High-low range captures true intraday volatility for 24/7 crypto markets
 					# Used for adaptive threshold bounds and volatility-adaptive k-selection
 					volatility_window = min(500, max(10, int(len(price_change_list) * 0.1)))
 					if len(price_change_list) >= volatility_window:
 						recent_changes = price_change_list[-volatility_window:]
-						# RMS volatility: sqrt(mean(squared_changes))
+						# RMS volatility: sqrt(mean(squared_ranges))
 						avg_volatility = math.sqrt(sum(x**2 for x in recent_changes) / len(recent_changes))
 					else:
 						# Fallback for early training: use all available data
 						if len(price_change_list) > 0:
 							avg_volatility = math.sqrt(sum(x**2 for x in price_change_list) / len(price_change_list))
 						else:
-							avg_volatility = 2.0  # Default fallback (typical crypto volatility)
+							avg_volatility = 4.0  # Default fallback (typical crypto high-low range volatility)
 					
 					debug_print(f"[DEBUG] TRAINER: Calculated avg_volatility={avg_volatility:.3f}% (window={volatility_window})")
 					
@@ -1534,8 +1540,10 @@ while True:
 					effective_min = max(min_threshold, adaptive_min_threshold)
 					effective_max = min(max_threshold, adaptive_max_threshold)
 					# Safeguard: ensure max >= min (can occur in very low volatility)
-					if effective_max < effective_min:
-						effective_max = effective_min
+					# Give PID room to work by doubling min instead of locking to exact value
+					if effective_max < effective_min * 3.0:
+						effective_max = effective_min * 3.0
+						debug_print(f"[DEBUG] TRAINER: Adjusted effective_max from {min(max_threshold, adaptive_max_threshold):.2f} to {effective_max:.2f} (low volatility safeguard)")
 					perfect_threshold = max(effective_min, min(effective_max, perfect_threshold))
 					
 					# Status output
@@ -1846,20 +1854,21 @@ while True:
 									
 									# Determine trend arrow by comparing to last PRINTED accuracy (not last candle)
 									if last_printed_accuracy is None:
-										trend_arrow = "*"  # First print, starting point
+										trend_arrow = "[o]"  # First print, starting point
 									elif accuracy > last_printed_accuracy + adaptive_threshold:
-										trend_arrow = "+"
+										trend_arrow = "[+]"
 									elif accuracy < last_printed_accuracy - adaptive_threshold:
-										trend_arrow = "-"
+										trend_arrow = "[-]"
 									else:
-										trend_arrow = "="  # No significant change
+										trend_arrow = "[=]"  # No significant change
 									
 									formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 									limit_test_count = len(upordown4)
 									limit_test_count_formatted = f'{limit_test_count:,}'
 									print(f'Bounce Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} breakout candles)')
-									threshold_formatted = format(perfect_threshold, '.2f')
-									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold)')
+									threshold_formatted = format(perfect_threshold, '.1f')
+									volatility_formatted = format(avg_volatility, '.2f')
+									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold, {volatility_formatted}% volatility)')
 									acceptance_formatted = format(api_acceptance_rate, '.1f').rstrip('0').rstrip('.')
 									print(f'Total Candles: {total_candles:,} ({acceptance_formatted}% acceptance)')
 									

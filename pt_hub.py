@@ -2609,9 +2609,9 @@ class ApolloHub(tk.Tk):
 
         ttk.Label(legend, text="Level bars: 0 = bottom, 7 = top").pack(side="left")
         ttk.Label(legend, text="   ").pack(side="left")
-        ttk.Label(legend, text="L = Long").pack(side="left")
+        ttk.Label(legend, text="L = long").pack(side="left")
         ttk.Label(legend, text="  ").pack(side="left")
-        ttk.Label(legend, text="S = Short").pack(side="left")
+        ttk.Label(legend, text="S = short").pack(side="left")
 
         self.lbl_neural_overview_last = ttk.Label(legend, text="Last: N/A")
         self.lbl_neural_overview_last.pack(side="right")
@@ -2880,7 +2880,7 @@ class ApolloHub(tk.Tk):
         # ----------------------------
         # RIGHT TOP: Charts (tabs)
         # ----------------------------
-        charts_frame = ttk.LabelFrame(right_split, text="Charts (Neural lines overlaid)")
+        charts_frame = ttk.LabelFrame(right_split, text="Charts (neural lines overlaid)")
         self._charts_frame = charts_frame
 
         # Multi-row "tabs" (WrapFrame)
