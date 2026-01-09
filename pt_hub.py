@@ -2715,10 +2715,10 @@ class ApolloHub(tk.Tk):
 
         # Configurable font for live logs (Thinker/Trader/Trainers)
         try:
-            _base = tkfont.nametofont(LOG_FONT_FAMILY)
+            _base = tkfont.nametofont("Cascadia Code")
             self._live_log_font = _base.copy()
         except Exception:
-            self._live_log_font = tkfont.Font(family="Courier", size=LOG_FONT_SIZE)
+            self._live_log_font = tkfont.Font(family="Cascadia Code", size=LOG_FONT_SIZE)
         self._live_log_font.configure(size=LOG_FONT_SIZE)
 
         logs_frame = ttk.LabelFrame(left_split, text="Live Output")

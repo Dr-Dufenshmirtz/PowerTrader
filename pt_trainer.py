@@ -1843,13 +1843,13 @@ while True:
 									
 									# Determine trend arrow by comparing to last PRINTED accuracy (not last candle)
 									if last_printed_accuracy is None:
-										trend_arrow = "*"  # First print, starting point
+										trend_arrow = "●"  # First print, starting point
 									elif accuracy > last_printed_accuracy + adaptive_threshold:
-										trend_arrow = "^"
+										trend_arrow = "↑"
 									elif accuracy < last_printed_accuracy - adaptive_threshold:
-										trend_arrow = "v"
+										trend_arrow = "↓"
 									else:
-										trend_arrow = "="  # No significant change
+										trend_arrow = "→"  # No significant change
 									
 									formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 									limit_test_count = len(upordown4)
