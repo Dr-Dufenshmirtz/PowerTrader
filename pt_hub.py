@@ -40,6 +40,8 @@ import shutil
 import glob
 import bisect
 import psutil
+import base64
+import requests
 
 # Ensure CREATE_NO_WINDOW is available (added in Python 3.7)
 if not hasattr(subprocess, 'CREATE_NO_WINDOW'):
@@ -134,13 +136,13 @@ DARK_SELECT_FG = "#FFD54F"
 # Chart colors
 CHART_CANDLE_UP = "#00E676"
 CHART_CANDLE_DOWN = "#FF4081"
-CHART_NEURAL_LONG = "#2196F3"
-CHART_NEURAL_SHORT = "#FF9800"
+CHART_NEURAL_LONG = "#00E5FF"
+CHART_NEURAL_SHORT = "#FFD54F"
 CHART_SELL_LINE = "#00E676"
 CHART_DCA_LINE = "#FF4081"
 CHART_ASK_LINE = "#9C27B0"
 CHART_BID_LINE = "#00BCD4"
-CHART_ACCOUNT_LINE = "#2196F3"
+CHART_ACCOUNT_LINE = "#00E5FF"
 
 # Font settings (Modern Segoe UI)
 LOG_FONT_FAMILY = "Cascadia Mono"
@@ -512,10 +514,7 @@ class NeuralSignalTile(ttk.Frame):
             short_trade_y = int(round(yb - (short_max * self._bar_h / self._display_levels)))
             self.canvas.coords(self._short_marker, x2, short_trade_y, x3, short_trade_y)
 
-# -----------------------------
-# Settings / Paths
-# -----------------------------
-
+# Default configuration settings and file paths
 DEFAULT_SETTINGS = {
     "main_neural_dir": "",  # if blank, defaults to script directory
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
@@ -591,7 +590,7 @@ DEFAULT_TRAINING_CONFIG = {
     "pid_integral_limit": 20,
     "min_threshold": 5.0,
     "max_threshold": 25.0,
-    "pattern_size": 3,
+    "pattern_size": 5,
     "weight_base_step": 0.25,
     "weight_step_cap_multiplier": 2.0,
     "weight_threshold_base": 0.1,
@@ -774,10 +773,7 @@ def _fmt_pct(x: float) -> str:
 def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
-# -----------------------------
-# Neural folder detection
-# -----------------------------
-
+# Helper functions for neural folder detection and coin subfolder mapping
 def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     """
     All coins use subfolders, including BTC.
@@ -874,10 +870,7 @@ def read_short_signal(folder: str) -> int:
     else:
         return 0
 
-# -----------------------------
-# Candle fetching (KuCoin)
-# -----------------------------
-
+# KuCoin API integration for fetching candlestick chart data
 class CandleFetcher:
     """
     Uses kucoin-python if available; otherwise falls back to KuCoin REST via requests.
@@ -975,10 +968,7 @@ class CandleFetcher:
         except Exception:
             return []
 
-# -----------------------------
-# Chart widget
-# -----------------------------
-
+# Tkinter chart widget for displaying candlestick charts with neural level overlays
 class CandleChart(ttk.Frame):
     def __init__(
         self,
@@ -1499,17 +1489,53 @@ class CandleChart(ttk.Frame):
         else:
             self.last_update_label.config(text="Last: N/A")
 
-# -----------------------------
-# Account Value chart widget
-# -----------------------------
-
+# Account value chart widget for displaying account value over time with trade markers
 class AccountValueChart(ttk.Frame):
+    """
+    Matplotlib-based chart displaying account value over time.
+    
+    Features:
+    - Line plot with shaded fill underneath (gradient effect)
+    - Trade markers (BUY/DCA/SELL dots with coin labels)
+    - Dynamic y-axis formatting ($1000+ = no decimals, <$1000 = 2 decimals)
+    - Time-series x-axis with date + time labels
+    - Mtime-based caching (only redraws when data files change)
+    - Downsampling to max 250 points (prevents performance degradation)
+    - Auto-resizing to match container dimensions exactly
+    
+    Data Sources:
+    - account_value_history.jsonl: Time-series of total account value
+    - trade_history.jsonl: Trade events for marker overlays
+    
+    Performance Optimizations:
+    - Mtime caching: Skip redraw if files unchanged (checked every tick)
+    - Bucket averaging: Downsample large datasets by averaging buckets
+    - Debounced resize: Batch resize events during window dragging
+    - Sparse plotting: Max 250 data points regardless of history size
+    
+    Visual Design:
+    - Dark theme with cyan (#00E5FF) line and 15% transparent fill
+    - Trade dots color-coded: Green (SELL), Purple (DCA), Red (BUY)
+    - Coin-tagged markers: "BTC BUY", "ETH SELL", etc.
+    - Grid lines for readability without clutter
+    """
+    
     def __init__(self, parent: tk.Widget, history_path: str, trade_history_path: str, max_points: int = 250):
+        """
+        Initialize account value chart widget.
+        
+        Args:
+            parent: Parent Tkinter widget
+            history_path: Path to account_value_history.jsonl
+            trade_history_path: Path to trade_history.jsonl (for marker overlays)
+            max_points: Maximum data points to display (hard-capped at 250)
+        """
         super().__init__(parent)
         self.history_path = history_path
         self.trade_history_path = trade_history_path
-        # Hard-cap to 250 points max (account value chart only)
+        # Hard-cap to 250 points max (prevents matplotlib slowdown with large datasets)
         self.max_points = min(int(max_points or 0) or 250, 250)
+        # Mtime cache: tracks last modification time of data files to skip unnecessary redraws
         self._last_mtime: Optional[float] = None
 
         top = ttk.Frame(self)
@@ -1583,9 +1609,52 @@ class AccountValueChart(ttk.Frame):
             pass
 
     def refresh(self) -> None:
+        """
+        Redraw account value chart from data files (mtime-cached).
+        
+        Performance Strategy:
+        - Mtime caching: Only redraws if account_value_history.jsonl OR trade_history.jsonl changed
+        - Called every 10 seconds (default) by _tick() loop
+        - Early return if no file changes detected (zero overhead)
+        
+        Data Processing Pipeline:
+        1. Load & Parse: Read all lines from account_value_history.jsonl
+        2. Validate: Drop invalid/malformed data points (NaN, negative values, bad timestamps)
+        3. Sort: Ensure chronological order (handles out-of-order writes)
+        4. Dedupe: Remove duplicate timestamps (keeps latest value per timestamp)
+        5. Downsample: Average into max 250 buckets (prevents matplotlib slowdown)
+        6. Plot: Draw line + shaded fill + trade markers
+        
+        Downsampling Algorithm (Bucket Averaging):
+        - Divides N points into 250 evenly-sized buckets
+        - Averages timestamp and value within each bucket
+        - Result: Smooth chart that responds to new data without visual "jumping"
+        - Alternative (rejected): Random sampling causes visual instability
+        
+        Trade Markers:
+        - Overlays colored dots for BUY/DCA/SELL trades from all coins
+        - Uses bisect to find nearest account value point for each trade timestamp
+        - Color coding: Green (SELL), Purple (DCA), Red/Magenta (BUY)
+        - Labels: "BTC BUY", "ETH SELL", etc. (coin-tagged for clarity)
+        
+        Visual Formatting:
+        - Y-axis: Smart dollar formatting ($1000+ = no decimals, <$1000 = 2 decimals)
+        - X-axis: 5 evenly-spaced time labels with date + time (YYYY-MM-DD HH:MM:SS)
+        - Title: "Account Value ($X.XX)" - shows current value
+        - Last update label: "Last: HH:MM:SS" - shows timestamp of most recent data point
+        - Fill: 15% transparent cyan under line (extends to chart edges)
+        
+        Edge Cases:
+        - No data: Displays "Account Value - no data" title
+        - Single data point: Still draws chart (matplotlib handles gracefully)
+        - Large history (>250 points): Downsampled to prevent slowdown
+        - Duplicate timestamps: Latest value wins (handles rapid updates)
+        """
         path = self.history_path
 
-        # mtime cache so we don't redraw if nothing changed (account history OR trade history)
+        # === Mtime-Based Cache Check ===
+        # Only redraw if account history OR trade history files have changed
+        # This prevents expensive matplotlib redraws when no new data exists
         try:
             m_hist = os.path.getmtime(path)
         except Exception:
@@ -1596,13 +1665,17 @@ class AccountValueChart(ttk.Frame):
         except Exception:
             m_trades = None
 
+        # Use max(mtimes) so changes to either file trigger refresh
         candidates = [m for m in (m_hist, m_trades) if m is not None]
         mtime = max(candidates) if candidates else None
 
+        # Early return: No file changes since last refresh
         if mtime is not None and self._last_mtime == mtime:
             return
         self._last_mtime = mtime
 
+        # === Data Loading ===
+        # Load all account value history points (timestamp, value) tuples
         points: List[Tuple[float, float]] = []
 
         try:
@@ -1632,7 +1705,7 @@ class AccountValueChart(ttk.Frame):
         except Exception:
             points = []
 
-        # ---- Clean up history so single-tick bogus dips/spikes don't render ----
+        # Clean up account value history to remove invalid data points and single-tick anomalies
         if points:
             # Ensure chronological order
             points.sort(key=lambda x: x[0])
@@ -1697,7 +1770,11 @@ class AccountValueChart(ttk.Frame):
         # Only show cent-level changes (hide sub-cent noise)
         ys = [round(p[1], 2) for p in points]
 
+        # Draw the line
         self.ax.plot(xs, ys, linewidth=1.5, color=CHART_ACCOUNT_LINE)
+        
+        # Fill area under the line (shaded) - creates a gradient effect
+        self.ax.fill_between(xs, ys, alpha=0.15, color=CHART_ACCOUNT_LINE)
 
         # --- Trade dots (BUY / DCA / SELL) for ALL coins ---
         try:
@@ -1801,7 +1878,8 @@ class AccountValueChart(ttk.Frame):
         except Exception:
             pass
 
-        self.ax.set_xlim(-0.5, (len(points) - 0.5) + 0.6)
+        # Set x-axis limits to align with data points (fill extends to edges)
+        self.ax.set_xlim(xs[0], xs[-1])
 
         try:
             self.ax.set_title(f"Account Value ({_fmt_money(ys[-1])})", color=DARK_FG, fontsize=CHART_LABEL_FONT_SIZE, fontfamily=CHART_FONT_FAMILY)
@@ -1817,10 +1895,7 @@ class AccountValueChart(ttk.Frame):
 
         self.canvas.draw_idle()
 
-# -----------------------------
-# Hub App
-# -----------------------------
-
+# Main Hub application class and supporting dataclasses
 @dataclass
 class ProcInfo:
     name: str
@@ -1839,77 +1914,140 @@ class LogProc:
     coin: Optional[str] = None
 
 class ApolloHub(tk.Tk):
+    """
+    Main GUI application for ApolloTrader.
+    
+    Responsibilities:
+    - Display real-time account status, charts, and trade history
+    - Launch and monitor trainer, thinker, and trader subprocesses
+    - Provide user controls for starting/stopping components
+    - Manage configuration via settings dialogs
+    - Coordinate "Autopilot" mode (auto-train → auto-start thinking/trading)
+    - Fetch and display Robinhood account data independently of trader
+    
+    Architecture:
+    - Uses Tkinter for GUI with forced dark theme
+    - Communicates with subprocesses via JSON files in hub_data/
+    - Employs mtime caching to minimize file I/O and UI redraws
+    - Runs periodic _tick() loop for UI updates (default 1Hz)
+    """
+    
     def __init__(self):
+        """
+        Initialize the Hub GUI and set up all components.
+        
+        Initialization sequence:
+        1. Create main window with custom icon and minimum size
+        2. Load settings from gui_settings.json
+        3. Apply dark theme styling
+        4. Set up file paths for data exchange with subprocesses
+        5. Initialize state tracking variables
+        6. Build UI layout (menus, panels, charts, logs)
+        7. Start tick loop and schedule startup tasks
+        """
         super().__init__()
         self.title(f"Apollo Trader {VERSION.split('.')[0]}")
         self.geometry("1400x820")
 
-        # Set custom taskbar icon if at.ico exists
+        # Set custom taskbar icon if at.ico exists in project directory
+        # This gives the app a professional appearance in Windows taskbar
         icon_path = os.path.join(os.path.dirname(__file__), "at.ico")
         if os.path.isfile(icon_path):
             try:
                 self.iconbitmap(icon_path)
-                # Set AppUserModelID so Windows shows our icon in taskbar (not Python's)
+                # Set AppUserModelID so Windows taskbar displays our custom icon
+                # instead of Python's default icon (Windows-specific)
                 import ctypes
-                myappid = 'apollotrader.cryptoai.26'  # Arbitrary string
+                myappid = 'apollotrader.cryptoai.26'  # Arbitrary unique string
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
             except Exception:
                 pass  # Silently fail if icon can't be loaded
 
-        # Hard minimum window size so the UI can't be shrunk to a point where panes vanish.
-        # (Keeps things usable even if someone aggressively resizes.)
+        # Set minimum window size to prevent UI from becoming unusable when resized
+        # These dimensions ensure all panels remain visible and functional
         self.minsize(980, 640)
         
-        # Auto-start variable for menu checkbutton
+        # === Menu Checkbox Variables ===
+        # These BooleanVars are bound to menu checkboxes and persist to gui_settings.json
+        
+        # Auto-start: Launches thinker/trader automatically when Hub opens
         self.auto_start_var = tk.BooleanVar()
         
-        # Debug mode variable for menu checkbutton
+        # Debug mode: Enables verbose console output for troubleshooting
         self.debug_mode_var = tk.BooleanVar()
         
-        # Simulation mode variable for menu checkbutton
+        # Simulation mode: Prevents real trades (testing/development safety)
         self.simulation_mode_var = tk.BooleanVar()
 
-        # Debounce map for panedwindow clamp operations
+        # === UI Performance ===
+        # Debounce map prevents rapid-fire panedwindow resize events from causing lag
+        # Keys are pane widget IDs, values are after() callback IDs for cancellation
         self._paned_clamp_after_ids: Dict[str, str] = {}
 
+        # === Configuration Loading ===
+        # Load user settings from gui_settings.json (coins, directories, API keys, etc.)
         self.settings = self._load_settings()
         
-        # Load custom theme if enabled (overrides color constants)
+        # Load custom theme (cyber/midnight) if user has selected one
+        # This overrides default color constants defined at module level
         _load_theme_settings()
 
-        # Force one and only one theme: dark mode everywhere (must be after theme load)
+        # Apply forced dark mode styling to all Tk/ttk widgets
+        # Must run after theme load to respect custom color schemes
         self._apply_forced_dark_mode()
 
+        # === Directory Structure ===
+        # Project directory: Location of pt_hub.py (base for relative paths)
         self.project_dir = os.path.abspath(os.path.dirname(__file__))
 
-        # hub data dir
+        # Hub data directory: Shared communication channel between all processes
+        # Contains JSON/JSONL files written by trader/thinker, read by hub
         hub_dir = self.settings.get("hub_data_dir") or os.path.join(self.project_dir, "hub_data")
         self.hub_dir = os.path.abspath(hub_dir)
         _ensure_dir(self.hub_dir)
 
-        # file paths written by pt_trader.py (after edits below)
+        # === Inter-Process Communication Files ===
+        # These files are the primary data exchange mechanism between Hub and subprocesses
+        
+        # Written by pt_trader.py - Account status and open positions
         self.trader_status_path = os.path.join(self.hub_dir, "trader_status.json")
+        
+        # Written by pt_trader.py - Complete trade history (append-only log)
         self.trade_history_path = os.path.join(self.hub_dir, "trade_history.jsonl")
+        
+        # Written by pt_trader.py - Realized profit/loss ledger
         self.pnl_ledger_path = os.path.join(self.hub_dir, "pnl_ledger.json")
+        
+        # Written by pt_trader.py AND pt_hub.py - Account value time series for chart
+        # Hub writes when trader is stopped, trader writes when running (no conflicts)
         self.account_value_history_path = os.path.join(self.hub_dir, "account_value_history.jsonl")
 
-        # file written by pt_thinker.py (thinker readiness gate used for Start All)
+        # Written by pt_thinker.py - Signals when thinker is ready to provide predictions
+        # Used by "Start All" to coordinate thinker → trader startup sequence
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
 
-        # internal: when Start All is pressed, we start the thinker first and only start the trader once ready
+        # === Startup Coordination State ===
+        # When "Start All" is clicked, Hub starts thinker first, then waits for runner_ready.json
+        # before starting trader. This flag tracks whether trader is waiting for thinker.
         self._auto_start_trader_pending = False
 
-        # Autopilot mode state (orchestrates train → thinker → trader)
-        self._auto_mode_active = False
-        self._auto_mode_phase = ""
-        self._auto_mode_pending_coins: set = set()
+        # === Autopilot Mode State ===
+        # Autopilot orchestrates: auto-train untrained coins → start thinker → start trader
+        # This provides a "one-click" experience for first-time users
+        self._auto_mode_active = False          # Currently in Autopilot workflow
+        self._auto_mode_phase = ""              # Current phase: "training", "thinking", "trading"
+        self._auto_mode_pending_coins: set = set()  # Coins waiting for training to complete
 
-        # auto-retrain state (proactive retraining when approaching staleness)
-        self._auto_retraining_active = False
-        self._auto_retrain_pending_coins: set = set()
-        self._last_auto_retrain_check = 0.0
+        # === Auto-Retrain State (Proactive Training) ===
+        # Monitors training data staleness and auto-retrains before it becomes critical
+        # Prevents thinker/trader from using expired AI memory patterns
+        self._auto_retraining_active = False       # Currently in auto-retrain workflow
+        self._auto_retrain_pending_coins: set = set()  # Coins being retrained
+        self._last_auto_retrain_check = 0.0       # Timestamp of last staleness check
 
-        # cache latest trader status so charts can overlay buy/sell lines
+        # === Live Trading State Cache ===
+        # Stores most recent position data for each coin to overlay on charts
+        # Format: {coin: {current_buy_price, current_sell_price, trail_line, dca_line_price}}
         self._last_positions: Dict[str, dict] = {}
 
         # Trading config cache (mtime-based to avoid repeated file reads)
@@ -1949,6 +2087,8 @@ class ApolloHub(tk.Tk):
 
         # trainers: coin -> LogProc
         self.trainers: Dict[str, LogProc] = {}
+        # trainer log history: coin -> list of log lines (for switching between coins)
+        self.trainer_log_history: Dict[str, list] = {}
 
         self.fetcher = CandleFetcher()
 
@@ -1963,6 +2103,14 @@ class ApolloHub(tk.Tk):
         
         # Set simulation mode variable after settings are loaded
         self.simulation_mode_var.set(bool(self.settings.get("simulation_mode", False)))
+        
+        # Show simulation mode banner immediately if enabled (don't wait for first account fetch)
+        if bool(self.settings.get("simulation_mode", False)):
+            try:
+                self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE - NO REAL TRADES ⚠️")
+                self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4), before=self.lbl_acct_total_value)
+            except Exception:
+                pass
 
         # Refresh charts immediately when a timeframe is changed (don't wait for the 10s throttle).
         self.bind_all("<<TimeframeChanged>>", self._on_timeframe_changed)
@@ -1977,11 +2125,17 @@ class ApolloHub(tk.Tk):
         # Display bounce accuracy results on startup (after GUI is ready)
         # Increased delay to ensure all widgets are fully initialized
         self.after(500, self._display_startup_bounce_accuracy)
+        
+        # Fetch initial account info if API keys are present (displays immediately without starting trader)
+        # Delay increased to ensure all widgets are initialized
+        self.after(1500, self._fetch_initial_account_info)
+        
+        # Check if first-time setup is needed and open settings dialog
+        self.after(1000, self._check_first_time_setup)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---- forced dark mode ----
-
+    # Theme styling methods
     def _apply_forced_dark_mode(self) -> None:
         """Force a single, global, non-optional dark theme."""
         # Root background (handles the areas behind ttk widgets)
@@ -2212,25 +2366,73 @@ class ApolloHub(tk.Tk):
             except Exception:
                 pass
 
-    # ---- settings ----
-
+    # Configuration management methods for loading and saving settings
     def _load_settings(self) -> dict:
+        """
+        Load Hub configuration from gui_settings.json with intelligent defaults.
+        
+        Configuration Hierarchy:
+        1. DEFAULT_SETTINGS (module-level constants) - Base configuration
+        2. gui_settings.json (user overrides) - Persisted user preferences
+        3. Normalization (uppercase coins, absolute paths) - Post-processing
+        
+        Key Settings:
+        - coins: List of cryptocurrencies to trade (["BTC", "ETH"], etc.)
+        - main_neural_dir: Base directory for coin folders and AI memory files
+        - script_neural_trainer: Path to pt_trainer.py
+        - script_neural_runner: Path to pt_thinker.py
+        - script_trader: Path to pt_trader.py
+        - ui_refresh_seconds: Tick loop frequency (default 1.0s)
+        - chart_refresh_seconds: Chart update frequency (default 10.0s)
+        - account_refresh_seconds: Account data fetch interval (default 10.0s)
+        - auto_start_scripts: Launch thinker/trader on Hub startup
+        - debug_mode: Enable verbose console logging
+        - simulation_mode: Prevent real trades (safety mode)
+        
+        Fallback Behavior:
+        - If gui_settings.json missing or malformed: Uses DEFAULT_SETTINGS
+        - If main_neural_dir empty: Defaults to project directory
+        - If coins list empty: System still functions (user prompted to configure)
+        
+        Returns:
+            Merged dictionary with defaults + user settings + normalizations
+        """
         data = _safe_read_json(SETTINGS_FILE)
         if not isinstance(data, dict):
             data = {}
 
+        # Merge user settings on top of defaults (preserves all default keys)
         merged = dict(DEFAULT_SETTINGS)
         merged.update(data)
         
-        # If main_neural_dir is empty, use script directory
+        # Ensure main_neural_dir has a sensible default (project directory)
         if not merged.get("main_neural_dir"):
             merged["main_neural_dir"] = os.path.abspath(os.path.dirname(__file__))
         
-        # normalize
+        # Normalize coin symbols to uppercase and strip whitespace
+        # This ensures consistent coin folder names and case-insensitive matching
         merged["coins"] = [c.upper().strip() for c in merged.get("coins", [])]
         return merged
 
     def _save_settings(self) -> None:
+        """
+        Persist current settings to gui_settings.json (atomic write).
+        
+        Write Strategy:
+        - Uses _safe_write_json helper for atomic write (temp file + os.replace)
+        - Preserves all settings keys (not just changed values)
+        - Pretty-printed JSON with 2-space indentation for readability
+        
+        Trigger Points:
+        - Settings dialog "Save" button
+        - Menu checkbox toggles (auto-start, debug mode, simulation mode)
+        - Coin list modifications
+        - Directory path changes
+        
+        Thread Safety:
+        - Atomic write prevents partial reads by other processes
+        - No explicit locking (file operations are atomic at OS level)
+        """
         _safe_write_json(SETTINGS_FILE, self.settings)
 
     def _settings_getter(self) -> dict:
@@ -2298,8 +2500,7 @@ class ApolloHub(tk.Tk):
         except Exception:
             pass  # Don't let startup fail if status cleanup fails
 
-    # ---- menu / layout ----
-
+    # GUI construction methods for menus and layout
     def _build_menu(self) -> None:
         menubar = tk.Menu(
             self,
@@ -2461,9 +2662,7 @@ class ApolloHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_right_bottom_split", None)),
         ))
 
-        # ----------------------------
-        # LEFT: 1) Mission Control (pane)
-        # ----------------------------
+        # Mission Control panel: status display and primary action buttons
         top_controls = ttk.LabelFrame(left_split, text="Mission Control")
 
         info_row = ttk.Frame(top_controls)
@@ -2511,9 +2710,7 @@ class ApolloHub(tk.Tk):
         self.lbl_last_status = ttk.Label(controls_left, text="Last status: N/A")
         self.lbl_last_status.pack(anchor="w", padx=6, pady=(0, 6))
 
-        # ----------------------------
-        # Training section (everything training-specific lives here)
-        # ----------------------------
+        # Training controls panel with coin selection and training buttons
         train_buttons_row = ttk.Frame(training_left)
         train_buttons_row.pack(fill="x", padx=6, pady=(6, 6))
 
@@ -2709,10 +2906,7 @@ class ApolloHub(tk.Tk):
         except Exception:
             pass
 
-        # ----------------------------
-        # LEFT: 3) Live Output (pane)
-        # ----------------------------
-
+        # Live Output panel: tabs for Thinker, Trader, and Trainer logs
         # Configurable font for live logs (Thinker/Trader/Trainers)
         try:
             _base = tkfont.nametofont("Cascadia Code")
@@ -2786,6 +2980,29 @@ class ApolloHub(tk.Tk):
             width=8
         )
         self.trainer_coin_combo.pack(side="left", padx=(6, 12))
+
+        def _on_trainer_coin_changed(*_):
+            try:
+                # Restore the historical log for the selected coin
+                selected_coin = (self.trainer_coin_var.get() or "").strip().upper()
+                self.trainer_text.delete("1.0", "end")
+                
+                # Display the historical log lines for this coin
+                if selected_coin in self.trainer_log_history:
+                    history = self.trainer_log_history[selected_coin]
+                    if history:
+                        self.trainer_text.insert("end", "\n".join(history))
+                        if not history[-1].endswith("\n"):
+                            self.trainer_text.insert("end", "\n")
+                        self.trainer_text.see("end")
+                
+                # Sync with train_coin_combo if present
+                if hasattr(self, "train_coin_var"):
+                    self.train_coin_var.set(self.trainer_coin_var.get())
+            except Exception:
+                pass
+
+        self.trainer_coin_combo.bind("<<ComboboxSelected>>", _on_trainer_coin_changed)
 
         ttk.Button(top_bar, text="Start Trainer", command=self.start_trainer_for_selected_coin).pack(side="left")
         ttk.Button(top_bar, text="Stop Trainer", command=self.stop_trainer_for_selected_coin).pack(side="left", padx=(6, 0))
@@ -2877,9 +3094,7 @@ class ApolloHub(tk.Tk):
 
         self.after_idle(_init_left_split_sash_once)
 
-        # ----------------------------
-        # RIGHT TOP: Charts (tabs)
-        # ----------------------------
+        # Charts panel: tabbed interface for displaying price charts with neural overlays
         charts_frame = ttk.LabelFrame(right_split, text="Charts (neural lines overlaid)")
         self._charts_frame = charts_frame
 
@@ -3000,9 +3215,7 @@ class ApolloHub(tk.Tk):
         # show initial page
         self._show_chart_page("ACCOUNT")
 
-        # ----------------------------
-        # RIGHT BOTTOM: Current Trades + Trade History (stacked)
-        # ----------------------------
+        # Trading panels: current positions and historical trade log display
         right_bottom_split = ttk.Panedwindow(right_split, orient="vertical")
         self._pw_right_bottom_split = right_bottom_split
 
@@ -3223,8 +3436,7 @@ class ApolloHub(tk.Tk):
         self.status = ttk.Label(self, text="Ready", anchor="w")
         self.status.pack(fill="x", side="bottom")
 
-    # ---- panedwindow anti-collapse helpers ----
-
+    # Panedwindow helper methods to prevent pane collapse during resize
     def _schedule_paned_clamp(self, pw: ttk.Panedwindow) -> None:
         """
         Debounced clamp so we don't fight the geometry manager mid-resize.
@@ -3338,8 +3550,7 @@ class ApolloHub(tk.Tk):
             if self.settings.get("debug_mode", False):
                 print(f"[HUB DEBUG] Panedwindow sash clamping error: {e}")
 
-    # ---- process control ----
-
+    # Subprocess management methods for starting, stopping, and monitoring processes
     def _reader_thread(self, proc: subprocess.Popen, q: "queue.Queue[str]", prefix: str) -> None:
         try:
             # line-buffered text mode
@@ -3598,15 +3809,59 @@ class ApolloHub(tk.Tk):
             pass
 
     def start_all_scripts(self) -> None:
-        """Legacy wrapper for backwards compatibility. Calls start_auto_mode()."""
+        """
+        Legacy method name preserved for backwards compatibility.
+        Simply delegates to start_auto_mode() which implements the full workflow.
+        """
         self.start_auto_mode()
 
     def start_auto_mode(self) -> None:
         """
-        Auto Mode: Intelligently starts the full trading system.
-        - Checks training status (untrained or stale)
-        - If training needed: trains first, then proceeds
-        - If training current: starts thinker → waits for ready → starts trader
+        Autopilot Mode: One-click intelligent startup of the complete trading system.
+        
+        Purpose:
+        - Eliminate multi-step manual workflow (train → start thinker → start trader)
+        - Handle training prerequisites automatically
+        - Coordinate startup sequence with proper readiness gates
+        - Provide user-friendly progress notifications
+        
+        Decision Logic:
+        1. Check all configured coins for training status:
+           - NOT TRAINED: No training data exists yet
+           - STALE: Training data older than staleness_days setting
+           - ERROR: Training failed or incomplete
+           - TRAINED: Ready to trade
+        
+        2. If ANY coin needs training:
+           Phase A (TRAINING): Train all coins that need it in parallel
+           Phase B (THINKING): Start thinker, wait for runner_ready.json
+           Phase C (TRADING): Start trader
+        
+        3. If all coins are trained and current:
+           Phase B (THINKING): Start thinker immediately
+           Phase C (TRADING): Start trader once ready
+        
+        Workflow Coordination:
+        - Sets _auto_mode_active flag to prevent duplicate sessions
+        - Tracks _auto_mode_pending_coins set for training completion polling
+        - _tick() loop polls training status and advances phases automatically
+        - User sees progress via "Auto Mode: TRAINING..." status label
+        
+        Readiness Gate (Phase B → C):
+        - Thinker writes runner_ready.json when first predictions are available
+        - Hub polls runner_ready_path every tick
+        - Prevents trader from starting with no predictions (would fail immediately)
+        
+        Error Handling:
+        - Validates training completeness before starting thinker
+        - Re-checks staleness after training (guards against training failure)
+        - Displays user-friendly messages for each phase transition
+        
+        User Experience:
+        - Single button click: "🚀 AUTOPILOT"
+        - Progress displayed in status bar: "Auto Mode: TRAINING...", "Auto Mode: THINKING...", etc.
+        - Info dialogs explain what's happening at each phase
+        - Button changes to "⏹ STOP AUTOPILOT" while active
         """
         # Prevent duplicate Auto Mode sessions
         if getattr(self, "_auto_mode_active", False):
@@ -4208,7 +4463,7 @@ class ApolloHub(tk.Tk):
         except Exception:
             pass
 
-    # ---- refresh loop ----
+    # UI refresh methods for updating logs, charts, and status displays
     def _drain_queue_to_text(self, q: "queue.Queue[str]", txt: tk.Text, max_lines: int = 2500) -> None:
         # Check if user is already at bottom before adding new text
         was_at_bottom = False
@@ -4249,13 +4504,553 @@ class ApolloHub(tk.Tk):
                 except Exception:
                     txt.see("end")
 
+    def _check_first_time_setup(self) -> None:
+        """Check if this is first-time setup and open settings dialog if needed."""
+        try:
+            needs_setup = False
+            
+            # Check if gui_settings.json exists or is minimal (default config)
+            gui_settings_path = os.path.join(self.project_dir, "gui_settings.json")
+            if not os.path.isfile(gui_settings_path):
+                needs_setup = True
+                if self.settings.get("debug_mode", False):
+                    print("[HUB DEBUG] gui_settings.json not found - opening setup dialog")
+            else:
+                # Check if it's a minimal/default config (likely first run)
+                try:
+                    with open(gui_settings_path, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        # If file is empty or very small, consider it uninitialized
+                        if len(content) < 50:
+                            needs_setup = True
+                            if self.settings.get("debug_mode", False):
+                                print("[HUB DEBUG] gui_settings.json is minimal - opening setup dialog")
+                except Exception:
+                    pass
+            
+            # Check if API keys are configured
+            key_path = os.path.join(self.project_dir, "rh_key.enc")
+            secret_path = os.path.join(self.project_dir, "rh_secret.enc")
+            
+            if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+                needs_setup = True
+                if self.settings.get("debug_mode", False):
+                    print("[HUB DEBUG] API keys not found - opening setup dialog")
+            
+            # Open settings dialog if setup is needed
+            if needs_setup:
+                if self.settings.get("debug_mode", False):
+                    print("[HUB DEBUG] First-time setup needed - opening settings dialog")
+                self.open_settings_dialog()
+        except Exception as e:
+            # Silently fail - this is a convenience feature
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] _check_first_time_setup failed: {e}")
+    
+    def _fetch_initial_account_info(self) -> None:
+        """
+        Fetch Robinhood account data on Hub startup (before trader is started).
+        
+        Purpose:
+        - Display account balance immediately without waiting for trader
+        - Provide instant feedback on API key configuration
+        - Populate account chart with initial data point
+        
+        Process:
+        1. Check for encrypted API keys (rh_key.enc, rh_secret.enc)
+        2. Decrypt keys using Windows DPAPI
+        3. Create Ed25519 signature for Robinhood API authentication
+        4. Fetch account data (buying power + holdings)
+        5. Calculate total account value (cash + crypto holdings at bid price)
+        6. Write to trader_status.json (for UI labels)
+        7. Append to account_value_history.jsonl (for chart)
+        8. Display success/error message in Trader log
+        
+        Authentication:
+        - Uses Ed25519 signature authentication (Robinhood Crypto API requirement)
+        - Timestamp must be Unix seconds (not milliseconds)
+        - Signature covers: api_key + timestamp + path + method + body
+        
+        Error Handling:
+        - Silently skips if API keys not configured (first-time user experience)
+        - Displays user-friendly messages in Trader log for API failures
+        - Gracefully degrades if NaCl library unavailable
+        
+        UI Updates:
+        - Resets trader_status.json mtime cache to force immediate UI refresh
+        - Triggers account chart redraw
+        - Displays success message with account breakdown in Trader log
+        """
+        print("[HUB] Attempting to fetch initial account info...")
+        try:
+            # Check if API keys exist
+            key_path = os.path.join(self.project_dir, "rh_key.enc")
+            secret_path = os.path.join(self.project_dir, "rh_secret.enc")
+            
+            if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+                print("[HUB] API keys not found, skipping initial account fetch")
+                # Write a message to the trader log
+                try:
+                    if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
+                        msg = "ℹ Account info not loaded - Robinhood API keys not configured.\n"
+                        msg += "Go to Settings → Robinhood API to set up your API keys.\n\n"
+                        self.trader_text.insert("end", msg)
+                except Exception as e:
+                    print(f"[HUB] Could not write to trader_text: {e}")
+                return
+            
+            # Read and decrypt API keys
+            print("[HUB] Reading and decrypting API keys...")
+            try:
+                with open(key_path, 'rb') as f:
+                    api_key = _decrypt_with_dpapi(f.read()).strip()
+                with open(secret_path, 'rb') as f:
+                    private_key_b64 = _decrypt_with_dpapi(f.read()).strip()
+                print("[HUB] API keys decrypted successfully")
+            except Exception as e:
+                print(f"[HUB] Failed to decrypt API keys: {e}")
+                return
+            
+            if not api_key or not private_key_b64:
+                print("[HUB] API keys are empty after decryption")
+                return
+            
+            # Import nacl for signing (lazy import to avoid dependency if not needed)
+            try:
+                from nacl.signing import SigningKey
+                print("[HUB] NaCl library imported successfully")
+            except ImportError:
+                print("[HUB] NaCl library not available, skipping account fetch")
+                return
+            
+            # Initialize signing key
+            try:
+                private_key_seed = base64.b64decode(private_key_b64)
+                private_key = SigningKey(private_key_seed)
+                print("[HUB] Signing key initialized successfully")
+            except Exception as e:
+                print(f"[HUB] Failed to initialize signing key: {e}")
+                return
+            
+            # Make API request to get account info
+            base_url = "https://trading.robinhood.com"
+            path = "/api/v1/crypto/trading/accounts/"
+            timestamp = int(time.time())  # Use seconds, not milliseconds (matches test code)
+            body = ""
+            method = "GET"
+            
+            message_to_sign = f"{api_key}{timestamp}{path}{method}{body}"
+            signed = private_key.sign(message_to_sign.encode("utf-8"))
+            
+            headers = {
+                "x-api-key": api_key,
+                "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
+                "x-timestamp": str(timestamp),
+            }
+            
+            # Fetch account data
+            print(f"[HUB] Making API request to {base_url + path}...")
+            try:
+                response = requests.get(base_url + path, headers=headers, timeout=10)
+                print(f"[HUB] API response status: {response.status_code}")
+                if response.status_code == 200:
+                    account_data = response.json()
+                    
+                    # Write to trader_status.json so the UI can display it
+                    # API returns account data directly (not in a "results" array)
+                    if account_data and "buying_power" in account_data:
+                        buying_power = float(account_data.get("buying_power", 0))
+                        
+                        # Try to fetch holdings for more accurate account value
+                        holdings_sell_value = 0.0
+                        holdings_buy_value = 0.0
+                        total_account_value = buying_power
+                        
+                        try:
+                            # Fetch holdings
+                            print("[HUB] Fetching holdings...")
+                            holdings_path = "/api/v1/crypto/trading/holdings/"
+                            timestamp_h = int(time.time())  # Use seconds
+                            message_h = f"{api_key}{timestamp_h}{holdings_path}{method}{body}"
+                            signed_h = private_key.sign(message_h.encode("utf-8"))
+                            headers_h = {
+                                "x-api-key": api_key,
+                                "x-signature": base64.b64encode(signed_h.signature).decode("utf-8"),
+                                "x-timestamp": str(timestamp_h),
+                            }
+                            holdings_resp = requests.get(base_url + holdings_path, headers=headers_h, timeout=10)
+                            
+                            if holdings_resp.status_code == 200:
+                                holdings_data = holdings_resp.json()
+                                holdings_list = holdings_data.get("results", []) if isinstance(holdings_data, dict) else []
+                                
+                                # Get symbols for price lookup
+                                symbols = [h["asset_code"] + "-USD" for h in holdings_list if h.get("asset_code") != "USDC"]
+                                
+                                if symbols:
+                                    # Fetch trading pairs to get current prices
+                                    pairs_path = "/api/v1/crypto/trading/trading_pairs/"
+                                    timestamp_p = int(time.time())  # Use seconds
+                                    message_p = f"{api_key}{timestamp_p}{pairs_path}{method}{body}"
+                                    signed_p = private_key.sign(message_p.encode("utf-8"))
+                                    headers_p = {
+                                        "x-api-key": api_key,
+                                        "x-signature": base64.b64encode(signed_p.signature).decode("utf-8"),
+                                        "x-timestamp": str(timestamp_p),
+                                    }
+                                    pairs_resp = requests.get(base_url + pairs_path, headers=headers_p, timeout=10)
+                                    
+                                    if pairs_resp.status_code == 200:
+                                        pairs_data = pairs_resp.json()
+                                        prices = {}
+                                        pairs_list = pairs_data.get("results", []) if isinstance(pairs_data, dict) else []
+                                        for pair in pairs_list:
+                                            sym = pair.get("symbol")
+                                            prices[sym] = {
+                                                "bid": float(pair.get("bid_inclusive_of_sell_spread", 0)),
+                                                "ask": float(pair.get("ask_inclusive_of_buy_spread", 0))
+                                            }
+                                        
+                                        # Calculate holdings value
+                                        for holding in holdings_list:
+                                            asset = holding.get("asset_code")
+                                            if asset == "USDC":
+                                                continue
+                                            qty = float(holding.get("total_quantity", 0))
+                                            if qty <= 0:
+                                                continue
+                                            sym = f"{asset}-USD"
+                                            if sym in prices:
+                                                holdings_buy_value += qty * prices[sym]["ask"]
+                                                holdings_sell_value += qty * prices[sym]["bid"]
+                                        
+                                        total_account_value = buying_power + holdings_sell_value
+                        except Exception as e_holdings:
+                            # If holdings fetch fails, just use buying_power
+                            if self.settings.get("debug_mode", False):
+                                print(f"[HUB DEBUG] Holdings fetch failed (using buying_power only): {e_holdings}")
+                        
+                        # Calculate percent in trade
+                        percent_in_trade = (holdings_sell_value / total_account_value * 100) if total_account_value > 0 else 0.0
+                        # Create a minimal trader_status.json with account info
+                        status = {
+                            "timestamp": time.time(),
+                            "simulation_mode": bool(self.settings.get("simulation_mode", False)),
+                            "account": {
+                                "total_account_value": total_account_value,
+                                "buying_power": buying_power,
+                                "holdings_sell_value": holdings_sell_value,
+                                "holdings_buy_value": holdings_buy_value,
+                                "percent_in_trade": percent_in_trade,
+                            },
+                            "positions": {},
+                            "_source": "hub_initial_fetch"
+                        }
+                        
+                        # Write atomically
+                        tmp_path = self.trader_status_path + ".tmp"
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(status, f, indent=2)
+                        os.replace(tmp_path, self.trader_status_path)
+                        
+                        # Also write to account value history for the chart
+                        try:
+                            history_entry = {
+                                "ts": time.time(),
+                                "total_account_value": total_account_value
+                            }
+                            with open(self.account_value_history_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(history_entry) + "\n")
+                            # Track last written value for duplicate checking in periodic fetches
+                            self._last_written_account_value = total_account_value
+                        except Exception:
+                            pass
+                        
+                        # Reset mtime cache and refresh UI
+                        try:
+                            self._last_trader_status_mtime = None
+                        except Exception:
+                            pass
+                        
+                        # Force an immediate UI refresh to display the account info
+                        try:
+                            self._refresh_trader_status()
+                        except Exception:
+                            pass
+                        
+                        # Refresh the account chart to show the new data point
+                        try:
+                            if hasattr(self, 'account_chart'):
+                                self.account_chart.refresh()
+                        except Exception:
+                            pass
+                        
+                        # Write success message to trader log
+                        try:
+                            if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
+                                msg = f"✓ Account info loaded: ${total_account_value:.2f} (${buying_power:.2f} buying power, ${holdings_sell_value:.2f} in holdings)\n\n"
+                                self.trader_text.insert("end", msg)
+                        except Exception:
+                            pass
+                        
+                        # Success - return to avoid error messages below
+                        return
+                    else:
+                        # account_data doesn't have expected structure
+                        try:
+                            if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
+                                msg = "⚠ Account info fetch failed: unexpected API response structure\n\n"
+                                self.trader_text.insert("end", msg)
+                        except Exception:
+                            pass
+                else:
+                    # API request failed
+                    print(f"[HUB] API request failed with status {response.status_code}")
+                    try:
+                        if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
+                            msg = f"⚠ Account info fetch failed (HTTP {response.status_code})\n"
+                            msg += "Check your API keys in Settings → Robinhood API\n\n"
+                            self.trader_text.insert("end", msg)
+                    except Exception as e:
+                        print(f"[HUB] Could not write error to trader_text: {e}")
+            except requests.Timeout:
+                print("[HUB] API request timed out")
+                try:
+                    if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
+                        msg = "⚠ Account info fetch timed out\n"
+                        msg += "Check your internet connection\n\n"
+                        self.trader_text.insert("end", msg)
+                except Exception as e:
+                    print(f"[HUB] Could not write error to trader_text: {e}")
+            except Exception as e:
+                print(f"[HUB] API request failed: {e}")
+                try:
+                    if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
+                        msg = f"⚠ Account info fetch error: {str(e)[:100]}\n\n"
+                        self.trader_text.insert("end", msg)
+                except Exception as e2:
+                    print(f"[HUB] Could not write error to trader_text: {e2}")
+        except Exception as e:
+            # Log all outer exceptions
+            print(f"[HUB] _fetch_initial_account_info failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _update_account_data_silent(self) -> None:
+        """
+        Background account data refresh (silent, no user notifications).
+        
+        Purpose:
+        - Keep account chart and labels current when trader is stopped
+        - Provide real-time account value updates during non-trading hours
+        - Enable account monitoring without starting the trader
+        
+        Behavior:
+        - Called every 10 seconds (default) by _tick() loop when trader is NOT running
+        - Skips automatically when trader starts (trader handles updates at higher frequency)
+        - All errors handled silently (no console output, no UI messages)
+        - Only writes new data points if account value changed by > $0.01 (prevents flat redundant lines)
+        
+        Data Flow:
+        1. Fetch account data from Robinhood API (same as _fetch_initial_account_info)
+        2. Calculate total account value (buying power + holdings)
+        3. Compare to last written value (_last_written_account_value)
+        4. If changed significantly (> $0.01), write to:
+           - trader_status.json (account labels auto-refresh via mtime cache)
+           - account_value_history.jsonl (chart auto-updates via mtime cache)
+        5. Reset mtime cache to trigger UI refresh on next tick
+        
+        Integration with Trader:
+        - Hub writes "_source": "hub_periodic_fetch" to trader_status.json
+        - Trader writes "_source": "trader_update" to trader_status.json
+        - Both sources are compatible (same JSON schema)
+        - No file conflicts: Hub checks trader_running flag before writing
+        
+        Performance:
+        - Minimal API calls: Respects configurable interval (default 10s)
+        - Duplicate filtering: Only writes when value changes
+        - Silent failures: Network issues don't spam console or dialogs
+        """
+        try:
+            # Check if API keys exist
+            key_path = os.path.join(self.project_dir, "rh_key.enc")
+            secret_path = os.path.join(self.project_dir, "rh_secret.enc")
+            
+            if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+                return  # No keys, skip silently
+            
+            # Read and decrypt API keys
+            try:
+                with open(key_path, 'rb') as f:
+                    api_key = _decrypt_with_dpapi(f.read()).strip()
+                with open(secret_path, 'rb') as f:
+                    private_key_b64 = _decrypt_with_dpapi(f.read()).strip()
+            except Exception:
+                return  # Decryption failed, skip silently
+            
+            if not api_key or not private_key_b64:
+                return  # Empty keys, skip silently
+            
+            # Import nacl for signing
+            try:
+                from nacl.signing import SigningKey
+            except ImportError:
+                return  # NaCl not available, skip silently
+            
+            # Initialize signing key
+            try:
+                private_key_seed = base64.b64decode(private_key_b64)
+                private_key = SigningKey(private_key_seed)
+            except Exception:
+                return  # Key initialization failed, skip silently
+            
+            # Make API request
+            base_url = "https://trading.robinhood.com"
+            path = "/api/v1/crypto/trading/accounts/"
+            timestamp = int(time.time())
+            body = ""
+            method = "GET"
+            
+            message_to_sign = f"{api_key}{timestamp}{path}{method}{body}"
+            signed = private_key.sign(message_to_sign.encode("utf-8"))
+            
+            headers = {
+                "x-api-key": api_key,
+                "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
+                "x-timestamp": str(timestamp),
+            }
+            
+            try:
+                response = requests.get(base_url + path, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    account_data = response.json()
+                    
+                    if account_data and "buying_power" in account_data:
+                        buying_power = float(account_data.get("buying_power", 0))
+                        holdings_sell_value = 0.0
+                        holdings_buy_value = 0.0
+                        total_account_value = buying_power
+                        
+                        # Try to fetch holdings for more accurate account value
+                        try:
+                            holdings_path = "/api/v1/crypto/trading/holdings/"
+                            timestamp_h = int(time.time())
+                            message_h = f"{api_key}{timestamp_h}{holdings_path}{method}{body}"
+                            signed_h = private_key.sign(message_h.encode("utf-8"))
+                            headers_h = {
+                                "x-api-key": api_key,
+                                "x-signature": base64.b64encode(signed_h.signature).decode("utf-8"),
+                                "x-timestamp": str(timestamp_h),
+                            }
+                            holdings_resp = requests.get(base_url + holdings_path, headers=headers_h, timeout=10)
+                            
+                            if holdings_resp.status_code == 200:
+                                holdings_data = holdings_resp.json()
+                                holdings_list = holdings_data.get("results", []) if isinstance(holdings_data, dict) else []
+                                
+                                # Get symbols for price lookup
+                                symbols = [h["asset_code"] + "-USD" for h in holdings_list if h.get("asset_code") != "USDC"]
+                                
+                                if symbols:
+                                    # Fetch trading pairs to get current prices
+                                    pairs_path = "/api/v1/crypto/trading/trading_pairs/"
+                                    timestamp_p = int(time.time())
+                                    message_p = f"{api_key}{timestamp_p}{pairs_path}{method}{body}"
+                                    signed_p = private_key.sign(message_p.encode("utf-8"))
+                                    headers_p = {
+                                        "x-api-key": api_key,
+                                        "x-signature": base64.b64encode(signed_p.signature).decode("utf-8"),
+                                        "x-timestamp": str(timestamp_p),
+                                    }
+                                    pairs_resp = requests.get(base_url + pairs_path, headers=headers_p, timeout=10)
+                                    
+                                    if pairs_resp.status_code == 200:
+                                        pairs_data = pairs_resp.json()
+                                        prices = {}
+                                        pairs_list = pairs_data.get("results", []) if isinstance(pairs_data, dict) else []
+                                        for pair in pairs_list:
+                                            sym = pair.get("symbol")
+                                            prices[sym] = {
+                                                "bid": float(pair.get("bid_inclusive_of_sell_spread", 0)),
+                                                "ask": float(pair.get("ask_inclusive_of_buy_spread", 0))
+                                            }
+                                        
+                                        # Calculate holdings value
+                                        for holding in holdings_list:
+                                            asset = holding.get("asset_code")
+                                            if asset == "USDC":
+                                                continue
+                                            qty = float(holding.get("total_quantity", 0))
+                                            if qty <= 0:
+                                                continue
+                                            sym = f"{asset}-USD"
+                                            if sym in prices:
+                                                holdings_buy_value += qty * prices[sym]["ask"]
+                                                holdings_sell_value += qty * prices[sym]["bid"]
+                                        
+                                        total_account_value = buying_power + holdings_sell_value
+                        except Exception:
+                            pass  # Holdings fetch failed, use buying_power only
+                        
+                        # Calculate percent in trade
+                        percent_in_trade = (holdings_sell_value / total_account_value * 100) if total_account_value > 0 else 0.0
+                        
+                        # Create trader_status.json entry
+                        status = {
+                            "timestamp": time.time(),
+                            "simulation_mode": bool(self.settings.get("simulation_mode", False)),
+                            "account": {
+                                "total_account_value": total_account_value,
+                                "buying_power": buying_power,
+                                "holdings_sell_value": holdings_sell_value,
+                                "holdings_buy_value": holdings_buy_value,
+                                "percent_in_trade": percent_in_trade,
+                            },
+                            "positions": {},
+                            "_source": "hub_periodic_fetch"
+                        }
+                        
+                        # Write atomically
+                        tmp_path = self.trader_status_path + ".tmp"
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(status, f, indent=2)
+                        os.replace(tmp_path, self.trader_status_path)
+                        
+                        # Also write to account value history for the chart
+                        # Only write if value changed significantly (> $0.01) to avoid duplicate flat lines
+                        try:
+                            last_written_value = getattr(self, "_last_written_account_value", None)
+                            value_changed = (last_written_value is None or 
+                                           abs(total_account_value - last_written_value) > 0.01)
+                            
+                            if value_changed:
+                                history_entry = {
+                                    "ts": time.time(),
+                                    "total_account_value": total_account_value
+                                }
+                                with open(self.account_value_history_path, "a", encoding="utf-8") as f:
+                                    f.write(json.dumps(history_entry) + "\n")
+                                self._last_written_account_value = total_account_value
+                        except Exception:
+                            pass
+                        
+                        # Reset mtime cache and refresh UI (no blocking UI operations)
+                        try:
+                            self._last_trader_status_mtime = None
+                        except Exception:
+                            pass
+                        
+                        # Chart will refresh on next tick cycle (already throttled)
+            except requests.Timeout:
+                pass  # Timeout, skip silently
+            except Exception:
+                pass  # Other error, skip silently
+        except Exception:
+            pass  # Outer exception, skip silently
+    
     def _display_startup_bounce_accuracy(self) -> None:
         """Display bounce accuracy results for all coins on Hub startup."""
         try:
-            if self.settings.get("debug_mode", False):
-                print(f"[HUB DEBUG] _display_startup_bounce_accuracy() called")
-                print(f"[HUB DEBUG] Checking bounce accuracy for coins: {self.coins}")
-            
             trained_coins_found = 0
             
             # Only check files if coins are configured
@@ -4263,12 +5058,32 @@ class ApolloHub(tk.Tk):
                 for coin in self.coins:
                     coin_folder = self.coin_folders.get(coin)
                     if not coin_folder:
-                        if self.settings.get("debug_mode", False):
-                            print(f"[HUB DEBUG] No coin folder found for {coin}")
                         continue
                     
                     accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
+                    
+                    # Initialize history for this coin if not present
+                    if coin not in self.trainer_log_history:
+                        self.trainer_log_history[coin] = []
+                    
                     if not os.path.isfile(accuracy_file):
+                        # No training data yet - add a helpful message
+                        msg = f"Training Status ({coin})\n"
+                        msg += f"Status: Not yet trained\n\n"
+                        msg += f"ℹ This coin has not been trained yet.\n"
+                        msg += f"Click 'Start Trainer' to begin training for {coin}.\n\n"
+                        
+                        # Add to history
+                        for line in msg.split("\n"):
+                            if line or msg.endswith("\n"):
+                                self.trainer_log_history[coin].append(line)
+                        
+                        # Display if this coin is currently selected
+                        current_coin = (self.trainer_coin_var.get() or "").strip().upper()
+                        if coin == current_coin:
+                            self.trainer_text.insert("end", msg)
+                            self.trainer_text.see("end")
+                        
                         continue
                     
                     try:
@@ -4299,11 +5114,6 @@ class ApolloHub(tk.Tk):
                         # Use the same training validation logic as the training window
                         if self._coin_is_trained(coin):
                             trained_coins_found += 1
-                            if self.settings.get("debug_mode", False):
-                                print(f"[HUB DEBUG] Found fully trained coin: {coin} (total trained: {trained_coins_found})")
-                        else:
-                            if self.settings.get("debug_mode", False):
-                                print(f"[HUB DEBUG] Coin {coin} is not fully trained")
                         
                         # Format and display
                         msg = f"Bounce Accuracy Results ({coin})\n"
@@ -4323,22 +5133,27 @@ class ApolloHub(tk.Tk):
                             msg += f"❌ Please retrain this coin to complete the training process.\n"
                             msg += f"\n\n"
                         
-                        # Insert into trainer log
-                        self.trainer_text.insert("end", msg)
-                        self.trainer_text.see("end")
+                        # Split message into lines and add to history (coin already initialized above)
+                        for line in msg.split("\n"):
+                            if line or msg.endswith("\n"):  # Preserve empty lines if they were in the original
+                                self.trainer_log_history[coin].append(line)
+                        
+                        # Keep history manageable
+                        if len(self.trainer_log_history[coin]) > 2500:
+                            self.trainer_log_history[coin] = self.trainer_log_history[coin][-2500:]
+                        
+                        # Insert into trainer log if this coin is currently selected
+                        current_coin = (self.trainer_coin_var.get() or "").strip().upper()
+                        if coin == current_coin:
+                            self.trainer_text.insert("end", msg)
+                            self.trainer_text.see("end")
                     
                     except Exception as e:
                         # Silently skip files that can't be read
                         pass
             
             # If no trained coins were found, display a helpful message in Thinker log
-            if self.settings.get("debug_mode", False):
-                print(f"[HUB DEBUG] Final trained_coins_found count: {trained_coins_found}")
-            
             if trained_coins_found == 0:
-                if self.settings.get("debug_mode", False):
-                    print(f"[HUB DEBUG] No trained coins found ({trained_coins_found}), displaying message in Thinker log")
-                
                 msg = (
                     "⚠ No trained coins detected\n\n"
                     "The Thinker requires trained AI models to generate trading signals.\n"
@@ -4353,18 +5168,10 @@ class ApolloHub(tk.Tk):
                 try:
                     self.runner_text.insert("end", msg)
                     self.runner_text.see("end")
-                    
-                    if self.settings.get("debug_mode", False):
-                        print(f"[HUB DEBUG] Message inserted into Thinker log successfully")
-                except Exception as insert_err:
-                    if self.settings.get("debug_mode", False):
-                        print(f"[HUB DEBUG] Failed to insert message: {insert_err}")
-                    # Try direct print as fallback
-                    print(msg)
+                except Exception:
+                    pass
         except Exception as e:
-            # Log error if debug mode enabled
             if self.settings.get("debug_mode", False):
-                print(f"[HUB DEBUG] Error in _display_startup_bounce_accuracy: {e}")
                 import traceback
                 traceback.print_exc()
             else:
@@ -4372,7 +5179,43 @@ class ApolloHub(tk.Tk):
                 print(f"Error checking trained coins: {e}")
 
     def _tick(self) -> None:
-        # process labels
+        """
+        Main UI update loop - refreshes all Hub components periodically.
+        
+        Execution Frequency:
+        - Runs every 1 second (default, configurable via "ui_refresh_seconds")
+        - Reschedules itself at the end of each cycle
+        
+        Primary Responsibilities:
+        1. Monitor subprocess status (trainer/thinker/trader running state)
+        2. Check for training data staleness and trigger auto-retrain
+        3. Fetch periodic account data when trader is stopped
+        4. Update status labels (Thinker/Trader running indicators)
+        5. Update button states based on training completeness
+        6. Refresh data-driven panels (trader status, PnL, trade history)
+        7. Refresh charts (throttled to separate configurable interval)
+        8. Drain log queues into UI text widgets
+        9. Poll for Autopilot/auto-retrain workflow completion
+        
+        Performance Optimizations:
+        - Mtime caching: Only redraws UI when underlying data files change
+        - Chart throttling: Charts refresh at lower frequency (default 10s)
+        - Subprocess polling: Uses poll() for zero-overhead process checking
+        - Queue draining: Non-blocking get_nowait() prevents thread contention
+        
+        Staleness Monitoring:
+        - RUNTIME CHECK: Immediately stops everything if training becomes stale during trading
+        - AUTO-RETRAIN: Proactively retrains coins approaching staleness (24hr warning)
+        - Batch retraining: Retrains all coins near staleness in one operation
+        
+        Autopilot Integration:
+        - Coordinates multi-phase workflow: train → start thinker → start trader
+        - Polls for completion of each phase before advancing
+        - Handles auto-start of trader once thinker reports ready
+        """
+        
+        # === Subprocess Status Detection ===
+        # Check if processes are alive by polling (non-blocking, no overhead)
         neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
         trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
 
@@ -4448,6 +5291,24 @@ class ApolloHub(tk.Tk):
                     
                     # Poll for completion
                     self.after(2000, self._poll_auto_retrain_completion)
+
+        # --- PERIODIC ACCOUNT DATA REFRESH ---
+        # Fetch fresh account data at regular intervals to keep chart/labels current
+        # Skip if trader is running (trader handles account updates at higher frequency)
+        if not trader_running:
+            last_account_fetch = getattr(self, "_last_account_fetch_time", 0)
+            # Match chart refresh frequency for uniform x-axis updates (default 10 seconds)
+            chart_refresh_sec = float(self.settings.get("chart_refresh_seconds", 10.0))
+            account_fetch_interval = float(self.settings.get("account_refresh_seconds", chart_refresh_sec))
+            
+            if (now - last_account_fetch) >= account_fetch_interval:
+                self._last_account_fetch_time = now
+                # Fetch in background (non-blocking, silent)
+                try:
+                    self._update_account_data_silent()
+                except Exception as e:
+                    if self.settings.get("debug_mode", False):
+                        print(f"[HUB DEBUG] Periodic account fetch failed: {e}")
 
         self.lbl_neural.config(text=f"Thinker: {'RUNNING' if neural_running else 'STOPPED'}")
         self.lbl_trader.config(text=f"Trader: {'RUNNING' if trader_running else 'STOPPED'}")
@@ -4613,7 +5474,43 @@ class ApolloHub(tk.Tk):
 
             lp = self.trainers.get(sel)
             if lp:
-                self._drain_queue_to_text(lp.log_q, self.trainer_text)
+                # Initialize history for this coin if not present
+                if sel not in self.trainer_log_history:
+                    self.trainer_log_history[sel] = []
+                
+                # Drain new messages and add to history
+                try:
+                    while True:
+                        line = lp.log_q.get_nowait()
+                        self.trainer_log_history[sel].append(line)
+                        # Keep history manageable (last 2500 lines)
+                        if len(self.trainer_log_history[sel]) > 2500:
+                            self.trainer_log_history[sel] = self.trainer_log_history[sel][-2500:]
+                except queue.Empty:
+                    pass
+                
+                # Display to text widget (only if this coin is currently selected)
+                if self.trainer_log_history[sel]:
+                    # Check if we need to update the display
+                    current_line_count = int(self.trainer_text.index("end-1c").split(".")[0])
+                    history_line_count = len(self.trainer_log_history[sel])
+                    
+                    # If mismatch, refresh the entire display
+                    if abs(current_line_count - history_line_count) > 1:
+                        was_at_bottom = False
+                        try:
+                            yview = self.trainer_text.yview()
+                            was_at_bottom = (yview[1] >= 0.98)
+                        except Exception:
+                            was_at_bottom = True
+                        
+                        self.trainer_text.delete("1.0", "end")
+                        self.trainer_text.insert("end", "\n".join(self.trainer_log_history[sel]))
+                        if not self.trainer_log_history[sel][-1].endswith("\n"):
+                            self.trainer_text.insert("end", "\n")
+                        
+                        if was_at_bottom:
+                            self.trainer_text.see("end")
         except Exception:
             pass
 
@@ -4674,7 +5571,7 @@ class ApolloHub(tk.Tk):
             if self.settings.get("debug_mode", False):
                 print(f"[HUB DEBUG] Simulation mode status: {sim_mode}")
             if sim_mode:
-                self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE - NO REAL TRADES ⚠️")
+                self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE ⚠️")
                 if not self.lbl_simulation_banner.winfo_ismapped():
                     self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4), before=self.lbl_acct_total_value)
                     if self.settings.get("debug_mode", False):
@@ -4690,7 +5587,6 @@ class ApolloHub(tk.Tk):
         acct = data.get("account", {}) or {}
         try:
             total_val = float(acct.get("total_account_value", 0.0) or 0.0)
-
             self.lbl_acct_total_value.config(
                 text=f"Total Account Value: {_fmt_money(acct.get('total_account_value', None))}"
             )
@@ -4708,10 +5604,7 @@ class ApolloHub(tk.Tk):
                 pit_txt = "N/A"
             self.lbl_acct_percent_in_trade.config(text=f"Percent In Trade: {pit_txt}")
 
-            # -------------------------
-            # DCA affordability
-            # Uses actual trading settings to calculate how many DCA levels you can afford
-            # -------------------------
+            # DCA affordability calculation using trading settings to determine available DCA levels
             coins = getattr(self, "coins", None) or []
             n = len(coins) if len(coins) > 0 else 1
             
@@ -5305,8 +6198,7 @@ class ApolloHub(tk.Tk):
         # Restore selection
         self._show_chart_page(selected)
 
-    # ---- settings dialog ----
-
+    # Settings dialog methods for GUI-based configuration management
     def open_settings_dialog(self) -> None:
         # Prevent duplicate dialogs - bring existing one to front if already open
         if hasattr(self, "_settings_dialog_win") and self._settings_dialog_win and self._settings_dialog_win.winfo_exists():
@@ -5680,9 +6572,7 @@ class ApolloHub(tk.Tk):
             existing_api_key, existing_private_b64 = _read_api_files()
             private_b64_state = {"value": (existing_private_b64 or "").strip()}
 
-            # -----------------------------
-            # Helpers (open folder, copy, etc.)
-            # -----------------------------
+            # Helper functions for file management and clipboard operations
             def _open_in_file_manager(path: str) -> None:
                 try:
                     p = os.path.abspath(path)
@@ -5710,9 +6600,7 @@ class ApolloHub(tk.Tk):
                 except Exception:
                     return p
 
-            # -----------------------------
-            # Big, beginner-friendly instructions
-            # -----------------------------
+            # Instructional text and UI layout for Robinhood API setup wizard
             intro_frame = ttk.Frame(container)
             intro_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
             intro_frame.columnconfigure(0, weight=1)
@@ -5770,9 +6658,7 @@ class ApolloHub(tk.Tk):
             ttk.Button(top_btns, text="Open Robinhood Crypto Trading API docs", command=lambda: webbrowser.open("https://docs.robinhood.com/crypto/trading/")).pack(side="left", padx=8)
             ttk.Button(top_btns, text="Open Folder With rh_key.enc / rh_secret.enc", command=lambda: _open_in_file_manager(self.project_dir)).pack(side="left", padx=8)
 
-            # -----------------------------
-            # Step 1 — Generate keys
-            # -----------------------------
+            # Step 1: Key generation UI for creating Ed25519 keypair
             step1 = ttk.LabelFrame(container, text="Step 1 — Generate your keys (click once)")
             step1.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
             step1.columnconfigure(0, weight=1)
@@ -5865,9 +6751,7 @@ class ApolloHub(tk.Tk):
             ttk.Button(step1_btns, text="Generate Keys", command=generate_keys).pack(side="left")
             ttk.Button(step1_btns, text="Copy Public Key", command=copy_public_key).pack(side="left", padx=8)
 
-            # -----------------------------
-            # Step 2 — Paste API key (from Robinhood)
-            # -----------------------------
+            # Step 2: API key input UI for Robinhood-provided credentials
             step2 = ttk.LabelFrame(container, text="Step 2 — Paste your Robinhood API Key here")
             step2.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
             step2.columnconfigure(0, weight=1)
@@ -5974,9 +6858,7 @@ class ApolloHub(tk.Tk):
             step2_btns.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
             ttk.Button(step2_btns, text="Test Credentials (safe, no trading)", command=_test_credentials).pack(side="left")
 
-            # -----------------------------
-            # Step 3 — Save
-            # -----------------------------
+            # Step 3: Credential persistence UI for saving encrypted keys to disk
             step3 = ttk.LabelFrame(container, text="Step 3 — Save to files (required)")
             step3.grid(row=4, column=0, sticky="nsew")
             step3.columnconfigure(0, weight=1)
@@ -6233,8 +7115,7 @@ class ApolloHub(tk.Tk):
         ttk.Button(btns, text="Cancel", command=on_close).pack(side="left", padx=8)
         ttk.Button(btns, text="Reset to Defaults", command=reset_hub_defaults).pack(side="left")
 
-    # ---- config file editors ----
-
+    # Configuration file editor dialogs for trading and training settings
     def open_trading_settings_dialog(self) -> None:
         """Open GUI dialog for editing trading_settings.json."""
         # Prevent duplicate dialogs - bring existing one to front if already open
@@ -6884,7 +7765,7 @@ class ApolloHub(tk.Tk):
 
         # Pattern size (moved from Pattern Quality)
         ttk.Label(learning_frame, text="Pattern size (candles):").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
-        pattern_size_var = tk.StringVar(value=str(cfg.get("pattern_size", 3)))
+        pattern_size_var = tk.StringVar(value=str(cfg.get("pattern_size", 5)))
         ttk.Entry(learning_frame, textvariable=pattern_size_var, width=15).grid(row=0, column=1, sticky="w", pady=6)
 
         ttk.Label(
@@ -7260,7 +8141,7 @@ class ApolloHub(tk.Tk):
                 # Read existing config to preserve timeframes and check for pattern_size change
                 existing_cfg = _safe_read_json(config_path) if os.path.isfile(config_path) else {}
                 timeframes = existing_cfg.get("timeframes", REQUIRED_THINKER_TIMEFRAMES)
-                old_pattern_size = existing_cfg.get("pattern_size", 3)
+                old_pattern_size = existing_cfg.get("pattern_size", 5)
                 
                 # Warn if pattern_size changed (requires retraining)
                 if pattern_size != old_pattern_size:
@@ -7410,8 +8291,7 @@ class ApolloHub(tk.Tk):
                 f"File location: {config_path}"
             )
 
-    # ---- close ----
-
+    # Window close handler for cleanup on application exit
     def _on_close(self) -> None:
         # Don’t force kill; just stop if running (you can change this later)
         try:

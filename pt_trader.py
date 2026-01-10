@@ -77,15 +77,11 @@ from colorama import Fore, Style
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
-# -----------------------------
-# GUI HUB OUTPUTS
-# -----------------------------
+# GUI hub outputs directory for trader status and trade history files
 HUB_DATA_DIR = os.environ.get("POWERTRADER_HUB_DIR", os.path.join(os.path.dirname(__file__), "hub_data"))
 os.makedirs(HUB_DATA_DIR, exist_ok=True)
 
-# -----------------------------
-# DEBUG MODE SUPPORT
-# -----------------------------
+# Debug mode support - reads from gui_settings.json to enable verbose logging
 _GUI_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
 _debug_mode_cache = {"enabled": False}
 _simulation_mode_cache = {"enabled": False}
@@ -195,9 +191,7 @@ ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.j
 # Initialize colorama
 colorama.init(autoreset=True)
 
-# -----------------------------
-# GUI SETTINGS (coins list + main_neural_dir)
-# -----------------------------
+# GUI settings for coins list and main neural directory path
 _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 	os.path.dirname(os.path.abspath(__file__)),
 	"gui_settings.json"
@@ -347,9 +341,7 @@ if not API_KEY or not BASE64_PRIVATE_KEY:
 # accidental live orders might be attempted. The GUI flow provides a
 # setup wizard to generate and persist these credentials.
 
-# -----------------------------
-# TRADING CONFIG
-# -----------------------------
+# Trading configuration loaded from trading_settings.json
 _TRADING_SETTINGS_PATH = os.environ.get("POWERTRADER_TRADING_SETTINGS") or os.path.join(
 	os.path.dirname(os.path.abspath(__file__)),
 	"trading_settings.json"
@@ -417,37 +409,62 @@ def _load_trading_config() -> dict:
 
 class CryptoAPITrading:
     def __init__(self):
-        # keep a copy of the folder map (same idea as trader.py)
+        """Initialize the trading engine with API credentials, configuration, and state management.
+        
+        Sets up Robinhood API integration, loads DCA and profit margin settings from
+        trading_settings.json, initializes cost basis tracking, and seeds the rolling 24-hour
+        DCA window from trade history. All per-coin state (DCA levels, trailing PM, timestamps)
+        is maintained in memory and persists across trading cycles.
+        """
+        # Keep a copy of the folder map so we can locate per-coin data files (memories, signals, etc.)
+        # This mirrors the path resolution used in pt_trainer.py and pt_thinker.py
         self.path_map = dict(base_paths)
 
+        # Initialize Robinhood API credentials from encrypted key files
         self.api_key = API_KEY
         private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
         self.private_key = SigningKey(private_key_seed)
         self.base_url = "https://trading.robinhood.com"
 
-        # Load trading config
+        # Load trading configuration (DCA levels, profit margins, timing) from trading_settings.json
+        # This hot-reloads during execution so settings changes take effect without restart
         trading_cfg = _load_trading_config()
 
-        self.dca_levels_triggered = {}  # Track DCA levels for each crypto
+        # DCA state tracking: tracks which DCA stages have been triggered for each coin in the current trade
+        # Stages are tracked by index (0, 1, 2, ...) rather than percentage values for cleaner neural/hardcoded logic
+        self.dca_levels_triggered = {}  # { "BTC": [0, 1, 2], "ETH": [0], ... }
         self.dca_levels = trading_cfg.get("dca", {}).get("levels", [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0])
 
-        # --- Trailing profit margin (per-coin state) ---
-        # Each coin keeps its own trailing PM line, peak, and "was above line" flag.
-        self.trailing_pm = {}  # { "BTC": {"active": bool, "line": float, "peak": float, "was_above": bool}, ... }
+        # Trailing profit margin per-coin state: each coin maintains isolated trailing stop state.
+        # The trailing line starts at the PM target (5% no DCA, 2.5% with DCA) and follows price
+        # upward by the trail gap percentage (default 0.5%). A sell triggers when price crosses
+        # from above the trailing line to below it, capturing gains while allowing upside.
+        # Structure: { "BTC": {"active": bool, "line": float, "peak": float, "was_above": bool}, ... }
+        self.trailing_pm = {}
         self.trailing_gap_pct = trading_cfg.get("profit_margin", {}).get("trailing_gap_pct", 0.5)
         self.pm_start_pct_no_dca = trading_cfg.get("profit_margin", {}).get("target_no_dca_pct", 5.0)
         self.pm_start_pct_with_dca = trading_cfg.get("profit_margin", {}).get("target_with_dca_pct", 2.5)
 
-        self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
-        self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
+        # Calculate initial cost basis for all holdings by examining recent buy order execution prices
+        # Uses LIFO reconstruction to match current quantities with most recent purchase prices
+        self.cost_basis = self.calculate_cost_basis()
+        
+        # Initialize DCA tracking by counting buy orders since the last sell for each coin
+        # Preserves state across restarts by reading actual order history from Robinhood API
+        self.initialize_dca_levels()
 
-        # GUI hub persistence
+        # GUI hub persistence: load cumulative realized profit/loss from local JSON ledger
+        # Updated on every sell to track overall trading performance across all coins
         self._pnl_ledger = self._load_pnl_ledger()
 
-        # Cache last known bid/ask per symbol so transient API misses don't zero out account value
-        self._last_good_bid_ask = {}
+        # Price caching: stores last successful bid/ask for each symbol to handle transient API failures
+        # gracefully. If price fetch fails, uses cached values to prevent account value from spiking to $0
+        # in the GUI, which would corrupt account history charts and cause false alarms.
+        self._last_good_bid_ask = {}  # { "BTC-USD": {"ask": float, "bid": float, "ts": timestamp}, ... }
 
-        # Cache last *complete* account snapshot so transient holdings/price misses can't write a bogus low value
+        # Account snapshot caching: stores last complete account state to prevent partial data from
+        # corrupting GUI displays. Only updates when all required data (holdings, prices, buying power)
+        # is successfully fetched. Falls back to cached snapshot if any component fails.
         self._last_good_account_snapshot = {
             "total_account_value": None,
             "buying_power": None,
@@ -456,24 +473,39 @@ class CryptoAPITrading:
             "percent_in_trade": None,
         }
 
-        # --- DCA rate-limit (per trade, per coin, rolling 24h window) ---
+        # DCA rate-limiting: enforces maximum DCA buys per rolling time window per trade to prevent
+        # over-allocating capital during prolonged downtrends. The window resets when a trade closes
+        # (sell order executes). Default: max 2 DCA buys per 24 hours per coin.
         self.max_dca_buys_per_window = trading_cfg.get("dca", {}).get("max_buys_per_window", 2)
         self.dca_window_seconds = trading_cfg.get("dca", {}).get("window_hours", 24) * 60 * 60
-        self._dca_buy_ts = {}         # { "BTC": [ts, ts, ...] } (DCA buys only)
-        self._dca_last_sell_ts = {}   # { "BTC": ts_of_last_sell }
+        
+        # DCA timestamp tracking: maintains lists of DCA buy timestamps for rolling window enforcement
+        # Only includes buys after the most recent sell (current trade boundary) and within the window
+        self._dca_buy_ts = {}         # { "BTC": [1234567890.0, 1234567900.0, ...], ... }
+        self._dca_last_sell_ts = {}   # { "BTC": 1234567880.0, ... }
+        
+        # Seed DCA window from trade history file so limits persist across restarts
+        # Reads trade_history.jsonl and reconstructs DCA buy timestamps for current trades
         self._seed_dca_window_from_history()
 
-        # Track which DCA stages triggered in current iteration to prevent double-triggers
-        self._dca_triggered_this_cycle = {}  # { "BTC": set([0, 1, ...]) }
+        # Cycle-level DCA tracking: prevents double-triggering the same DCA stage within a single
+        # manage_trades() iteration when both neural and hardcoded conditions are met simultaneously
+        self._dca_triggered_this_cycle = {}  # { "BTC": {0, 1, 2}, "ETH": {0}, ... }
 
     def _atomic_write_json(self, path: str, data: dict) -> None:
+        """Write JSON data atomically to prevent corruption from interrupted writes.
+        
+        Uses temp file + os.replace() pattern to ensure the target file is never in a
+        partially-written state. Critical for status files read by the GUI hub during
+        active trading. Silently fails on error to prevent trade execution from crashing.
+        """
         try:
             tmp = f"{path}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            os.replace(tmp, path)
+            os.replace(tmp, path)  # Atomic on Windows/Unix
         except Exception:
-            pass
+            pass  # Non-critical write, continue trading
 
     def _append_jsonl(self, path: str, obj: dict) -> None:
         try:
@@ -498,6 +530,43 @@ class CryptoAPITrading:
         except Exception:
             pass
 
+    @staticmethod
+    def _extract_execution_price(order_response: Any) -> Optional[float]:
+        """
+        Extract actual fill price from Robinhood order response for accurate profit calculations.
+        
+        Robinhood market orders can execute across multiple fills at different prices. This method
+        computes the weighted average effective_price from all execution records to get the true
+        cost/proceeds per unit. Used instead of estimated market prices to ensure PnL tracking
+        reflects actual execution prices, not bid/ask at order placement time.
+        
+        Returns:
+            Weighted average fill price, or None if order hasn't executed yet or response is invalid
+        """
+        try:
+            if not isinstance(order_response, dict):
+                return None
+            
+            executions = order_response.get("executions", [])
+            if not executions:
+                return None
+            
+            total_cost = 0.0
+            total_qty = 0.0
+            
+            for execution in executions:
+                qty = float(execution.get("quantity", 0))
+                price = float(execution.get("effective_price", 0))
+                if qty > 0 and price > 0:
+                    total_cost += qty * price
+                    total_qty += qty
+            
+            if total_qty > 0:
+                return total_cost / total_qty
+            return None
+        except Exception:
+            return None
+
     def _record_trade(
         self,
         side: str,
@@ -512,7 +581,7 @@ class CryptoAPITrading:
         """
         Minimal local ledger for GUI:
         - append trade_history.jsonl
-        - update pnl_ledger.json on sells (using estimated price * qty)
+        - update pnl_ledger.json on sells (using actual execution price * qty)
         - store the exact PnL% at the moment for DCA buys / sells (for GUI trade history)
         """
         ts = time.time()
@@ -722,14 +791,21 @@ class CryptoAPITrading:
             return []
 
     def initialize_dca_levels(self):
-
         """
-        Initializes the DCA levels_triggered dictionary based on the number of buy orders
-        that have occurred after the first buy order following the most recent sell order
-        for each cryptocurrency.
+        Initialize DCA tracking by reconstructing current trade state from order history.
         
-        Preserves DCA state when no relevant orders found instead of resetting.
-        Only resets to [] if we confirm there's actually no holding (position fully closed).
+        For each held coin, determines which DCA stages have been triggered in the current
+        trade by counting buy orders since the last sell. The first buy after a sell (or
+        the first ever buy) is considered the trade entry at neural level 3. Each additional
+        buy represents one triggered DCA stage (stage 0, 1, 2, ...).
+        
+        State preservation: If order history is temporarily unavailable but we're still
+        holding the position, preserves existing DCA state rather than resetting to empty.
+        This prevents false re-triggers when the API has transient issues. Only resets to
+        [] when we confirm the position is fully closed (quantity == 0).
+        
+        Called at startup and after any trade completes to synchronize in-memory state with
+        actual execution history. Critical for preventing duplicate DCA triggers across restarts.
         """
         holdings = self.get_holdings()
         if not holdings or "results" not in holdings:
@@ -840,10 +916,19 @@ class CryptoAPITrading:
 
     def _seed_dca_window_from_history(self) -> None:
         """
-        Seeds in-memory DCA buy timestamps from TRADE_HISTORY_PATH so the 24h limit
-        works across restarts.
-
-        Uses the local GUI trade history (tag == "DCA") and resets per trade at the most recent sell.
+        Reconstruct DCA buy timestamp tracking from trade_history.jsonl for rolling window enforcement.
+        
+        Reads the local trade history file (written by _record_trade) and extracts all DCA buy
+        timestamps for each coin, filtering to only buys that occurred after the most recent
+        sell (the current trade boundary). This ensures the 24-hour DCA limit persists across
+        trader restarts - we don't reset the count just because the process restarted.
+        
+        Also validates trade history data integrity: logs warnings for corrupted entries (invalid
+        JSON, missing fields, malformed timestamps) to help diagnose trade_history.jsonl corruption.
+        Skipped entries don't affect trading but indicate potential file corruption that should be
+        investigated.
+        
+        Called once during __init__() to seed the rolling window state before trading begins.
         """
         now_ts = time.time()
         cutoff = now_ts - float(getattr(self, "dca_window_seconds", 86400))
@@ -947,8 +1032,23 @@ class CryptoAPITrading:
 
     def _dca_window_count(self, base_symbol: str, now_ts: Optional[float] = None) -> int:
         """
-        Count of DCA buys for this coin within rolling 24h in the *current trade*.
-        Current trade boundary = most recent sell we observed for this coin.
+        Count DCA buys within the rolling 24-hour window for the current trade.
+        
+        The rolling window is scoped to the current trade: only counts DCAs that occurred
+        after the most recent sell. This ensures each trade gets its own fresh DCA allowance
+        rather than being penalized for DCA buys from previous trades. The window slides
+        forward with time, dropping buys older than 24 hours automatically.
+        
+        Called before each potential DCA trigger to check if we've hit the limit (default 2
+        buys per 24h). Prevents excessive averaging down during sustained price crashes by
+        rate-limiting capital allocation.
+        
+        Args:
+            base_symbol: Coin symbol without pair suffix (e.g., "BTC" not "BTC-USD")
+            now_ts: Optional timestamp for testing; defaults to current time
+            
+        Returns:
+            Number of DCA buys in the rolling window for this trade (0 to max_dca_buys_per_window)
         """
         base = str(base_symbol).upper().strip()
         if not base:
@@ -980,7 +1080,24 @@ class CryptoAPITrading:
         self._dca_buy_ts[base] = []
 
     def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
-
+        """
+        Execute HTTP request to Robinhood API with authentication and retry logic.
+        
+        Handles API authentication via HMAC-signed headers, implements automatic retry with
+        exponential backoff for transient failures (network timeouts, server errors), and
+        triggers the circuit breaker on persistent failures to temporarily halt trading.
+        
+        Non-retryable errors (401/403 auth failures) are returned immediately without retries
+        since they indicate configuration issues that won't resolve automatically.
+        
+        Args:
+            method: HTTP method ("GET" or "POST")
+            path: API endpoint path (e.g., "/api/v1/crypto/trading/orders/")
+            body: JSON body for POST requests (empty string for GET)
+            
+        Returns:
+            Parsed JSON response dict, or None if all retries exhausted
+        """
         timestamp = self._get_current_timestamp()
         headers = self.get_authorization_header(method, path, body, timestamp)
         url = self.base_url + path
@@ -1066,10 +1183,24 @@ class CryptoAPITrading:
         return self.make_api_request("GET", path)
 
     def calculate_cost_basis(self):
+        """Calculate weighted average cost basis for all currently held assets.
+        
+        Uses LIFO (Last In First Out) reconstruction: works backward from most recent buy orders
+        to match the current held quantity. This reflects the actual cost of the specific units
+        we still hold after any partial sells. Each buy order's execution records provide the
+        actual fill prices (not estimates) for precise cost basis calculation.
+        
+        Called at startup to initialize cost basis, then maintained incrementally via
+        recalculate_single_cost_basis() after each trade for performance.
+        
+        Returns:
+            dict: { "BTC": avg_cost_per_unit, "ETH": avg_cost_per_unit, ... }
+        """
         holdings = self.get_holdings()
         if not holdings or "results" not in holdings:
             return {}
 
+        # Build set of assets we currently hold and their quantities
         active_assets = {holding["asset_code"] for holding in holdings.get("results", [])}
         current_quantities = {
             holding["asset_code"]: float(holding["total_quantity"])
@@ -1083,7 +1214,7 @@ class CryptoAPITrading:
             if not orders or "results" not in orders:
                 continue
 
-            # Get all filled buy orders, sorted oldest to newest for proper LIFO reconstruction
+            # Get all filled buy orders sorted oldest to newest (will process in reverse for LIFO)
             buy_orders = [
                 order for order in orders["results"]
                 if order["side"] == "buy" and order["state"] == "filled"
@@ -1123,11 +1254,23 @@ class CryptoAPITrading:
 
     def recalculate_single_cost_basis(self, symbol: str) -> Optional[float]:
         """
-        Recalculate cost basis for a single symbol immediately after a trade.
-        Returns the new cost basis or None if calculation fails.
+        Recalculate cost basis for a single coin immediately after a buy or sell executes.
         
-        This method allows immediate cost basis updates after each trade,
-        ensuring DCA and trailing PM calculations always use current values.
+        This incremental update is much faster than recalculating all holdings and ensures
+        that subsequent DCA trigger checks and trailing profit margin calculations in the
+        same trading cycle use the updated cost basis. Uses the same LIFO reconstruction
+        as calculate_cost_basis() but scoped to one symbol.
+        
+        Critical for accuracy: if we buy and the price drops to a DCA level in the same
+        cycle, we need the new blended cost basis to correctly calculate the DCA trigger
+        percentage. Similarly for trailing PM: the profit margin line must reflect the
+        updated cost after DCA buys.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC-USD")
+            
+        Returns:
+            New cost basis per unit, or None if position is closed or calculation fails
         """
         try:
             asset_code = symbol.replace("-USD", "").strip()
@@ -1255,6 +1398,32 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        """
+        Execute a market buy order for a specified USD amount of a cryptocurrency.
+        
+        Converts USD amount to crypto quantity at current ask price, handles Robinhood's
+        precision requirements via retry logic, and records the trade with actual execution
+        price (not estimated) for accurate cost basis and PnL tracking. In simulation mode,
+        records a fake trade without hitting the API.
+        
+        Precision handling: Robinhood requires specific decimal precision per asset. If the
+        initial order fails due to "too much precision", extracts the required precision from
+        the error response and retries with rounded quantity. Retries up to 5 times with
+        price refreshes after attempt 2 to avoid stale prices during volatility.
+        
+        Args:
+            client_order_id: Unique order ID for idempotency
+            side: Must be "buy"
+            order_type: Must be "market"
+            symbol: Trading pair (e.g., "BTC-USD")
+            amount_in_usd: Dollar amount to spend (e.g., 100.00)
+            avg_cost_basis: Current cost basis for PnL calculation at order time
+            pnl_pct: Pre-calculated PnL percentage (for DCA orders)
+            tag: Order classification ("ENTRY", "DCA", etc.) for trade history
+            
+        Returns:
+            Robinhood API response dict on success, None on failure
+        """
         debug_print(f"[DEBUG] TRADER: Placing BUY order for {symbol}: ${amount_in_usd:.2f} USD")
         # Fetch the current price of the asset
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
@@ -1322,18 +1491,27 @@ class CryptoAPITrading:
                 path = "/api/v1/crypto/trading/orders/"
                 response = self.make_api_request("POST", path, json.dumps(body))
                 if response and "errors" not in response:
-                    # Record for GUI history (estimated fill at current_price)
+                    # Extract actual execution price from response, fallback to estimated if not available
+                    actual_price = self._extract_execution_price(response)
+                    fill_price = actual_price if actual_price is not None else current_price
+                    
                     try:
                         order_id = response.get("id", None) if isinstance(response, dict) else None
                     except Exception:
                         order_id = None
+                    
+                    # Recalculate PnL% using actual fill price if available
+                    actual_pnl_pct = pnl_pct
+                    if actual_price is not None and avg_cost_basis is not None and avg_cost_basis > 0:
+                        actual_pnl_pct = ((actual_price - avg_cost_basis) / avg_cost_basis) * 100.0
+                    
                     self._record_trade(
                         side="buy",
                         symbol=symbol,
                         qty=float(rounded_quantity),
-                        price=float(current_price),
+                        price=float(fill_price),
                         avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
-                        pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                        pnl_pct=float(actual_pnl_pct) if actual_pnl_pct is not None else None,
                         tag=tag,
                         order_id=order_id,
                     )
@@ -1374,6 +1552,31 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        """
+        Execute a market sell order for a specified quantity of cryptocurrency.
+        
+        Sells the entire position quantity (or partial for testing), records the trade with
+        actual execution price for accurate realized PnL tracking, and updates the PnL ledger.
+        In simulation mode, records a fake trade without hitting the API.
+        
+        The expected_price parameter is the current bid at order time and is used for GUI
+        display and loss-prevention validation, but the actual fill price from the API response
+        is used for PnL calculations to ensure accuracy despite slippage.
+        
+        Args:
+            client_order_id: Unique order ID for idempotency
+            side: Must be "sell"
+            order_type: Must be "market"
+            symbol: Trading pair (e.g., "BTC-USD")
+            asset_quantity: Crypto quantity to sell (e.g., 0.00123456 BTC)
+            expected_price: Current bid price for validation/display (not used for PnL)
+            avg_cost_basis: Cost basis per unit for PnL calculation
+            pnl_pct: Pre-calculated PnL percentage at sell time
+            tag: Order classification ("TRAIL_SELL", "STOP_LOSS", etc.)
+            
+        Returns:
+            Robinhood API response dict on success, None on failure
+        """
         debug_print(f"[DEBUG] TRADER: Placing SELL order for {symbol}: {asset_quantity:.8f} units @ ${expected_price:.2f}" if expected_price else f"[DEBUG] TRADER: Placing SELL order for {symbol}: {asset_quantity:.8f} units")
         
         # Simulation mode: skip actual trade execution
@@ -1415,13 +1618,23 @@ class CryptoAPITrading:
 
         if response and isinstance(response, dict) and "errors" not in response:
             order_id = response.get("id", None)
+            
+            # Extract actual execution price from response, fallback to estimated if not available
+            actual_price = self._extract_execution_price(response)
+            fill_price = actual_price if actual_price is not None else expected_price
+            
+            # Recalculate PnL% using actual fill price if available
+            actual_pnl_pct = pnl_pct
+            if actual_price is not None and avg_cost_basis is not None and avg_cost_basis > 0:
+                actual_pnl_pct = ((actual_price - avg_cost_basis) / avg_cost_basis) * 100.0
+            
             self._record_trade(
                 side="sell",
                 symbol=symbol,
                 qty=float(asset_quantity),
-                price=float(expected_price) if expected_price is not None else None,
+                price=float(fill_price) if fill_price is not None else None,
                 avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
-                pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                pnl_pct=float(actual_pnl_pct) if actual_pnl_pct is not None else None,
                 tag=tag,
                 order_id=order_id,
             )
@@ -1433,6 +1646,27 @@ class CryptoAPITrading:
         return response
 
     def manage_trades(self):
+        """Execute one complete trading cycle: fetch positions, check signals, execute trades.
+        
+        This is the main trading loop called periodically by the runner. Each cycle:
+        1. Fetches current account state (holdings, buying power, prices)
+        2. Calculates gain/loss percentages for each held position
+        3. Checks DCA triggers (neural levels + hardcoded percentages)
+        4. Checks trailing profit margin sell conditions
+        5. Executes any triggered trades and updates cost basis
+        6. Writes status to GUI hub for display
+        
+        Circuit breaker protection: Skips trading if persistent API failures detected but
+        continues monitoring (fetching prices/positions) to maintain GUI state. Automatically
+        resumes trading after cooldown period elapses.
+        
+        Account value caching: Falls back to last known-good values if any component of account
+        state fails to fetch. Prevents GUI chart corruption from transient API glitches while
+        still attempting to update when possible.
+        
+        Hot-reload support: Reloads coin list and trading config from JSON files each cycle so
+        settings changes take effect without restart.
+        """
         debug_print("[DEBUG] TRADER: Starting trade management cycle...")
         
         # Check circuit breaker - skip trading but continue monitoring during network issues
@@ -1642,7 +1876,7 @@ class CryptoAPITrading:
             else:
                 next_dca_display = f"{hard_next:.2f}%"
 
-            # --- DCA DISPLAY LINE (pick whichever trigger line is higher: NEURAL vs HARD) ---
+            # DCA display line calculation - picks whichever trigger line is higher (NEURAL vs HARD).
             # Hardcoded gives an actual price line: cost_basis * (1 + hard_next%).
             # Neural uses actual predicted price levels from low_bound_prices.html.
             dca_line_source = "HARD"
@@ -1710,8 +1944,8 @@ class CryptoAPITrading:
             else:
                 color2 = Fore.RED
 
-            # --- Trailing PM display (per-coin, isolated) ---
-            # Display uses current state if present; otherwise shows the base PM start line.
+            # Trailing profit margin display for per-coin isolated state.
+            # Display uses current state if present, otherwise shows the base PM start line.
             trail_status = "N/A"
             pm_start_pct_disp = 0.0
             base_pm_line_disp = 0.0
@@ -1785,10 +2019,10 @@ class CryptoAPITrading:
             else:
                 print("  PM/Trail: N/A (avg_cost_basis is 0)")
 
-            # --- Trailing profit margin (0.5% trail gap) ---
-            # PM "start line" is the normal 5% / 2.5% line (depending on DCA levels hit).
-            # Trailing activates once price is ABOVE the PM start line, then line follows peaks up
-            # by 0.5%. Forced sell happens ONLY when price goes from ABOVE the trailing line to BELOW it.
+            # Trailing profit margin logic with 0.5% trail gap. The PM "start line" is the normal
+            # 5% or 2.5% line depending on whether DCA occurred. Trailing activates once price
+            # rises above the PM start line, then the line follows peaks upward by 0.5%. A forced
+            # sell happens only when price crosses from above the trailing line to below it.
             if avg_cost_basis > 0:
                 pm_start_pct = self.pm_start_pct_no_dca if int(triggered_levels) == 0 else self.pm_start_pct_with_dca
                 base_pm_line = avg_cost_basis * (1.0 + (pm_start_pct / 100.0))
@@ -1997,7 +2231,7 @@ class CryptoAPITrading:
             else:
                 pass
 
-        # --- ensure GUI gets bid/ask lines even for coins not currently held ---
+        # Ensure GUI gets bid/ask lines even for coins not currently held
         try:
             for sym in crypto_symbols:
                 if sym in positions:
@@ -2125,7 +2359,7 @@ class CryptoAPITrading:
             debug_print("[DEBUG] TRADER: Trades made this cycle, reinitializing DCA levels...")
             self.initialize_dca_levels()
 
-        # --- GUI HUB STATUS WRITE ---
+        # Write combined holdings and zero-holdings status for GUI hub display
         try:
             status = {
                 "timestamp": time.time(),

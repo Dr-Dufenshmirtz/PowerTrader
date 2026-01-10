@@ -601,7 +601,7 @@ tf_minutes = [tf_minutes_map.get(tf, 60) for tf in tf_choices]
 pruning_sigma_level = training_settings.get("pruning_sigma_level", 2.0) if os.path.isfile(import_path) else 2.0
 min_threshold = training_settings.get("min_threshold", 1.0) if os.path.isfile(import_path) else 1.0
 max_threshold = training_settings.get("max_threshold", 25.0) if os.path.isfile(import_path) else 25.0
-pattern_size = training_settings.get("pattern_size", 3) if os.path.isfile(import_path) else 3
+pattern_size = training_settings.get("pattern_size", 5) if os.path.isfile(import_path) else 5
 
 # PID controller parameters (tuned for non-stationary crypto markets)
 # Kp: proportional gain for quick response to current error
@@ -1212,10 +1212,10 @@ while True:
 					if current_candle != last_printed_candle and (current_candle == 1 or current_candle % print_interval == 0 or current_candle == total_candles):
 						print()
 						percent_complete = int((current_candle / total_candles) * 100)
-						print(f'Timeframe: {timeframe} ({percent_complete}% complete)')
 						pattern_count = len(_mem["memory_list"])
+						print(f'Timeframe: {timeframe} ({percent_complete}% complete)')
 						print(f'Training on timeframe data, {pattern_count:,} patterns learned...')
-					
+
 					debug_print(f"[DEBUG] TRAINER: Inner loop iteration - price_list2={len(price_list2)}, price_change_list={len(price_change_list)}")
 					
 					try:
@@ -1541,8 +1541,8 @@ while True:
 					effective_max = min(max_threshold, adaptive_max_threshold)
 					# Safeguard: ensure max >= min (can occur in very low volatility)
 					# Give PID room to work by doubling min instead of locking to exact value
-					if effective_max < effective_min * 3.0:
-						effective_max = effective_min * 3.0
+					if effective_max < effective_min * 2.0:
+						effective_max = effective_min * 2.0
 						debug_print(f"[DEBUG] TRAINER: Adjusted effective_max from {min(max_threshold, adaptive_max_threshold):.2f} to {effective_max:.2f} (low volatility safeguard)")
 					perfect_threshold = max(effective_min, min(effective_max, perfect_threshold))
 					
@@ -1865,13 +1865,13 @@ while True:
 									formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 									limit_test_count = len(upordown4)
 									limit_test_count_formatted = f'{limit_test_count:,}'
-									print(f'Bounce Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} breakout candles)')
 									threshold_formatted = format(perfect_threshold, '.1f')
 									volatility_formatted = format(avg_volatility, '.2f')
-									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold, {volatility_formatted}% volatility)')
 									acceptance_formatted = format(api_acceptance_rate, '.1f').rstrip('0').rstrip('.')
 									print(f'Total Candles: {total_candles:,} ({acceptance_formatted}% acceptance)')
-									
+									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold, {volatility_formatted}% volatility)')
+									print(f'Bounce Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} breakout candles)')
+
 									# Update last printed accuracy for next comparison
 									last_printed_accuracy = accuracy
 						except:

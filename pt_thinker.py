@@ -101,20 +101,16 @@ def _decrypt_with_dpapi(encrypted_data: bytes) -> str:
 	else:
 		raise RuntimeError("Failed to decrypt data with Windows DPAPI")
 
-# -----------------------------
-# Helper function to clean training file strings
-# -----------------------------
+# Helper function to clean training file strings by removing quotes, brackets, and commas
 def _clean_training_string(text: str) -> str:
 	"""Remove quotes, brackets, commas from training file data."""
 	for char in ("'", ',', '"', ']', '['):
 		text = text.replace(char, '')
 	return text
 
-# -----------------------------
-# Robinhood market-data (current ASK), same source as rhcb.py trader:
-#   GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD
-#   use result["ask_inclusive_of_buy_spread"]
-# -----------------------------
+# Robinhood market-data API for current ask prices, same source as trader.
+# Uses GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD
+# Returns result["ask_inclusive_of_buy_spread"]
 ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
 
 _RH_MD = None  # lazy-init so import doesn't explode if creds missing
@@ -233,9 +229,16 @@ def restart_program():
 # runtime errors during long-running loops.
 
 def PrintException():
+	"""Extract and log detailed exception information for debugging.
+	
+	Walks the traceback to the innermost frame (actual error location) and logs
+	the exact line of code, line number, and error message. Logs to both console
+	and debug_thinker.log file for persistent error tracking. Always logs exceptions
+	regardless of debug mode since exceptions indicate serious issues.
+	"""
 	exc_type, exc_obj, tb = sys.exc_info()
 
-	# walk to the innermost frame (where the error actually happened)
+	# Walk to the innermost frame (where the error actually happened)
 	while tb and tb.tb_next:
 		tb = tb.tb_next
 
@@ -256,15 +259,14 @@ def PrintException():
 	except Exception:
 		pass
 
+# Legacy state flags preserved for historical compatibility (may be unused in current codebase)
 restarted = 'no'
 short_started = 'no'
 long_started = 'no'
 minute = 0
 last_minute = 0
 
-# -----------------------------
-# GUI SETTINGS (coins list)
-# -----------------------------
+# GUI settings for coins list loaded from gui_settings.json with hot-reload capability
 _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 	os.path.dirname(os.path.abspath(__file__)),
 	"gui_settings.json"
@@ -317,7 +319,17 @@ def _get_sleep_timing(key: str) -> float:
 
 
 def handle_network_error(operation: str, error: Exception):
-	"""Print network error and suggest enabling debug mode"""
+	"""Handle fatal network errors by logging details and exiting gracefully.
+	
+	Called when network operations (KuCoin API, Robinhood market data) fail persistently
+	after retries. Provides user-friendly error messaging with troubleshooting guidance.
+	Exits the process since continued operation without network access would generate
+	misleading predictions and potentially dangerous trading signals.
+	
+	Args:
+		operation: Description of the failed operation for logging (e.g., "KuCoin candle fetch")
+		error: The exception that triggered the failure
+	"""
 	print(f"\n{'='*60}")
 	print(f"NETWORK ERROR: {operation} failed")
 	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
@@ -332,8 +344,19 @@ def handle_network_error(operation: str, error: Exception):
 
 def _load_gui_coins() -> list:
 	"""
-	Reads gui_settings.json and returns settings["coins"] as an uppercased list.
-	Caches by mtime so it is cheap to call frequently.
+	Load the list of coins to track from gui_settings.json with hot-reload capability.
+	
+	Reads the coins list from GUI settings and caches it by file modification time.
+	Subsequent calls only re-read the file if it changed, making frequent polling
+	efficient for hot-reload support. Returns uppercased symbols ("BTC", "ETH", etc.)
+	for consistency with other modules.
+	
+	Hot-reload allows adding/removing coins from the GUI while the Thinker is running
+	without requiring a process restart. The Thinker's main loop calls this periodically
+	and uses _sync_coins_from_settings() to start/stop tracking coins dynamically.
+	
+	Returns:
+		List of uppercased coin symbols to track (e.g., ['BTC', 'ETH', 'XRP'])
 	"""
 	try:
 		if not os.path.isfile(_GUI_SETTINGS_PATH):
@@ -417,7 +440,7 @@ def coin_directory(sym: str):
 		os.chdir(old_dir)
 
 
-# --- training freshness gate (mirrors pt_hub.py) ---
+# Training freshness gate (mirrors pt_hub.py) - checks if coin training is current
 _TRAINING_STALE_SECONDS = 14 * 24 * 60 * 60  # 14 days
 
 def _coin_is_trained(sym: str) -> bool:
@@ -475,8 +498,7 @@ def _coin_is_trained(sym: str) -> bool:
 		debug_print(f"[DEBUG] {sym}: Unexpected error checking training status: {type(e).__name__}: {e}")
 		return False
 
-# --- GUI HUB "runner ready" gate file (read by gui_hub.py Autopilot toggle) ---
-
+# GUI hub "runner ready" gate file read by gui_hub.py Autopilot toggle
 HUB_DIR = os.environ.get("POWERTRADER_HUB_DIR") or os.path.join(BASE_DIR, "hub_data")
 try:
 	os.makedirs(HUB_DIR, exist_ok=True)
@@ -504,12 +526,15 @@ def _write_runner_ready(ready: bool, stage: str, ready_coins=None, total_coins: 
 	}
 	_atomic_write_json(RUNNER_READY_PATH, obj)
 
-# Ensure folders exist for the current configured coins
+# Ensure folders exist for the current configured coins so signal files can be written
 for _sym in CURRENT_COINS:
 	os.makedirs(coin_folder(_sym), exist_ok=True)
 
-# Required timeframes that the Thinker uses for predictions and neural levels
-# These MUST be trained for the system to function properly
+# Required timeframes that the Thinker uses for multi-timeframe predictions and neural level signals.
+# All seven timeframes MUST be trained before the Thinker can produce valid trading signals. The
+# Thinker generates predicted high/low for each timeframe, then combines them to determine trade
+# entry signals (when price drops below 3+ predicted lows) and DCA levels (neural levels 4-7).
+# Missing any timeframe causes the Thinker to block signal generation for that coin.
 REQUIRED_THINKER_TIMEFRAMES = [
 	'1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week'
 ]
@@ -518,12 +543,26 @@ distance = 0.5
 tf_choices = REQUIRED_THINKER_TIMEFRAMES
 
 def new_coin_state():
+	"""Create initial state dictionary for a newly tracked coin.
+	
+	Initializes all per-timeframe arrays with placeholder values (0.0 for lows, inf for highs)
+	and sets up tracking fields for prediction updates, message generation, and readiness gating.
+	
+	The bounds_version counter tracks when we've updated from placeholder values to real predictions.
+	This prevents the Thinker from signaling "ready" to the Hub until actual predictions replace
+	the startup placeholders. Only after bounds_version increments (real data loaded) does the
+	Thinker start producing LONG/SHORT/WITHIN messages for the trader.
+	
+	Returns:
+		Dict with per-timeframe arrays and state tracking fields
+	"""
 	return {
+		# Predicted price levels: low_bound = predicted lows (blue lines), high_bound = predicted highs (orange lines)
 		'low_bound_prices': [0.0] * len(tf_choices),
 		'high_bound_prices': [float('inf')] * len(tf_choices),
 
-		'tf_times': [],
-		'tf_choice_index': 0,
+		'tf_times': [],  # Target update times for each timeframe
+		'tf_choice_index': 0,  # Current timeframe being processed in the step loop
 
 		'tf_update': ['yes'] * len(tf_choices),
 		'messages': ['none'] * len(tf_choices),
@@ -550,7 +589,23 @@ states = {}
 display_cache = {sym: f"{sym}  (starting.)" for sym in CURRENT_COINS}
 
 def _validate_coin_training(coin: str) -> tuple:
-	"""Check if coin has all required timeframes trained. Returns (is_valid, missing_timeframes_list)."""
+	"""Validate that a coin has all required timeframe data files present and non-empty.
+	
+	Checks for existence of memories, weights, and threshold files for each required timeframe.
+	All three files must exist and be at least 10 bytes (non-empty) for the timeframe to be
+	considered trained. This validation runs before the Thinker attempts to load predictions,
+	preventing crashes from missing or corrupted training data.
+	
+	Called by both the Thinker (to check training freshness) and the Hub (to show training
+	status in the GUI). Missing files indicate the Trainer hasn't run or training was interrupted.
+	
+	Args:
+		coin: Coin symbol (e.g., "BTC")
+		
+	Returns:
+		Tuple of (is_valid: bool, missing_timeframes: list). is_valid is True only if ALL
+		required timeframes are present. missing_timeframes lists any incomplete timeframes.
+	"""
 	missing = []
 	folder = coin_folder(coin)
 	
@@ -583,9 +638,26 @@ def _validate_coin_training(coin: str) -> tuple:
 # Track which coins have produced REAL predicted levels (not placeholder 0.0 / inf)
 _ready_coins = set()
 
-# We consider the runner "READY" only once it is ACTUALLY PRINTING real prediction messages
-# (i.e. output lines start with WITHIN / LONG / SHORT). No numeric placeholder checks at all.
+# Readiness detection: the runner is considered "READY" only when it's producing real prediction
+# messages (WITHIN/LONG/SHORT) instead of placeholder messages (INACTIVE/Starting). This ensures
+# the Hub doesn't enable Autopilot until predictions are based on actual trained data, not startup
+# placeholders. Prevents premature trading signals that could execute on invalid prediction data.
 def _is_printing_real_predictions(messages) -> bool:
+	"""Check if message list contains real prediction output (not placeholders).
+	
+	Examines the current message array for each timeframe and returns True if ANY timeframe
+	is producing real prediction messages (WITHIN/LONG/SHORT). These messages indicate the
+	Thinker has loaded trained data and is generating actionable predictions. INACTIVE messages
+	mean the timeframe hasn't produced predictions yet (still initializing or training incomplete).
+	
+	Used by the readiness gate to determine when to signal the Hub that trading can begin.
+	
+	Args:
+		messages: List of message strings from state['messages']
+		
+	Returns:
+		True if any message is a real prediction type, False if all are placeholders
+	"""
 	try:
 		for m in (messages or []):
 			if not isinstance(m, str):
@@ -600,10 +672,24 @@ def _is_printing_real_predictions(messages) -> bool:
 
 def _sync_coins_from_settings():
 	"""
-	Hot-reload coins from gui_settings.json while runner is running.
-
-	- Adds new coins: creates folder + init_coin() + starts stepping them
-	- Removes coins: stops stepping them (leaves state on disk untouched)
+	Hot-reload coin list from gui_settings.json and dynamically start/stop coin tracking.
+	
+	Called periodically by the main runner loop to detect coin list changes without requiring
+	a process restart. Enables adding new coins (creates their folder, initializes state, and
+	starts generating predictions) or removing coins (stops processing them but preserves their
+	data files for potential re-addition later).
+	
+	Adding a coin:
+		1. Creates coin subfolder (BTC/, ETH/, etc.) if it doesn't exist
+		2. Initializes state dict via new_coin_state()
+		3. Adds to active processing in the step loop
+		4. Starts generating predictions on next cycle (assuming training data exists)
+	
+	Removing a coin:
+		1. Removes from active state dict (stops processing)
+		2. Leaves training data files intact on disk
+		3. Stops writing signal files for that coin
+		4. Can be re-added later without retraining
 	"""
 	global CURRENT_COINS
 	global COIN_SYMBOLS
@@ -763,14 +849,39 @@ def find_purple_area(lines):
         return (purple_bottom, purple_top)
     return (None, None)
 def step_coin(sym: str):
+	"""Execute one prediction cycle for a single coin across all timeframes.
+	
+	This is the core prediction engine called periodically for each tracked coin. Each cycle:
+	1. Validates training freshness (skips if training > 14 days old)
+	2. Fetches latest candle data from KuCoin for each timeframe
+	3. Loads trained memories/weights from disk
+	4. Generates weighted-average predictions for current candle high/low
+	5. Writes predicted levels to signal files (low_bound_prices.html, high_bound_prices.html)
+	6. Generates trading signals based on predicted levels vs current price
+	7. Writes long/short DCA signals for trader to consume
+	
+	Training freshness gate: Prevents trading on stale predictions by blocking signal generation
+	when training data is >14 days old. Forces retraining before allowing new trades to start.
+	Sets all signals to OFF and profit margins to baseline to safely hold existing positions.
+	
+	Timeframe rotation: Steps through all 7 timeframes in sequence, updating one per cycle to
+	distribute API calls over time and avoid rate limits. Full update cycle completes every
+	7 iterations (one per timeframe).
+	
+	Error handling: Retries failed API calls with exponential backoff. After max retries, calls
+	handle_network_error() which logs the issue and exits (trading requires reliable data).
+	
+	Args:
+		sym: Coin symbol (e.g., "BTC") - function changes to coin folder internally
+	"""
 	debug_print(f"[DEBUG] {sym}: step_coin() called")
 	
 	# Load state before training check so we can persist it properly
 	st = states[sym]
 	
-	# --- training freshness gate (check BEFORE processing predictions) ---
-	# If GUI would show NOT TRAINED (missing / stale trainer_last_training_time.txt),
-	# skip this coin so no new trades can start until it is trained again.
+	# Training freshness gate - check before processing predictions. If GUI would show
+	# NOT TRAINED (missing or stale trainer_last_training_time.txt), skip this coin so
+	# no new trades can start until it is trained again.
 	if not _coin_is_trained(sym):
 		with coin_directory(sym):
 			try:
@@ -1139,7 +1250,7 @@ def step_coin(sym: str):
 			# We only allow "ready" once messages are generated using a non-startup bounds_version.
 			bounds_version_used_for_messages = st.get('bounds_version', 0)
 
-			# --- HARD GUARANTEE: all TF arrays stay length==len(tf_choices) (fallback placeholders) ---
+			# Hard guarantee that all timeframe arrays stay length==len(tf_choices) with fallback placeholders
 			def _pad_to_len(lst, n, fill):
 				if lst is None:
 					lst = []
