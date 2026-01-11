@@ -73,7 +73,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011111"
+VERSION = "26.011112"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -5608,8 +5608,29 @@ class ApolloHub(tk.Tk):
                     if self.settings.get("debug_mode", False):
                         print(f"[HUB DEBUG] Periodic account fetch failed: {e}")
 
-        self.lbl_neural.config(text=f"Thinker: {'RUNNING' if neural_running else 'STOPPED'}")
-        self.lbl_trader.config(text=f"Trader: {'RUNNING' if trader_running else 'STOPPED'}")
+        # Determine status for thinker and trader (STOPPED, WAITING, or RUNNING)
+        auto_mode_active = getattr(self, "_auto_mode_active", False)
+        auto_mode_phase = getattr(self, "_auto_mode_phase", "")
+        
+        # Show WAITING when autopilot is engaged but processes aren't running yet
+        # Show RUNNING when processes are active
+        # Show STOPPED otherwise
+        if neural_running:
+            neural_status = "RUNNING"
+        elif auto_mode_active or (auto_mode_phase in ("TRAINING", "RUNNING") and self._auto_start_trader_pending):
+            neural_status = "WAITING"
+        else:
+            neural_status = "STOPPED"
+        
+        if trader_running:
+            trader_status = "RUNNING"
+        elif auto_mode_active or (auto_mode_phase in ("TRAINING", "RUNNING") and self._auto_start_trader_pending):
+            trader_status = "WAITING"
+        else:
+            trader_status = "STOPPED"
+        
+        self.lbl_neural.config(text=f"Thinker: {neural_status}")
+        self.lbl_trader.config(text=f"Trader: {trader_status}")
 
         # Start All is now a toggle (Start/Stop)
         # Show STOP when auto mode is active (training/thinking/trading) OR when both thinker and trader are running
@@ -5828,7 +5849,7 @@ class ApolloHub(tk.Tk):
         # Check if a coin is approaching a trigger and switch chart view automatically
         self._check_auto_switch()
 
-        self.status.config(text=f"{_now_str()}  |  v{VERSION}  |  main_dir={self.settings['main_neural_dir']}")
+        self.status.config(text=f"{_now_str()}  |  v{VERSION}  |  {self.settings['main_neural_dir']}")
         self.after(int(float(self.settings.get("ui_refresh_seconds", 1.0)) * 1000), self._tick)
 
     def _check_auto_switch(self) -> None:
