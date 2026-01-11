@@ -642,7 +642,7 @@ age_pruning_weight_limit = training_settings.get("age_pruning_weight_limit", 1.0
 initial_perfect_threshold = (min_threshold + max_threshold) / 2
 perfect_threshold_target = (min_threshold + max_threshold) / 2
 # bounce_accuracy_tolerance is hardcoded (not a training parameter, used only for post-training measurement)
-bounce_accuracy_tolerance = 0.1  # Measures prediction quality at 0.1% inside the trading trigger zone
+bounce_accuracy_tolerance = 0.5  # Measures prediction quality at 0.5% inside the trading trigger zone (aligns with trailing gap)
 
 # Initialize number_of_candles based on pattern_size setting
 # pattern_size=3 means 3 candles (2 prior values + current), pattern_size=2 means 2 candles (1 prior + current)
@@ -1545,8 +1545,8 @@ while True:
 					effective_max = min(max_threshold, adaptive_max_threshold)
 					# Safeguard: ensure max >= min (can occur in very low volatility)
 					# Give PID room to work by doubling min instead of locking to exact value
-					if effective_max < effective_min * 2.0:
-						effective_max = effective_min * 2.0
+					if effective_max < effective_min * 3.0:
+						effective_max = effective_min * 3.0
 						debug_print(f"[DEBUG] TRAINER: Adjusted effective_max from {min(max_threshold, adaptive_max_threshold):.2f} to {effective_max:.2f} (low volatility safeguard)")
 					perfect_threshold = max(effective_min, min(effective_max, perfect_threshold))
 					
