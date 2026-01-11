@@ -2950,7 +2950,7 @@ class ApolloHub(tk.Tk):
             highlightthickness=1,
             highlightbackground=DARK_BORDER,
             bd=0,
-            height=110,  # Height for one row of tiles with minimal padding
+            height=115,  # Height for one row of tiles with minimal padding
         )
         self._neural_overview_canvas.grid(row=0, column=0, sticky="ew")
 
