@@ -73,7 +73,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011112"
+VERSION = "26.011113"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -339,12 +339,16 @@ class NeuralSignalTile(ttk.Frame):
         self.coin = coin
 
         self._hover_on = False
+        self._selected_on = False
         self._normal_canvas_bg = DARK_PANEL2
         self._hover_canvas_bg = DARK_PANEL
+        self._selected_canvas_bg = DARK_PANEL
         self._normal_border = DARK_BORDER
         self._hover_border = DARK_ACCENT2
+        self._selected_border = DARK_ACCENT2
         self._normal_fg = DARK_FG
         self._hover_fg = DARK_ACCENT2
+        self._selected_fg = DARK_ACCENT2
 
         self._levels = max(2, int(levels))
         self._display_levels = self._levels - 1
@@ -436,9 +440,23 @@ class NeuralSignalTile(ttk.Frame):
         if bool(on) == bool(self._hover_on):
             return
         self._hover_on = bool(on)
+        self._apply_visual_state()
 
+    def set_selected(self, on: bool) -> None:
+        """Visually highlight the tile as the currently displayed chart coin."""
+        if bool(on) == bool(self._selected_on):
+            return
+        self._selected_on = bool(on)
+        self._apply_visual_state()
+
+    def _apply_visual_state(self) -> None:
+        """Apply visual styling based on selected/hover state priority."""
         try:
+            # Hover changes both border and text (transient)
+            # Selected changes only border, not text (persistent)
+            # Priority: hover overrides selected for text color
             if self._hover_on:
+                # Full hover effect: border + text color
                 self.canvas.configure(
                     bg=self._hover_canvas_bg,
                     highlightbackground=self._hover_border,
@@ -446,7 +464,17 @@ class NeuralSignalTile(ttk.Frame):
                 )
                 self.title_lbl.configure(foreground=self._hover_fg)
                 self.value_lbl.configure(foreground=self._hover_fg)
+            elif self._selected_on:
+                # Selected effect: border only, text stays normal
+                self.canvas.configure(
+                    bg=self._selected_canvas_bg,
+                    highlightbackground=self._selected_border,
+                    highlightthickness=2,
+                )
+                self.title_lbl.configure(foreground=self._normal_fg)
+                self.value_lbl.configure(foreground=self._normal_fg)
             else:
+                # Normal state
                 self.canvas.configure(
                     bg=self._normal_canvas_bg,
                     highlightbackground=self._normal_border,
@@ -3282,6 +3310,14 @@ class ApolloHub(tk.Tk):
                     b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
                 except Exception:
                     pass
+            
+            # Update neural tiles to highlight the selected coin
+            if hasattr(self, "neural_tiles"):
+                for coin, tile in self.neural_tiles.items():
+                    try:
+                        tile.set_selected(coin == name)
+                    except Exception:
+                        pass
 
             # Immediately refresh the newly shown coin chart so candles appear right away
             # (even if trader/neural scripts are not running yet).
@@ -5456,7 +5492,7 @@ class ApolloHub(tk.Tk):
                     "Please train at least one coin before starting the Thinker:\n\n"
                     "  1. Select a coin (BTC, ETH, etc.)\n"
                     "  2. Click 'Train' or 'Train All'\n"
-                    "  3. Wait for training to complete (may take 1-8 hours)\n"
+                    "  3. Wait for training to complete (may take several hours)\n"
                     "  4. Once training finishes, the Thinker can be started\n\n"
                     "Training creates AI memory patterns that predict price movements.\n"
                 )
@@ -5572,14 +5608,14 @@ class ApolloHub(tk.Tk):
                             f"Training data is stale for: {stale_list}\n\n"
                             f"Batch retraining all coins within 24hrs of staleness: {batch_list}\n\n"
                             f"System will restart automatically when complete.\n\n"
-                            f"Estimated time: 1-12 hours per coin."
+                            f"Estimated time: several hours per coin."
                         )
                     else:
                         messagebox.showinfo(
                             "Auto-Retrain Starting",
                             f"Training data is stale for: {stale_list}\n\n"
                             f"System will auto-retrain and restart when complete.\n\n"
-                            f"Estimated time: 1-12 hours per coin."
+                            f"Estimated time: several hours per coin."
                         )
                     
                     # Start training for all coins that need it
