@@ -602,7 +602,7 @@ tf_minutes = [tf_minutes_map.get(tf, 60) for tf in tf_choices]
 pruning_sigma_level = training_settings.get("pruning_sigma_level", 2.0) if os.path.isfile(import_path) else 2.0
 min_threshold = training_settings.get("min_threshold", 5.0) if os.path.isfile(import_path) else 5.0
 max_threshold = training_settings.get("max_threshold", 25.0) if os.path.isfile(import_path) else 25.0
-pattern_size = training_settings.get("pattern_size", 4) if os.path.isfile(import_path) else 4
+pattern_size = training_settings.get("pattern_size", 3) if os.path.isfile(import_path) else 3
 
 # PID controller parameters (tuned for non-stationary crypto markets)
 # Kp: proportional gain for quick response to current error
@@ -1544,9 +1544,9 @@ while True:
 					effective_min = max(min_threshold, adaptive_min_threshold)
 					effective_max = min(max_threshold, adaptive_max_threshold)
 					# Safeguard: ensure max >= min (can occur in very low volatility)
-					# Give PID room to work by doubling min instead of locking to exact value
-					if effective_max < effective_min * 3.0:
-						effective_max = effective_min * 3.0
+					# Give PID room to work by using average of configured min/max thresholds
+					if effective_max < (min_threshold + max_threshold) / 2:
+						effective_max = (min_threshold + max_threshold) / 2
 						debug_print(f"[DEBUG] TRAINER: Adjusted effective_max from {min(max_threshold, adaptive_max_threshold):.2f} to {effective_max:.2f} (low volatility safeguard)")
 					perfect_threshold = max(effective_min, min(effective_max, perfect_threshold))
 					

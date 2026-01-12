@@ -1929,7 +1929,7 @@ def step_coin(sym: str):
 					pm_value = sum(active_margins) / len(active_margins)
 					pm_display = f"{pm_value:+.2f}%"
 				else:
-					pm_display = "----"
+					pm_display = "-----"
 
 				# Build output lines
 				lines = []
@@ -1965,14 +1965,16 @@ def step_coin(sym: str):
 						bounds_text = f"Low:{low_dist:+5.1f}%   High:    --"
 					elif high_bound != float('inf'):
 						high_dist = ((high_bound - current) / current) * 100
-						bounds_text = f"Low: ----   High:{high_dist:+5.1f}%"
+						bounds_text = f"Low: ------   High:{high_dist:+5.1f}%"
 					else:
 						bounds_text = "No boundaries"
 						
 					# Add match quality indicator (ASCII only for Hub display compatibility)
 					quality = match_qualities[i] if i < len(match_qualities) else 100.0
 					if quality >= 100:
-						quality_icon = f"Signal: {quality:.0f}% STRONG"  # Excellent match
+						quality_icon = f"Signal: {quality:.0f}% PERFECT"  # Excellent match
+					elif quality >= 67:
+						quality_icon = f"Signal: {quality:.0f}% STRONG"  # Good match
 					elif quality >= 50:
 						quality_icon = f"Signal: {quality:.0f}% MARGINAL"  # Good match
 					else:
@@ -2238,12 +2240,12 @@ try:
 						if summary['next_long_pct'] is not None:
 							long_str = f"{summary['next_long_pct']:+.1f}%"
 						else:
-							long_str = "----"
+							long_str = "-----"
 						
 						if summary['next_short_pct'] is not None:
 							short_str = f"{summary['next_short_pct']:+.1f}%"
 						else:
-							short_str = "----"
+							short_str = "-----"
 						
 						# Dynamic spacing: 2 spaces for 3-letter tickers, 1 for 4-letter, 0 for 5-letter
 						spacing = " " * max(0, 4 - len(_sym))
