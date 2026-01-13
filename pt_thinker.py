@@ -490,6 +490,25 @@ def coin_directory(sym: str):
 # Training freshness gate (mirrors pt_hub.py) - checks if coin training is current
 _TRAINING_STALE_SECONDS = 14 * 24 * 60 * 60  # 14 days
 
+def _is_coin_actively_training(sym: str) -> bool:
+	"""Check if a coin is currently in TRAINING state (trainer process is running).
+	
+	Returns True if trainer_status.json shows state=TRAINING, False otherwise.
+	Used to suppress incomplete training warnings for coins actively being trained.
+	"""
+	try:
+		folder = coin_folder(sym)
+		status_path = os.path.join(folder, "trainer_status.json")
+		if os.path.isfile(status_path):
+			with open(status_path, "r", encoding="utf-8") as f:
+				status_data = json.load(f)
+			if isinstance(status_data, dict):
+				state = str(status_data.get("state", "")).upper()
+				return state == "TRAINING"
+	except Exception:
+		pass
+	return False
+
 def _coin_is_trained(sym: str) -> bool:
 	"""
 	Training freshness gate:
@@ -2168,6 +2187,7 @@ def step_coin(sym: str):
 # Track first iteration for startup message
 _first_run = True
 _startup_message_shown = False
+_last_training_warning_time = 0.0  # Throttle training warnings to once per 60 seconds
 
 print("Starting main loop...\n", flush=True)
 
@@ -2192,20 +2212,30 @@ try:
 		total_count = len(coins_this_iteration)
 
 		# Validate training status and display persistent warning if incomplete
+		# Skip coins actively being trained and throttle warning to once per 60 seconds
 		training_warnings = []
 		for _sym in coins_this_iteration:
+			# Skip coins that are currently training (not finished yet)
+			if _is_coin_actively_training(_sym):
+				continue
+			
 			is_valid, missing_tfs = _validate_coin_training(_sym)
 			if not is_valid:
 				training_warnings.append(f"{_sym}: Missing {', '.join(missing_tfs)}")
 
-		if training_warnings:
+		# Throttle warning to once per 60 seconds to avoid log spam
+		current_time = time.time()
+		time_since_last_warning = current_time - _last_training_warning_time
+		
+		if training_warnings and time_since_last_warning >= 60.0:
 			print("⚠ WARNING: INCOMPLETE TRAINING DETECTED", flush=True)
 			for warning in training_warnings:
 				print(f"  {warning}", flush=True)
 			print(f"Required timeframes: {', '.join(REQUIRED_THINKER_TIMEFRAMES)}", flush=True)
 			print("Predictions may be inaccurate until training is complete.\n", flush=True)
+			_last_training_warning_time = current_time
 			_startup_message_shown = False  # Reset if warnings appear
-		else:
+		elif not training_warnings:
 			# Show startup message only on first successful validation
 			if _first_run and not _startup_message_shown:
 				_startup_message_shown = True

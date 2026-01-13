@@ -2901,7 +2901,7 @@ class ApolloHub(tk.Tk):
         self.lbl_neural = ttk.Label(controls_left, text="Thinker: waiting")
         self.lbl_neural.pack(anchor="w", padx=6, pady=(6, 2))
 
-        self.lbl_trader = ttk.Label(controls_left, text="Trader: waiting")
+        self.lbl_trader = ttk.Label(controls_left, text="Trader: stopped")
         self.lbl_trader.pack(anchor="w", padx=6, pady=(0, 6))
 
         # Account info (LEFT column, under status) - reduced top padding
@@ -5757,9 +5757,8 @@ class ApolloHub(tk.Tk):
         auto_mode_phase = getattr(self, "_auto_mode_phase", "")
         user_manually_stopped = getattr(self, "_user_manually_stopped", False)
         
-        # Show WAITING when autopilot is engaged but processes aren't running yet
-        # Show RUNNING when processes are active
-        # Show STOPPED only when user manually stopped (not just idle)
+        # Thinker: Show WAITING by default (auto-starts), STOPPED only when manually stopped
+        # Trader: Show STOPPED by default, WAITING only when autopilot engaged
         if neural_running:
             neural_status = "RUNNING"
         elif auto_mode_active or (auto_mode_phase in ("TRAINING", "RUNNING") and self._auto_start_trader_pending):
@@ -5773,10 +5772,8 @@ class ApolloHub(tk.Tk):
             trader_status = "RUNNING"
         elif auto_mode_active or (auto_mode_phase in ("TRAINING", "RUNNING") and self._auto_start_trader_pending):
             trader_status = "WAITING"
-        elif user_manually_stopped:
-            trader_status = "STOPPED"
         else:
-            trader_status = "WAITING"
+            trader_status = "STOPPED"
         
         self.lbl_neural.config(text=f"Thinker: {neural_status}")
         self.lbl_trader.config(text=f"Trader: {trader_status}")
