@@ -26,6 +26,18 @@ Relevant behavior notes (informational only):
     The GUI communicates with other processes through status files and the
     `hub_data` directory so each component can run independently while the
     hub shows a unified view.
+
+- Auto-Start Thinker:
+    After manual training completes successfully, the Thinker automatically
+    starts (unless already running or in autopilot mode). This provides a
+    seamless user experience similar to the Hub startup behavior.
+
+- Smart Auto-Retrain:
+    When training becomes stale, the system checks for imminent trade actions
+    before stopping to retrain. If any coin is within critical trading distance
+    (entry, DCA, stop loss, or take profit), retraining is delayed until trades
+    complete. Training staleness countdown shows T-X (hours until stale) or
+    T+X (hours overdue) in the UI.
 """
 
 import os
@@ -73,7 +85,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011123"
+VERSION = "26.011222"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -622,14 +634,10 @@ REQUIRED_THINKER_TIMEFRAMES = [
 DEFAULT_TRAINING_CONFIG = {
     "staleness_days": 14,
     "auto_train_when_stale": True,
-    "pruning_sigma_level": 2.0,
-    "pid_kp": 0.5,
-    "pid_ki": 0.005,
-    "pid_kd": 0.2,
-    "pid_integral_limit": 20,
+    "pruning_sigma_level": 3.0,
     "min_threshold": 5.0,
     "max_threshold": 25.0,
-    "pattern_size": 3,
+    "pattern_size": 4,
     "weight_base_step": 0.25,
     "weight_step_cap_multiplier": 2.0,
     "weight_threshold_base": 0.1,
@@ -5586,6 +5594,19 @@ class ApolloHub(tk.Tk):
                 stale_coins = self._get_stale_coins()
                 
                 if stale_coins:
+                    # --- CRITICAL TRADING WINDOW CHECK ---
+                    # Before stopping everything, check if any coin is in imminent trade window
+                    # If so, delay retraining until all trades complete (safety first)
+                    auto_switch_cfg = self.settings.get("auto_switch", {})
+                    threshold_pct = auto_switch_cfg.get("threshold_pct", 2.0)
+                    
+                    if self._has_priority_coin(threshold_pct):
+                        # Critical trade imminent - delay retraining
+                        # User will see T+X countdown in UI to know training is overdue
+                        if self.settings.get("debug_mode", False):
+                            print(f"[HUB AUTO-RETRAIN] Delaying: priority coin detected (trade imminent)")
+                        return  # Exit without retraining - will check again next minute
+                    
                     # At least one coin is stale - batch retrain everything within 24 hours of staleness
                     near_stale = self._get_coins_near_stale(threshold_hours=24.0)
                     
@@ -5699,6 +5720,33 @@ class ApolloHub(tk.Tk):
             training_running = [c for c, s in status_map.items() if s == "TRAINING"]
             not_trained = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
 
+            # --- AUTO-START THINKER AFTER MANUAL TRAINING COMPLETES ---
+            # When a coin finishes training outside of autopilot mode, automatically start the thinker
+            # This provides a seamless experience: user clicks "Train All", training completes, thinker starts
+            # Similar to how thinker auto-starts when Hub opens with valid training data
+            prev_status = getattr(self, "_prev_training_status_map", {})
+            auto_mode_active = getattr(self, "_auto_mode_active", False)
+            auto_retraining = getattr(self, "_auto_retraining_active", False)
+            
+            # Detect coins that just transitioned from TRAINING to TRAINED
+            newly_trained = [c for c in status_map.keys() 
+                           if prev_status.get(c) == "TRAINING" and status_map.get(c) == "TRAINED"]
+            
+            # If any coins just finished training successfully, and we're not in autopilot/auto-retrain mode, start thinker
+            if newly_trained and not auto_mode_active and not auto_retraining and not neural_running:
+                try:
+                    # Reset thinker-ready gate file
+                    with open(self.runner_ready_path, "w", encoding="utf-8") as f:
+                        json.dump({"timestamp": time.time(), "ready": False, "stage": "starting"}, f)
+                except Exception:
+                    pass
+                
+                # Start the thinker automatically (no dialog needed - silent convenience feature)
+                self._start_process(self.proc_neural, log_q=self.runner_log_q, prefix="[THINKER] ")
+            
+            # Save current status for next tick's comparison
+            self._prev_training_status_map = status_map.copy()
+
             if training_running:
                 self.lbl_training_overview.config(text=f"Training: RUNNING ({', '.join(training_running)})")
             elif not_trained:
@@ -5724,9 +5772,15 @@ class ApolloHub(tk.Tk):
                 self._last_training_sig = sig
                 self.training_list.delete(0, "end")
                 for c, st, hours in sig:
-                    # For trained coins, show time until stale
-                    if st == "TRAINED" and hours is not None and hours > 0:
-                        self.training_list.insert("end", f"{c}: {st.upper()} (T-{hours} HRS)")
+                    # For trained coins, show time until stale (T-X) or time overdue (T+X)
+                    if st == "TRAINED" and hours is not None:
+                        if hours > 0:
+                            # Training is still valid - show countdown
+                            self.training_list.insert("end", f"{c}: {st.upper()} (T-{hours} HRS)")
+                        else:
+                            # Training is overdue - show how long it's been stale
+                            overdue_hours = abs(hours)
+                            self.training_list.insert("end", f"{c}: {st.upper()} (T+{overdue_hours} HRS)")
                     else:
                         self.training_list.insert("end", f"{c}: {st.upper()}")
 
@@ -6051,6 +6105,91 @@ class ApolloHub(tk.Tk):
         except Exception:
             self._hide_priority_alert()
             pass  # Silently fail - don't crash tick loop
+    
+    def _has_priority_coin(self, threshold_pct: float = 2.0) -> bool:
+        """
+        Check if any coin is within critical trading window (imminent trade action).
+        Uses same logic as auto-switch to detect:
+        1. New buy entry signal (if slots available)
+        2. DCA trigger (existing position approaching next DCA level)
+        3. Stop loss trigger (existing position approaching stop loss)
+        4. Take profit trigger (existing position approaching trailing stop)
+        
+        Args:
+            threshold_pct: Distance threshold (default 2.0%)
+        
+        Returns:
+            True if any coin is within threshold of a trading action
+        """
+        try:
+            # Load trader status for position data
+            trader_data = _safe_read_json(self.trader_status_path)
+            if not trader_data:
+                return False
+            
+            positions = trader_data.get("positions", {})
+            if not positions:
+                return False
+            
+            # Load trading config for thresholds and limits
+            trading_cfg = self._get_cached_trading_config()
+            long_signal_min = trading_cfg.get("entry_signals", {}).get("long_signal_min", 4)
+            stop_loss_pct = trading_cfg.get("profit_margin", {}).get("stop_loss_pct", -40.0)
+            max_concurrent = trading_cfg.get("position_sizing", {}).get("max_concurrent_positions", 3)
+            
+            # Count active positions (slots used)
+            active_positions = sum(1 for pos in positions.values() if float(pos.get("quantity", 0.0)) > 0)
+            slots_available = max_concurrent - active_positions
+            
+            # Check each coin for proximity to trading actions
+            for coin in self.coins:
+                pos = positions.get(coin)
+                if not pos:
+                    continue
+                
+                current_price = float(pos.get("current_sell_price", 0.0) or 0.0)
+                if current_price <= 0:
+                    continue
+                
+                quantity = float(pos.get("quantity", 0.0))
+                has_position = quantity > 0
+                
+                # Check 1: New buy entry (if signal strong and slots available)
+                if not has_position and slots_available > 0:
+                    entry_distance = self._calculate_entry_distance(coin, current_price, long_signal_min)
+                    if entry_distance is not None and entry_distance <= threshold_pct:
+                        return True
+                
+                # Checks 2-4 only apply to existing positions
+                if has_position:
+                    avg_cost = float(pos.get("avg_cost_basis", 0.0))
+                    if avg_cost <= 0:
+                        continue
+                    
+                    # Check 2: DCA trigger
+                    dca_line = float(pos.get("dca_line_price", 0.0))
+                    if dca_line > 0:
+                        dca_distance = abs(current_price - dca_line) / current_price * 100.0
+                        if dca_distance <= threshold_pct:
+                            return True
+                    
+                    # Check 3: Stop loss
+                    stop_loss_price = avg_cost * (1.0 + stop_loss_pct / 100.0)
+                    stop_distance = abs(current_price - stop_loss_price) / current_price * 100.0
+                    if stop_distance <= threshold_pct and current_price <= stop_loss_price * 1.05:
+                        return True
+                    
+                    # Check 4: Take profit (trailing stop)
+                    trail_active = pos.get("trail_active", False)
+                    trail_line = float(pos.get("trail_line", 0.0))
+                    if trail_active and trail_line > 0:
+                        trail_distance = abs(current_price - trail_line) / current_price * 100.0
+                        if trail_distance <= threshold_pct:
+                            return True
+            
+            return False
+        except Exception:
+            return False  # On error, assume no priority (don't block retraining)
     
     def _calculate_entry_distance(self, coin: str, current_price: float, long_signal_min: int) -> Optional[float]:
         """
@@ -8455,80 +8594,54 @@ class ApolloHub(tk.Tk):
 
         # Pattern size (moved from Pattern Quality)
         ttk.Label(learning_frame, text="Pattern size (candles):").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
-        pattern_size_var = tk.StringVar(value=str(cfg.get("pattern_size", 3)))
+        pattern_size_var = tk.StringVar(value=str(cfg.get("pattern_size", 4)))
         ttk.Entry(learning_frame, textvariable=pattern_size_var, width=15).grid(row=0, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
-            text="Number of candles per pattern (2-5 range; 3=balanced, 5=specific). ⚠ Changing requires full retrain!",
+            text="Number of candles per pattern (2-5 range; 4=balanced, 5=specific). ⚠ Changing requires full retrain!",
             foreground="orange",
             font=("TkDefaultFont", 8, "bold")
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 15))
 
         ttk.Label(
             learning_frame,
-            text="PID controller adaptively adjusts similarity threshold for optimal pattern matching:",
+            text="Volatility-adaptive threshold: System automatically scales threshold based on market conditions (4.0x volatility).",
             foreground=DARK_FG,
             wraplength=550
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # Kp (Proportional gain)
-        ttk.Label(learning_frame, text="Kp (Proportional):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        pid_kp_var = tk.StringVar(value=str(cfg.get("pid_kp", 0.5)))
-        ttk.Entry(learning_frame, textvariable=pid_kp_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
-
-        # Ki (Integral gain)
-        ttk.Label(learning_frame, text="Ki (Integral):").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
-        pid_ki_var = tk.StringVar(value=str(cfg.get("pid_ki", 0.005)))
-        ttk.Entry(learning_frame, textvariable=pid_ki_var, width=15).grid(row=4, column=1, sticky="w", pady=6)
-
-        # Kd (Derivative gain)
-        ttk.Label(learning_frame, text="Kd (Derivative):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
-        pid_kd_var = tk.StringVar(value=str(cfg.get("pid_kd", 0.2)))
-        ttk.Entry(learning_frame, textvariable=pid_kd_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
-
-        # Integral limit
-        ttk.Label(learning_frame, text="Integral limit:").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
-        pid_limit_var = tk.StringVar(value=str(cfg.get("pid_integral_limit", 20)))
-        ttk.Entry(learning_frame, textvariable=pid_limit_var, width=15).grid(row=6, column=1, sticky="w", pady=6)
-
-        ttk.Label(
-            learning_frame,
-            text="PID gains: Kp=response speed, Ki=steady-state correction, Kd=damping. Leave defaults unless tuning.",
-            foreground=DARK_FG,
-            font=("TkDefaultFont", 8)
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
         # Minimum threshold
-        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         min_threshold_var = tk.StringVar(value=str(cfg.get("min_threshold", 5.0)))
-        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=8, column=1, sticky="w", pady=6)
+        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
-            text="Lower limit for threshold adjustment (prevents too strict matching)",
+            text="Lower bound for relative threshold (prevents too strict matching in low volatility)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # Maximum threshold
-        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
         max_threshold_var = tk.StringVar(value=str(cfg.get("max_threshold", 20.0)))
-        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=10, column=1, sticky="w", pady=6)
+        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
-            text="Upper limit for threshold adjustment (prevents too loose matching)",
+            text="Upper bound for relative threshold (caps volatility scaling to prevent too loose matching)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(
             learning_frame,
-            text="Note: Initial and target thresholds will be the average of min and max",
+            text="Note: Threshold is RELATIVE (% of pattern value). Formula: min(max_threshold, 4.0 × volatility), clamped to [min, max].\nExample: 5% pattern with 20% threshold matches 4% to 6% (±1% absolute range).",
             foreground=DARK_FG,
-            font=("TkDefaultFont", 8, "italic")
-        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(0, 0))
+            font=("TkDefaultFont", 8, "italic"),
+            wraplength=550
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Advanced Weight System Section
         advanced_frame = ttk.LabelFrame(frm, text=" Advanced Weight System ", padding=15)
@@ -8595,7 +8708,7 @@ class ApolloHub(tk.Tk):
 
         # Pruning sigma level (moved from Pattern Quality)
         ttk.Label(advanced_frame, text="Pruning sigma level:").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
-        pruning_sigma_var = tk.StringVar(value=str(cfg.get("pruning_sigma_level", 2.0)))
+        pruning_sigma_var = tk.StringVar(value=str(cfg.get("pruning_sigma_level", 3.0)))
         ttk.Entry(advanced_frame, textvariable=pruning_sigma_var, width=15).grid(row=20, column=1, sticky="w", pady=6)
 
         ttk.Label(
@@ -8761,19 +8874,6 @@ class ApolloHub(tk.Tk):
                     messagebox.showerror("Validation Error", "Staleness threshold must be at least 1 day")
                     return
                 
-                # PID Controller parameters
-                pid_kp = float(pid_kp_var.get())
-                pid_ki = float(pid_ki_var.get())
-                pid_kd = float(pid_kd_var.get())
-                pid_limit = float(pid_limit_var.get())
-                
-                if pid_kp <= 0 or pid_ki <= 0 or pid_kd <= 0:
-                    messagebox.showerror("Validation Error", "PID gains (Kp, Ki, Kd) must be greater than 0")
-                    return
-                if pid_limit <= 0:
-                    messagebox.showerror("Validation Error", "PID integral limit must be greater than 0")
-                    return
-                
                 min_threshold = float(min_threshold_var.get())
                 max_threshold = float(max_threshold_var.get())
                 if min_threshold < 0 or min_threshold > 100:
@@ -8831,7 +8931,7 @@ class ApolloHub(tk.Tk):
                 # Read existing config to preserve timeframes and check for pattern_size change
                 existing_cfg = _safe_read_json(config_path) if os.path.isfile(config_path) else {}
                 timeframes = existing_cfg.get("timeframes", REQUIRED_THINKER_TIMEFRAMES)
-                old_pattern_size = existing_cfg.get("pattern_size", 3)
+                old_pattern_size = existing_cfg.get("pattern_size", 4)
                 
                 # Warn if pattern_size changed (requires retraining)
                 if pattern_size != old_pattern_size:
@@ -8849,14 +8949,9 @@ class ApolloHub(tk.Tk):
                     "staleness_days": staleness,
                     "auto_train_when_stale": bool(auto_train_var.get()),
                     "pruning_sigma_level": pruning_sigma,
-                    "pid_kp": pid_kp,
-                    "pid_ki": pid_ki,
-                    "pid_kd": pid_kd,
-                    "pid_integral_limit": pid_limit,
                     "min_threshold": min_threshold,
                     "max_threshold": max_threshold,
                     "pattern_size": pattern_size,
-                    "timeframes": timeframes,
                     "weight_base_step": weight_base_step,
                     "weight_step_cap_multiplier": weight_step_cap,
                     "weight_threshold_base": weight_threshold_base,
@@ -8867,7 +8962,8 @@ class ApolloHub(tk.Tk):
                     "weight_decay_target": weight_decay_target,
                     "age_pruning_enabled": bool(age_pruning_enabled_var.get()),
                     "age_pruning_percentile": age_pruning_percentile,
-                    "age_pruning_weight_limit": age_pruning_weight
+                    "age_pruning_weight_limit": age_pruning_weight,
+                    "timeframes": timeframes
                 }
                 _safe_write_json(config_path, new_cfg)
                 messagebox.showinfo(
@@ -8888,14 +8984,10 @@ class ApolloHub(tk.Tk):
                 # Reset all fields to defaults
                 staleness_var.set(str(defaults.get("staleness_days", 14)))
                 auto_train_var.set(bool(defaults.get("auto_train_when_stale", False)))
-                pid_kp_var.set(str(defaults.get("pid_kp", 0.5)))
-                pid_ki_var.set(str(defaults.get("pid_ki", 0.01)))
-                pid_kd_var.set(str(defaults.get("pid_kd", 0.02)))
-                pid_limit_var.set(str(defaults.get("pid_integral_limit", 0.5)))
                 min_threshold_var.set(str(defaults.get("min_threshold", 5.0)))
                 max_threshold_var.set(str(defaults.get("max_threshold", 25.0)))
-                pruning_sigma_var.set(str(defaults.get("pruning_sigma_level", 2.0)))
-                pattern_size_var.set(str(defaults.get("pattern_size", 3)))
+                pruning_sigma_var.set(str(defaults.get("pruning_sigma_level", 3.0)))
+                pattern_size_var.set(str(defaults.get("pattern_size", 4)))
                 weight_base_step_var.set(str(defaults.get("weight_base_step", 0.25)))
                 weight_step_cap_var.set(str(defaults.get("weight_step_cap_multiplier", 2.0)))
                 weight_threshold_base_var.set(str(defaults.get("weight_threshold_base", 0.1)))

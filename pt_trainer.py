@@ -23,6 +23,13 @@ Key behavioral notes (informational only):
 	adjusts pattern weights based on prediction accuracy so future
 	weighted-averages improve over time.
 
+- Pattern Matching:
+	Uses relative threshold matching (percentage of pattern magnitude) for
+	scale-invariant behavior across different price levels. Thresholds are
+	automatically adjusted based on volatility (4.0× average volatility) and
+	clamped to configured min/max bounds. Zero/tiny patterns use a 0.1%
+	baseline to prevent division-by-zero.
+
 - Thinker/Trader integration:
 	The Thinker uses predicted highs/lows from each timeframe to decide
 	start signals and DCA levels; the Trader uses those signals with
@@ -151,32 +158,6 @@ _write_buffer = {
 	"last_flush_time": 0,       # timestamp of last periodic flush
 }
 
-# PID controller state tracking per timeframe
-_pid_state = {}  # tf_choice -> dict(integral_error, prev_error, initialized)
-
-def init_pid_state(tf_choice):
-	"""Initialize PID state for a timeframe."""
-	if tf_choice not in _pid_state:
-		_pid_state[tf_choice] = {
-			"integral_error": 0.0,    # Accumulated error for Ki term
-			"prev_error": 0.0,         # Previous error for Kd term
-			"initialized": False       # First iteration flag
-		}
-
-def reset_pid_state(tf_choice):
-	"""Reset PID state (e.g., after retraining or when starting fresh)."""
-	if tf_choice in _pid_state:
-		_pid_state[tf_choice] = {
-			"integral_error": 0.0,
-			"prev_error": 0.0,
-			"initialized": False
-		}
-
-def get_pid_state(tf_choice):
-	"""Get PID state for timeframe, initializing if needed."""
-	init_pid_state(tf_choice)
-	return _pid_state[tf_choice]
-
 def _read_text(path):
 	with open(path, "r", encoding="utf-8", errors="ignore") as f:
 		return f.read()
@@ -292,54 +273,100 @@ def flush_all_buffers(force=True):
 	debug_print("[DEBUG] TRAINER: All buffers flushed successfully")
 
 def clear_incompatible_patterns(tf_choice, expected_pattern_size):
-	"""Delete existing pattern files if they were created with a different number_of_candles.
-	This forces a clean retrain when pattern structure changes (e.g., 2 candles → 3 candles).
+	"""Delete existing pattern files if they are incompatible with current format.
+	Validates:
+	1. Pattern size matches expected (pattern_size - 1 values)
+	2. Values are percentage changes (typically -100 to +1000 range), not absolute prices
+	3. Pattern structure is valid
+	Forces a clean retrain when format is incompatible.
 	Returns True if files were cleared, False if compatible or no files exist."""
-	debug_print(f"[VALIDATION] Checking pattern compatibility for {tf_choice} (expecting {expected_pattern_size} candles)...")
+	debug_print(f"[VALIDATION] Checking pattern compatibility for {tf_choice} (expecting {expected_pattern_size-1} percentage changes from {expected_pattern_size} candles)...")
 	try:
 		memory_file = f"memories_{tf_choice}.dat"
 		if not os.path.exists(memory_file):
 			debug_print(f"[VALIDATION] No existing patterns found, starting fresh")
+			return False
 		
-		# Check first pattern to see if structure matches expected size
+		# Check first pattern to see if structure matches expected size and format
 		content = _read_text(memory_file)
 		if not content or content.strip() == '':
 			return False  # Empty file, nothing to validate
 		
 		first_pattern = content.split('~')[0]
-		if '{}' in first_pattern:
-			pattern_values = first_pattern.split('{}')[0].split('|')
-			pattern_values = [v for v in pattern_values if v.strip() != '']
-			actual_size = len(pattern_values)
-			expected_size = expected_pattern_size - 1  # number_of_candles=3 means 2 prior values
-			
-			if actual_size == expected_size:
-				debug_print(f"[DEBUG] TRAINER: Existing patterns for {tf_choice} are compatible (size={actual_size})")
-				return False  # Compatible, keep existing patterns
-			
-			# Incompatible structure detected - clear all related files
-			print(f"[RETRAIN] Pattern structure changed for {tf_choice}:")
-			print(f"[RETRAIN]   Old: {actual_size} values per pattern")
-			print(f"[RETRAIN]   New: {expected_size} values per pattern")
-			print(f"[RETRAIN] Clearing old memories and starting fresh...")
-			
-			files_to_clear = [
-				f"memories_{tf_choice}.dat",
-				f"memory_weights_{tf_choice}.dat",
-				f"memory_weights_high_{tf_choice}.dat",
-				f"memory_weights_low_{tf_choice}.dat",
-				f"neural_perfect_threshold_{tf_choice}.dat"
-			]
-			
-			for filename in files_to_clear:
-				if os.path.exists(filename):
-					os.remove(filename)
-					debug_print(f"[DEBUG] TRAINER: Deleted {filename}")
-			
-			return True  # Files cleared
+		if '{}' not in first_pattern:
+			debug_print(f"[VALIDATION] Invalid pattern structure (missing {{}}), clearing...")
+			_clear_pattern_files(tf_choice, "Invalid structure")
+			return True
+		
+		pattern_values = first_pattern.split('{}')[0].split('|')
+		pattern_values = [v for v in pattern_values if v.strip() != '']
+		actual_size = len(pattern_values)
+		expected_size = expected_pattern_size - 1  # number_of_candles=3 means 2 prior % changes
+		
+		# Validation 1: Check pattern size
+		if actual_size != expected_size:
+			print(f"[RETRAIN] Pattern size mismatch for {tf_choice}:")
+			print(f"[RETRAIN]   Found: {actual_size} values per pattern")
+			print(f"[RETRAIN]   Expected: {expected_size} values per pattern")
+			_clear_pattern_files(tf_choice, f"Size mismatch ({actual_size} vs {expected_size})")
+			return True
+		
+		# Validation 2: Check that values are percentage changes, not absolute prices
+		# Sample first 10 patterns to check format
+		patterns_to_check = content.split('~')[:10]
+		incompatible_count = 0
+		for pattern in patterns_to_check:
+			if '{}' in pattern:
+				try:
+					values = pattern.split('{}')[0].split('|')
+					for val_str in values:
+						if val_str.strip() == '':
+							continue
+						val = float(val_str)
+						# Percentage changes typically range from -100% to +1000% (crypto can be extreme)
+						# Absolute prices are typically > 1000 (e.g., BTC at $40k+)
+						# If we see values > 5000, it's likely absolute prices
+						if abs(val) > 5000:
+							incompatible_count += 1
+							break
+				except (ValueError, IndexError):
+					continue
+		
+		# If more than half of sampled patterns look like absolute prices, clear
+		if incompatible_count > len(patterns_to_check) / 2:
+			print(f"[RETRAIN] Detected old absolute-price format for {tf_choice}")
+			print(f"[RETRAIN]   Found {incompatible_count}/{len(patterns_to_check)} patterns with absolute prices")
+			print(f"[RETRAIN]   New format uses percentage changes (scale-invariant)")
+			_clear_pattern_files(tf_choice, "Absolute price format detected")
+			return True
+		
+		debug_print(f"[VALIDATION] Patterns for {tf_choice} are compatible (size={actual_size}, format=percentage changes)")
+		return False  # Compatible, keep existing patterns
+		
 	except Exception as e:
-		debug_print(f"[DEBUG] TRAINER: Error checking pattern compatibility: {e}")
-		return False
+		debug_print(f"[VALIDATION] Error during validation: {e}")
+		# On validation error, clear to be safe
+		_clear_pattern_files(tf_choice, f"Validation error: {e}")
+		return True
+
+def _clear_pattern_files(tf_choice, reason):
+	"""Helper to clear all pattern-related files for a timeframe."""
+	print(f"[RETRAIN] Clearing memories for {tf_choice}: {reason}")
+	files_to_clear = [
+		f"memories_{tf_choice}.dat",
+		f"memory_weights_{tf_choice}.dat",
+		f"memory_weights_high_{tf_choice}.dat",
+		f"memory_weights_low_{tf_choice}.dat",
+		f"neural_perfect_threshold_{tf_choice}.dat"
+	]
+	
+	for filename in files_to_clear:
+		if os.path.exists(filename):
+			try:
+				os.remove(filename)
+				debug_print(f"[DEBUG] TRAINER: Deleted {filename}")
+			except Exception as e:
+				debug_print(f"[DEBUG] TRAINER: Failed to delete {filename}: {e}")
 
 def mark_training_error(error_msg: str):
 	"""Mark training as ERROR in status file before exiting on failures.
@@ -599,19 +626,10 @@ else:
 tf_minutes = [tf_minutes_map.get(tf, 60) for tf in tf_choices]
 
 # Load training parameter settings with defaults
-pruning_sigma_level = training_settings.get("pruning_sigma_level", 2.0) if os.path.isfile(import_path) else 2.0
+pruning_sigma_level = training_settings.get("pruning_sigma_level", 3.0) if os.path.isfile(import_path) else 3.0
 min_threshold = training_settings.get("min_threshold", 5.0) if os.path.isfile(import_path) else 5.0
 max_threshold = training_settings.get("max_threshold", 25.0) if os.path.isfile(import_path) else 25.0
-pattern_size = training_settings.get("pattern_size", 3) if os.path.isfile(import_path) else 3
-
-# PID controller parameters (tuned for non-stationary crypto markets)
-# Kp: proportional gain for quick response to current error
-# Ki: integral gain for eliminating steady-state error (reduced to prevent windup)
-# Kd: derivative gain for anticipating volatility changes and damping oscillations
-pid_kp = training_settings.get("pid_kp", 0.5) if os.path.isfile(import_path) else 0.5
-pid_ki = training_settings.get("pid_ki", 0.005) if os.path.isfile(import_path) else 0.005
-pid_kd = training_settings.get("pid_kd", 0.2) if os.path.isfile(import_path) else 0.2
-pid_integral_limit = training_settings.get("pid_integral_limit", 20) if os.path.isfile(import_path) else 20
+pattern_size = training_settings.get("pattern_size", 4) if os.path.isfile(import_path) else 4
 
 # Weight adjustment parameters (error-proportional scaling)
 # Base step scales with error magnitude for faster convergence on large errors
@@ -638,24 +656,23 @@ age_pruning_enabled = training_settings.get("age_pruning_enabled", True) if os.p
 age_pruning_percentile = training_settings.get("age_pruning_percentile", 0.10) if os.path.isfile(import_path) else 0.10
 age_pruning_weight_limit = training_settings.get("age_pruning_weight_limit", 1.0) if os.path.isfile(import_path) else 1.0
 
-# Calculate initial and target threshold as average of min and max
+# Calculate initial threshold as average of min and max (used as starting point, will be calculated per-timeframe based on volatility)
 initial_perfect_threshold = (min_threshold + max_threshold) / 2
-perfect_threshold_target = (min_threshold + max_threshold) / 2
 # bounce_accuracy_tolerance is now adaptive (calculated as 0.25x of avg_volatility per timeframe)
 # This automatically scales by timeframe and market conditions for honest accuracy measurement
 
 # Initialize number_of_candles based on pattern_size setting
-# pattern_size=3 means 3 candles (2 prior values + current), pattern_size=2 means 2 candles (1 prior + current)
+# pattern_size=4 means 4 candles (3 prior values + current), pattern_size=3 means 3 candles (2 prior + current)
 number_of_candles = [pattern_size] * len(tf_choices)
 
 # Debug print to confirm settings are loaded (will only show if debug mode is enabled)
 try:
 	debug_print(f"[DEBUG] TRAINER: Loaded training settings from: {import_path}")
 	debug_print(f"[DEBUG] TRAINER: Active timeframes: {tf_choices}")
-	debug_print(f"[DEBUG] TRAINER: Pattern sizes (number_of_candles): {number_of_candles}")
+	debug_print(f"[DEBUG] TRAINER: Pattern sizes (number_of_candles → percentage changes): {number_of_candles} → {[n-1 for n in number_of_candles]}")
 	debug_print(f"[DEBUG] TRAINER: Training parameters - bounce_tol=adaptive(0.25×volatility), pruning_sigma={pruning_sigma_level}")
-	debug_print(f"[DEBUG] TRAINER: Threshold limits - min={min_threshold}%, max={max_threshold}%, initial/target={initial_perfect_threshold}%")
-	debug_print(f"[DEBUG] TRAINER: PID Controller - Kp={pid_kp}, Ki={pid_ki}, Kd={pid_kd}, integral_limit={pid_integral_limit}")
+	debug_print(f"[DEBUG] TRAINER: Threshold bounds - min={min_threshold}%, max={max_threshold}%, initial={initial_perfect_threshold}%")
+	debug_print(f"[DEBUG] TRAINER: Volatility-adaptive threshold - formula: min(max_threshold, 4.0 × volatility)")
 	debug_print(f"[DEBUG] TRAINER: Weight adjustment - base_step={weight_base_step}, cap={weight_step_cap}x (error-proportional scaling)")
 	debug_print(f"[DEBUG] TRAINER: Adaptive thresholds - base={weight_threshold_base}, range=[{weight_threshold_min}, {weight_threshold_max}], ewma_decay={volatility_ewma_decay}")
 	debug_print(f"[DEBUG] TRAINER: Temporal decay - rate={weight_decay_rate}, target={weight_decay_target} (half-life ~{int(0.693/weight_decay_rate)} validations)")
@@ -1076,10 +1093,6 @@ while True:
 	except Exception as e:
 		debug_print(f"[DEBUG] TRAINER: Failed to load saved threshold: {e}, using initial")
 	
-	# Initialize PID state for this timeframe
-	init_pid_state(tf_choice)
-	debug_print(f"[DEBUG] TRAINER: Initialized PID state for {tf_choice}")
-	
 	loop_i = 0  # counts inner training iterations (used to throttle disk IO)
 	
 	# Skip first 2% of candles to avoid volatile startup period (minimum 12)
@@ -1101,6 +1114,10 @@ while True:
 	debug_print(f"[DEBUG] TRAINER: Initialized empty price_change lists, starting with price_list_length={price_list_length}")
 	debug_print(f"[DEBUG] TRAINER: Total historical candles available: {len(price_list)}")
 	debug_print(f"[DEBUG] TRAINER: Starting perfect_threshold: {perfect_threshold}")
+	
+	# Track pattern matching statistics for user visibility
+	matched_pattern_count = 0  # Patterns that matched existing memories (weight updates)
+	new_pattern_count = 0      # New patterns created (no match found)
 	
 	while True:
 		while True:
@@ -1217,8 +1234,17 @@ while True:
 						print()
 						percent_complete = int((current_candle / total_candles) * 100)
 						pattern_count = len(_mem["memory_list"])
-						print(f'Timeframe: {timeframe} ({percent_complete}% complete)')
-						print(f'Training on timeframe data, {pattern_count:,} patterns learned...')
+						# Calculate match rate (what % of processing reused existing patterns)
+						total_processed = matched_pattern_count + new_pattern_count
+						if total_processed > 0:
+							match_rate = (matched_pattern_count / total_processed) * 100
+							print(f'Timeframe: {timeframe} ({percent_complete}% complete)')
+							print(f'Training on timeframe data, {pattern_count:,} patterns learned ({match_rate:.1f}% matching)')
+						else:
+							print(f'Timeframe: {timeframe} ({percent_complete}% complete)')
+							print(f'Training on timeframe data, {pattern_count:,} patterns learned...')
+						# Don't update last_printed_candle here - let the final update section handle it
+						# This allows the status detail printing section to also run at the same milestone
 
 					debug_print(f"[DEBUG] TRAINER: Inner loop iteration - price_list2={len(price_list2)}, price_change_list={len(price_change_list)}")
 					
@@ -1265,7 +1291,7 @@ while True:
 						PrintException()
 					
 					# Debug: Show what was built
-					debug_print(f"[DEBUG] TRAINER: Patterns built - current={len(current_pattern)}, high={len(high_current_pattern)}, low={len(low_current_pattern)}, expected={number_of_candles[number_of_candles_index]-1}")
+					debug_print(f"[DEBUG] TRAINER: Patterns built as percentage changes - current={len(current_pattern)}, high={len(high_current_pattern)}, low={len(low_current_pattern)}, expected={number_of_candles[number_of_candles_index]-1}")
 					debug_print(f"[DEBUG] TRAINER: Lists sizes - price_change={len(price_change_list)}, high_price_change={len(high_price_change_list)}, low_price_change={len(low_price_change_list)}")
 					
 					# Non-blocking validation: warn if patterns are shorter than expected but proceed anyway
@@ -1273,7 +1299,7 @@ while True:
 					if (len(current_pattern) < expected_length or 
 					    len(high_current_pattern) < expected_length or 
 					    len(low_current_pattern) < expected_length):
-						debug_print(f"[DEBUG] TRAINER: Pattern shorter than expected (current:{len(current_pattern)}, high:{len(high_current_pattern)}, low:{len(low_current_pattern)}, expected:{expected_length}) - proceeding with partial data")
+						debug_print(f"[DEBUG] TRAINER: Pattern shorter than expected (current:{len(current_pattern)} pct_changes, high:{len(high_current_pattern)} pct_changes, low:{len(low_current_pattern)} pct_changes, expected:{expected_length}) - proceeding with partial data")
 					
 					history_diff = 1000000.0
 					memory_diff = 1000000.0
@@ -1311,7 +1337,7 @@ while True:
 										high_final_moves = 0.0
 										low_final_moves = 0.0
 										new_memory = 'yes'
-										debug_print(f"[DEBUG] TRAINER: No perfect match found (threshold={perfect_threshold:.4f}), will create new pattern")
+										debug_print(f"[DEBUG] TRAINER: No perfect match found (threshold={perfect_threshold:.2f}% relative tolerance), will create new pattern")
 									else:
 										try:
 											final_moves = sum(moves)/len(moves)
@@ -1323,7 +1349,8 @@ while True:
 											low_final_moves = 0.0
 										which_memory_index = perfect_dexs[perfect_diffs.index(min(perfect_diffs))]
 										perfect.append('yes')
-										debug_print(f"[DEBUG] TRAINER: Found {len(perfect_dexs)} perfect match(es) (threshold={perfect_threshold:.4f})")
+										matched_pattern_count += 1  # Track pattern reuse
+										debug_print(f"[DEBUG] TRAINER: Matched {len(perfect_dexs)} pattern(s) within {perfect_threshold:.2f}% relative tolerance")
 									break
 								
 								# Use pre-split patterns from cache (avoid repeated string operations)
@@ -1335,15 +1362,14 @@ while True:
 								for check_dex in range(min_len):
 									current_candle = float(current_pattern[check_dex])
 									memory_candle = float(memory_pattern[check_dex])
-									# Calculate RELATIVE difference: percentage of average (not absolute)
-									# Example: 2.0% vs 2.2% → avg=2.1, diff=|2.0-2.2|/2.1*100 = 9.52%
-									# threshold=10 means patterns can differ by 10% of their average value
-									avg_value = (current_candle + memory_candle) / 2
-									if avg_value == 0.0:
-										# Both values are zero or sum to zero - no difference
-										difference = 0.0
-									else:
-										difference = abs((abs(current_candle - memory_candle) / avg_value) * 100)
+									# Relative percentage difference (threshold applies as % of pattern value)
+									# Example: memory=5%, current=6%, threshold=15% → diff = |6-5|/5 * 100 = 20% > 15% (no match)
+									# Example: memory=5%, current=5.5%, threshold=15% → diff = |5.5-5|/5 * 100 = 10% < 15% (match)
+									# This scales precision: small moves get tight absolute tolerances, large moves get proportional tolerances
+									# Use minimum baseline of 0.05% to handle zero/tiny patterns consistently
+									# For patterns >0.05%: normal relative comparison; for patterns <0.05%: 0.05% is the noise floor
+									baseline = max(abs(memory_candle), 0.05)
+									difference = (abs(current_candle - memory_candle) / baseline) * 100
 									checks.append(difference)
 								
 								# Protect against division by zero if checks list is empty
@@ -1373,29 +1399,7 @@ while True:
 									pass
 								diffs_list.append(diff_avg)
 								memory_index += 1
-								if memory_index >= len(memory_list):
-									if any_perfect == 'no':
-										memory_diff = min(diffs_list)
-										which_memory_index = diffs_list.index(memory_diff)
-										perfect.append('no')
-										final_moves = 0.0
-										high_final_moves = 0.0
-										low_final_moves = 0.0
-										new_memory = 'yes'
-									else:
-										try:
-											final_moves = sum(moves)/len(moves)
-											high_final_moves = sum(high_moves)/len(high_moves)
-											low_final_moves = sum(low_moves)/len(low_moves)
-										except:
-											final_moves = 0.0
-											high_final_moves = 0.0
-											low_final_moves = 0.0
-										which_memory_index = perfect_dexs[perfect_diffs.index(min(perfect_diffs))]
-										perfect.append('yes')
-									break
-								else:
-									continue
+								# Loop continues to check at top (line 1318) which properly increments counters
 						except:
 							PrintException()
 							# Don't break references to _mem cache - just reset working variables
@@ -1417,13 +1421,10 @@ while True:
 							low_final_moves = 0.0
 					else:
 						pass
-					debug_print(f"[DEBUG] TRAINER: Appending current_pattern with {len(current_pattern)} candles (expected: {number_of_candles[number_of_candles_index]-1})")
+					debug_print(f"[DEBUG] TRAINER: Appending current_pattern with {len(current_pattern)} percentage changes (expected: {number_of_candles[number_of_candles_index]-1})")
 					all_current_patterns.append(current_pattern)
 					
-					# Adjust perfect_threshold based on match count, pattern library size, AND accuracy
-					# With strict validation, we have fewer but higher-quality patterns
-					# Key insight: If accuracy is high, we have enough good matches - don't force more
-					match_count = len(unweighted)
+					# Pattern library size for status output
 					pattern_count = len(_mem["memory_list"])
 					
 					# Calculate current accuracy from recent perfect predictions
@@ -1461,100 +1462,21 @@ while True:
 						}
 						debug_print(f"[DEBUG] TRAINER: Initialized volatility cache - ewma={avg_volatility:.3f}%, avg={avg_volatility:.3f}%")
 					
-					# Adaptive threshold bounds based on market volatility
-					# Low volatility → tighter bounds (more precise matching)
-					# High volatility → wider bounds (accommodate market noise)
-					# Formula: min = max(min_threshold, 1.0×volatility), max = min(max_threshold, 4.0×volatility)
-					adaptive_min_threshold = max(min_threshold, 1.0 * avg_volatility)
-					adaptive_max_threshold = min(max_threshold, 4.0 * avg_volatility)
-					debug_print(f"[DEBUG] TRAINER: Adaptive bounds = [{adaptive_min_threshold:.2f}, {adaptive_max_threshold:.2f}] (volatility-scaled)")
+					# Fixed threshold based on volatility (no PID adjustment, no target matches)
+					# Formula: Scale with volatility, cap at max, ensure minimum
+					# Low volatility → tight threshold (specific patterns needed)
+					# High volatility → loose threshold (accommodate noise)
+					# Formula: min(max_threshold, 4.0 × volatility), clamped to [min_threshold, max_threshold]
+					perfect_threshold = min(max_threshold, 4.0 * avg_volatility)
+					perfect_threshold = max(min_threshold, perfect_threshold)
 					
-					# Volatility-adaptive k-selection using √N formula
-					# Formula: k = int(√N × volatility_factor)
-					# Rationale: √N has better theoretical foundation (kNN literature)
-					#            Volatility factor adapts to market conditions
-					#            Scales properly: small N → small k, large N → larger k
-					dataset_size = len(price_list)
-					if dataset_size >= 2:
-						# Normalize volatility to 0.1-1.0 range for scaling factor
-						volatility_factor = max(0.1, min(1.0, avg_volatility / 10.0))
-						dynamic_k = int(math.sqrt(dataset_size) * volatility_factor)
-						dynamic_k = max(3, dynamic_k)  # Minimum k=3 for statistical validity
-						
-						debug_print(f"[DEBUG] TRAINER: Dynamic k = {dynamic_k} (√N formula, volatility_factor={volatility_factor:.3f}, N={dataset_size})")
-					else:
-						dynamic_k = 3  # Fallback minimum for statistical validity
-						debug_print(f"[DEBUG] TRAINER: Using fallback k = 3 (dataset_size={dataset_size} too small)")
-					
-					# Adaptive target percentage based on pattern complexity
-					# Formula: 0.0001 × sqrt(pattern_size)
-					# Rationale: Larger patterns have more information content, need higher coverage
-					# Examples: pattern_size=2 → 0.0141%, pattern_size=3 → 0.0173%, pattern_size=4 → 0.02%
-					target_percentage = 0.0001 * math.sqrt(pattern_size)
-					debug_print(f"[DEBUG] TRAINER: Adaptive target_percentage = {target_percentage*100:.2f}% (pattern_size={pattern_size})")
-					
-					# Target matches: min of adaptive % of dataset or dynamic k
-					target_matches = min(int(dataset_size * target_percentage), dynamic_k)
-					# Ensure at least 1 match is required
-					if target_matches < 1:
-						target_matches = 1
-					
-					# THRESHOLD ADJUSTMENT using PID controller
-					# Normalized error: (target - actual) / target
-					# Positive error = too few matches → increase threshold (looser matching)
-					# Negative error = too many matches → decrease threshold (stricter matching)
-					# HIGHER threshold = looser = MORE pattern matches
-					# LOWER threshold = stricter = FEWER pattern matches
-					assert target_matches > 0, f"target_matches must be positive, got {target_matches}"
-					error = (target_matches - match_count) / target_matches
-					
-					# PID Controller - Pure adaptive feedback
-					# No manual heuristics: no size_multiplier, no quality_multiplier, no deadlock override
-					pid_state = get_pid_state(tf_choice)
-					
-					# Proportional term (responds to current error)
-					p_term = pid_kp * error
-					
-					# Integral term (eliminates steady-state error, prevents deadlock)
-					pid_state["integral_error"] += error
-					# Anti-windup: Clamp integral to prevent runaway accumulation
-					pid_state["integral_error"] = max(-pid_integral_limit, min(pid_integral_limit, pid_state["integral_error"]))
-					i_term = pid_ki * pid_state["integral_error"]
-					
-					# Derivative term (dampens oscillations, prevents overshoot)
-					if pid_state["initialized"]:
-						d_term = pid_kd * (error - pid_state["prev_error"])
-					else:
-						d_term = 0.0  # First iteration, no previous error
-						pid_state["initialized"] = True
-					
-					# Update previous error for next iteration
-					pid_state["prev_error"] = error
-					
-					# PID output (clean - no multipliers!)
-					adjustment = p_term + i_term + d_term
-					
-					debug_print(f"[DEBUG] TRAINER: PID adjustment={adjustment:.4f} | P={p_term:.4f}, I={i_term:.4f} (Σ={pid_state['integral_error']:.3f}), D={d_term:.4f} | error={error:.3f}")
-					
-					perfect_threshold += adjustment
-					
-					# Clamp threshold with adaptive bounds (volatility-scaled)
-					# Adaptive bounds adjust to market conditions while respecting configured limits
-					# Effective bounds are the stricter of volatility-based or user-configured values
-					effective_min = max(min_threshold, adaptive_min_threshold)
-					effective_max = min(max_threshold, adaptive_max_threshold)
-					# Safeguard: ensure max >= min (can occur in very low volatility)
-					# Give PID room to work by using average of configured min/max thresholds
-					if effective_max < (min_threshold + max_threshold) / 2:
-						effective_max = (min_threshold + max_threshold) / 2
-						debug_print(f"[DEBUG] TRAINER: Adjusted effective_max from {min(max_threshold, adaptive_max_threshold):.2f} to {effective_max:.2f} (low volatility safeguard)")
-					perfect_threshold = max(effective_min, min(effective_max, perfect_threshold))
+					# Pattern library size
+					pattern_count = len(_mem["memory_list"])
 					
 					# Status output
-					pid_state = get_pid_state(tf_choice)
 					bounce_accuracy = bounce_accuracy_dict.get(tf_choice, 0.0)
 					signal_accuracy = signal_accuracy_dict.get(tf_choice, 0.0)
-					debug_print(f"[DEBUG] TRAINER: threshold={perfect_threshold:.4f} | matches={match_count}/{target_matches} (target={target_percentage*100:.2f}%) | PID_Σ={pid_state['integral_error']:.3f} | match_acc={current_accuracy:.1f}% | limit_acc={bounce_accuracy:.1f}% | sig_acc={signal_accuracy:.1f}% | patterns={pattern_count:,}")
+					debug_print(f"[DEBUG] TRAINER: threshold={perfect_threshold:.2f}% (volatility-adaptive: {avg_volatility:.1f}%, bounds=[{min_threshold}, {max_threshold}]) | match_acc={current_accuracy:.1f}% | limit_acc={bounce_accuracy:.1f}% | sig_acc={signal_accuracy:.1f}% | patterns={pattern_count:,}")
 					
 					# Buffer threshold in memory instead of writing to disk
 					buffer_threshold(tf_choice, perfect_threshold)
@@ -1563,12 +1485,14 @@ while True:
 						index = 0
 						current_pattern_length = number_of_candles[number_of_candles_index]
 						current_pattern = []
+						# First, collect absolute prices from price_list2
+						temp_absolute_prices = []
 						# Check if price_list2 has enough elements
 						if len(price_list2) >= current_pattern_length:
 							index = (len(price_list2))-current_pattern_length
 							while True:
-								current_pattern.append(price_list2[index])
-								if len(current_pattern)>=number_of_candles[number_of_candles_index]:
+								temp_absolute_prices.append(price_list2[index])
+								if len(temp_absolute_prices)>=number_of_candles[number_of_candles_index]:
 									break
 								else:
 									index += 1
@@ -1576,8 +1500,26 @@ while True:
 										break
 									else:
 										continue
+						
+						# Convert absolute prices to percentage changes for scale-invariant matching
+						# N prices → (N-1) percentage changes
+						for i in range(1, len(temp_absolute_prices)):
+							if temp_absolute_prices[i-1] != 0:
+								pct_change = ((temp_absolute_prices[i] - temp_absolute_prices[i-1]) / temp_absolute_prices[i-1]) * 100
+							else:
+								pct_change = 0.0
+							current_pattern.append(pct_change)
+						
+						debug_print(f"[DEBUG] TRAINER: Built current_pattern with {len(current_pattern)} percentage changes from {len(temp_absolute_prices)} prices")
+						
+						# Save the actual last price for prediction calculations (current_pattern now contains % changes)
+						if len(temp_absolute_prices) > 0:
+							last_actual_price = temp_absolute_prices[-1]
+						else:
+							last_actual_price = 0.0
 					except:
 						PrintException()
+						last_actual_price = 0.0  # Fallback if pattern building fails
 					# TROUBLESHOOTING TOGGLE: if 1==1 keeps this always enabled in production.
 					# This block uses memory-based neural predictions (final_moves from pattern matching).
 					# The 'else' branch is a fallback for when memory system has no trained data -
@@ -1589,10 +1531,11 @@ while True:
 								c_diff = final_moves/100
 								high_diff = high_final_moves
 								low_diff = low_final_moves
-								prediction_prices = [current_pattern[len(current_pattern)-1]]
-								high_prediction_prices = [current_pattern[len(current_pattern)-1]]
-								low_prediction_prices = [current_pattern[len(current_pattern)-1]]
-								start_price = current_pattern[len(current_pattern)-1]
+								# Use last_actual_price instead of current_pattern (which now contains % changes)
+								start_price = last_actual_price
+								prediction_prices = [start_price]
+								high_prediction_prices = [start_price]
+								low_prediction_prices = [start_price]
 								new_price = start_price+(start_price*c_diff)
 								high_new_price = start_price+(start_price*high_diff)
 								low_new_price = start_price+(start_price*low_diff)
@@ -1600,10 +1543,7 @@ while True:
 								high_prediction_prices = [start_price,high_new_price]
 								low_prediction_prices = [start_price,low_new_price]
 							except:
-								if len(current_pattern) > 0:
-									start_price = current_pattern[len(current_pattern)-1]
-								else:
-									start_price = 0.0
+								start_price = last_actual_price if last_actual_price > 0 else 0.0
 								new_price = start_price
 								prediction_prices = [start_price,start_price]
 								high_prediction_prices = [start_price,start_price]
@@ -1663,46 +1603,56 @@ while True:
 								high_new_y = [start_price,high_new_price]
 								low_new_y = [start_price,low_new_price]
 							except NameError:
-								# Variables not defined, use pattern fallback
-								if len(current_pattern) > 0:
-									new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
-								else:
-									new_y = [0.0, 0.0]
+								# Variables not defined, use last_actual_price fallback
+								fallback_price = last_actual_price if last_actual_price > 0 else 0.0
+								new_y = [fallback_price, fallback_price]
 								if len(high_current_pattern) > 0:
-									high_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, high_current_pattern[len(high_current_pattern)-1]]
+									high_new_y = [fallback_price, high_current_pattern[len(high_current_pattern)-1]]
 								else:
 									high_new_y = [0.0, 0.0]
 								if len(low_current_pattern) > 0:
-									low_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, low_current_pattern[len(low_current_pattern)-1]]
+									low_new_y = [fallback_price, low_current_pattern[len(low_current_pattern)-1]]
 								else:
 									low_new_y = [0.0, 0.0]
 						except:
 							PrintException()
-							if len(current_pattern) > 0:
-								new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
-							else:
-								new_y = [0.0, 0.0]
+							fallback_price = last_actual_price if last_actual_price > 0 else 0.0
+							new_y = [fallback_price, fallback_price]
 							if len(high_current_pattern) > 0:
-								high_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, high_current_pattern[len(high_current_pattern)-1]]
+								high_new_y = [fallback_price, high_current_pattern[len(high_current_pattern)-1]]
 							else:
 								high_new_y = [0.0, 0.0]
 							if len(low_current_pattern) > 0:
-								low_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, low_current_pattern[len(low_current_pattern)-1]]
+								low_new_y = [fallback_price, low_current_pattern[len(low_current_pattern)-1]]
 							else:
 								low_new_y = [0.0, 0.0]
 					else:
+						# Fallback branch: Build pattern as percentage changes even when memory system is empty
 						current_pattern_length = 3
 						current_pattern = []
+						temp_fallback_prices = []
 						# Check if price_list2 has enough elements
 						if len(price_list2) >= current_pattern_length:
 							index = (len(price_list2))-current_pattern_length
 							while True:
-								current_pattern.append(price_list2[index])
+								temp_fallback_prices.append(price_list2[index])
 								index += 1
+								if index >= len(temp_fallback_prices) + (len(price_list2) - current_pattern_length):
+									break
 								if index >= len(price_list2):
 									break
 								else:
 									continue
+						# Convert to percentage changes
+						fallback_last_price = 0.0
+						for i in range(1, len(temp_fallback_prices)):
+							if temp_fallback_prices[i-1] != 0:
+								pct_change = ((temp_fallback_prices[i] - temp_fallback_prices[i-1]) / temp_fallback_prices[i-1]) * 100
+							else:
+								pct_change = 0.0
+							current_pattern.append(pct_change)
+							if i == len(temp_fallback_prices) - 1:
+								fallback_last_price = temp_fallback_prices[i]  # Save last absolute price
 						high_current_pattern_length = 3
 						high_current_pattern = []
 						# Check if high_price_list2 has enough elements
@@ -1727,9 +1677,9 @@ while True:
 									break
 								else:
 									continue
-						# Use last element if pattern exists, otherwise use a default
-						if len(current_pattern) > 0:
-							new_y = [current_pattern[len(current_pattern)-1],current_pattern[len(current_pattern)-1]]
+						# Use absolute price for new_y (needed for metrics calculations)
+						if fallback_last_price > 0:
+							new_y = [fallback_last_price, fallback_last_price]
 						else:
 							new_y = [0.0, 0.0]
 						number_of_candles_index += 1
@@ -1863,12 +1813,6 @@ while True:
 									pass
 							else:
 								pass
-							# Calculate and display bounce accuracy if we have data
-							if len(upordown4) > 0:
-								accuracy = (sum(upordown4)/len(upordown4))*100
-								
-								# Store accuracy in dict for this timeframe
-								bounce_accuracy_dict[tf_choice] = accuracy
 							
 							# Calculate and store signal accuracy if we have data
 							if len(upordown_signal) > 0:
@@ -1877,14 +1821,29 @@ while True:
 								# Store signal accuracy in dict for this timeframe
 								signal_accuracy_dict[tf_choice] = signal_accuracy
 							
-							# Print approximately every 1% of candles to reduce console I/O overhead (for bounce accuracy)
+							# Calculate and store bounce accuracy if we have data (for later printing)
 							if len(upordown4) > 0:
-								total_candles = len(price_list)
-								current_candle = len(price_list2)
-								print_interval = max(1, total_candles // 100)  # 1% intervals, minimum 1
+								accuracy = (sum(upordown4)/len(upordown4))*100
 								
-								# Print if this is a new milestone we haven't printed yet
-								if current_candle != last_printed_candle and (current_candle % print_interval == 0 or current_candle == total_candles):
+								# Store accuracy in dict for this timeframe
+								bounce_accuracy_dict[tf_choice] = accuracy
+							
+							# Print approximately every 1% of candles to reduce console I/O overhead
+							total_candles = len(price_list)
+							current_candle = len(price_list2)
+							print_interval = max(1, total_candles // 100)  # 1% intervals, minimum 1
+							
+							# Print if this is a new milestone we haven't printed yet
+							if current_candle != last_printed_candle and (current_candle % print_interval == 0 or current_candle == total_candles):
+								# Always print basic status information (available from start)
+								threshold_formatted = format(perfect_threshold, '.1f')
+								volatility_formatted = format(avg_volatility, '.2f')
+								acceptance_formatted = format(api_acceptance_rate, '.1f').rstrip('0').rstrip('.')
+								print(f'Total Candles: {total_candles:,} ({acceptance_formatted}% acceptance)')
+								print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold, {volatility_formatted}% volatility)')
+								
+								# Print accuracy metrics only when data is available
+								if len(upordown4) > 0:
 									# Calculate adaptive threshold from statistical standard error
 									# Formula: SE = sqrt(p×(1-p)/n) where p=accuracy proportion, n=sample count
 									# Threshold = 2×SE (95% confidence interval) to filter statistical noise
@@ -1911,37 +1870,36 @@ while True:
 									formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 									limit_test_count = len(upordown4)
 									limit_test_count_formatted = f'{limit_test_count:,}'
-									threshold_formatted = format(perfect_threshold, '.1f')
-									volatility_formatted = format(avg_volatility, '.2f')
-									acceptance_formatted = format(api_acceptance_rate, '.1f').rstrip('0').rstrip('.')
-									print(f'Total Candles: {total_candles:,} ({acceptance_formatted}% acceptance)')
-									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold, {volatility_formatted}% volatility)')
 									print(f'Limit-Breach Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} predictions)')
 									
-									# Print signal accuracy if we have data
-									if len(upordown_signal) > 0:
-										sig_accuracy = (sum(upordown_signal)/len(upordown_signal))*100
-										sig_formatted = format(sig_accuracy, '.2f').rstrip('0').rstrip('.')
-										sig_count = len(upordown_signal)
-										sig_count_formatted = f'{sig_count:,}'
-										
-										# Calculate trend arrow for signal accuracy (same logic as bounce accuracy)
-										if last_printed_signal_accuracy is None:
-											sig_trend_arrow = "[~]"  # First print, starting point
-										elif sig_accuracy > last_printed_signal_accuracy + adaptive_threshold:
-											sig_trend_arrow = "[+]"
-										elif sig_accuracy < last_printed_signal_accuracy - adaptive_threshold:
-											sig_trend_arrow = "[-]"
-										else:
-											sig_trend_arrow = "[=]"  # No significant change
-										
-										print(f'Signal Accuracy: {sig_trend_arrow} {sig_formatted}% ({sig_count_formatted} signals triggered)')
-										
-										# Update last printed signal accuracy for next comparison
-										last_printed_signal_accuracy = sig_accuracy
-
 									# Update last printed accuracy for next comparison
 									last_printed_accuracy = accuracy
+								
+								# Print signal accuracy if we have data
+								if len(upordown_signal) > 0:
+									sig_accuracy = (sum(upordown_signal)/len(upordown_signal))*100
+									sig_formatted = format(sig_accuracy, '.2f').rstrip('0').rstrip('.')
+									sig_count = len(upordown_signal)
+									sig_count_formatted = f'{sig_count:,}'
+									
+									# Calculate trend arrow for signal accuracy (same logic as bounce accuracy)
+									# Use adaptive_threshold if available from bounce accuracy, otherwise calculate
+									if 'adaptive_threshold' not in locals():
+										adaptive_threshold = 0.5  # Default
+									
+									if last_printed_signal_accuracy is None:
+										sig_trend_arrow = "[~]"  # First print, starting point
+									elif sig_accuracy > last_printed_signal_accuracy + adaptive_threshold:
+										sig_trend_arrow = "[+]"
+									elif sig_accuracy < last_printed_signal_accuracy - adaptive_threshold:
+										sig_trend_arrow = "[-]"
+									else:
+										sig_trend_arrow = "[=]"  # No significant change
+									
+									print(f'Signal Accuracy: {sig_trend_arrow} {sig_formatted}% ({sig_count_formatted} signals triggered)')
+									
+									# Update last printed signal accuracy for next comparison
+									last_printed_signal_accuracy = sig_accuracy
 						except:
 							PrintException()
 					else:
@@ -2534,17 +2492,19 @@ while True:
 														# Don't log the expected "no patterns" exception - it's normal during initial training
 														if "EXPECTED_NO_PATTERNS" not in str(e):
 															PrintException()
-														debug_print(f"[DEBUG] TRAINER: Weight update failed - creating new memory pattern")
 														
-														# Create new memory when weight update fails (not when moves is empty)
 														# This is the baseline's pattern creation approach - only on actual failure
-														# Create a copy of the pattern with this_diff appended
+														# IMPORTANT: all_current_patterns already contains percentage changes (from Step 2)
+														# and this_diff is also a percentage change, so new_pattern is already in the correct format
 														new_pattern = all_current_patterns[highlowind] + [this_diff]
-														debug_print(f"[DEBUG] TRAINER: new_pattern before mem_entry: {len(new_pattern)} candles, highlowind={highlowind}, all_current_patterns[{highlowind}]={len(all_current_patterns[highlowind])} candles")
+														debug_print(f"[DEBUG] TRAINER: Creating new pattern with {len(new_pattern)} percentage changes: {[f'{x:.4f}%' for x in new_pattern[:3]]}{'...' if len(new_pattern) > 3 else ''}")
 														
+														# Increment counter at decision point (before validation) for accurate match rate
+														new_pattern_count += 1
+														
+														# new_pattern is already percentage changes - use directly without conversion
+														# Pattern format: [pct_change1, pct_change2, ..., prediction_pct_change]
 														mem_entry = '|'.join([str(x) for x in new_pattern])+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
-														
-														# Strict pattern creation: only append valid, unique, non-empty patterns
 														# However, when memory is small (<1000 patterns), be more permissive to allow initial learning
 														skip_pattern = False
 														skip_reason = ""
@@ -2564,8 +2524,8 @@ while True:
 														if skip_pattern:
 															debug_print(f"[DEBUG] TRAINER: Skipped {skip_reason} pattern (memory size: {len(_mem['memory_list'])})")
 														else:
-															candle_count = len(mem_entry.split('{}')[0].split('|'))
-															debug_print(f"[DEBUG] TRAINER: Adding pattern with {candle_count} candles to memory (expected: {number_of_candles[number_of_candles_index]})")
+															pct_change_count = len(mem_entry.split('{}')[0].split('|'))
+															debug_print(f"[DEBUG] TRAINER: Adding pattern with {pct_change_count} percentage changes to memory (expected: {number_of_candles[number_of_candles_index]-1})")
 															_mem["memory_list"].append(mem_entry)
 															# Also append pre-split pattern for fast comparison
 															_mem["memory_patterns"].append(mem_entry.split('{}')[0].split('|'))
@@ -2576,7 +2536,7 @@ while True:
 															if tf_choice in _pattern_ages:
 																_pattern_ages[tf_choice].append(0)
 															_mem["dirty"] = True
-															debug_print(f"[DEBUG] TRAINER: Added new pattern to memory (total: {len(_mem['memory_list'])}), candles={candle_count}")
+															debug_print(f"[DEBUG] TRAINER: Added new pattern to memory (total: {len(_mem['memory_list'])}), pct_changes={pct_change_count}")
 												except:
 													PrintException()
 													pass

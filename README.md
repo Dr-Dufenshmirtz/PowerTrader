@@ -165,7 +165,9 @@ The white marker lines on the Neural Signal tiles update automatically when you 
 ### Training Settings
 Access via **Settings → Training Settings** in the Hub menu:
 - **Staleness Days**: How many days before retraining is recommended (default: 14)
-- **Auto-retrain**: Enable automatic retraining when data becomes stale (future feature)
+- **Auto-retrain**: Enable automatic retraining when data becomes stale
+- **Pattern Matching**: Configurable thresholds for pattern similarity (uses relative percentage matching)
+- **Volatility Adaptation**: Training automatically adjusts matching thresholds based on each coin's volatility (4.0x multiplier)
 
 Changes to settings files take effect immediately for the trading bot (hot-reload with caching).
 
@@ -215,12 +217,21 @@ Default themes included:
 
 Create your own theme by copying and modifying the color values in `theme_settings.json`.
 
-### Enhanced Error Handling
-The Enhanced Edition includes robust error recovery:
+### Enhanced Error Handling & Pattern Matching
+The Enhanced Edition includes robust error recovery and improved AI pattern matching:
+
+**Error Recovery:**
 - **Circuit Breaker Pattern**: Prevents cascading failures when API is down
 - **Automatic Retry Logic**: Network requests retry with exponential backoff
 - **Training File Validation**: Detects and skips corrupted training data
 - **Graceful Degradation**: System continues operating even when individual components fail
+
+**Pattern Matching Improvements:**
+- **Relative Threshold Matching**: Thresholds are now relative to pattern magnitude (percentage-based)
+- **Scale-Invariant**: Works consistently across different price levels and market conditions
+- **Volatility-Based Adaptation**: Thresholds automatically adjust using 4.0× average volatility
+- **Zero-Value Protection**: Uses 0.1% baseline for near-zero patterns (prevents division-by-zero)
+- **Simplified Algorithm**: Removed complex PID controller in favor of transparent volatility-based system
 
 ### Chart & UI Improvements
 - **Centered Window Positioning**: Window always opens within visible screen area
@@ -230,12 +241,29 @@ The Enhanced Edition includes robust error recovery:
 - **Optimized Padding**: Improved chart margins for better label visibility
 - **Flow Status Indicators**: Visual checkmarks (✓) and hourglasses (⧗) show system state between stages
 
-### Training Freshness Gates
-The system now enforces training freshness to prevent trading with outdated predictions:
+### Training Freshness & Automation
+The system enforces training freshness and provides intelligent automation:
+
+**Freshness Enforcement:**
 - Trainer writes timestamp when training starts
-- Hub and Runner check training age before allowing trades
+- Hub and Thinker check training age before allowing trades
 - Visual indicators show which coins need retraining
 - Configurable staleness threshold (default: 14 days)
+- **T-X countdown**: Shows hours remaining until training becomes stale (e.g., "BTC: TRAINED (T-72 HRS)")
+- **T+X overdue indicator**: Shows hours overdue when training is stale (e.g., "BTC: TRAINED (T+3 HRS)")
+
+**Auto-Start Thinker:**
+- After manual training completes, the Thinker automatically starts
+- Seamless workflow: click "Train All" → training finishes → Thinker starts automatically
+- Similar to how Thinker auto-starts when opening the Hub with valid training data
+
+**Smart Auto-Retrain:**
+- When auto-retrain is enabled, system checks for stale training every minute
+- **Priority Coin Protection**: Before stopping for retraining, checks if any coin has imminent trade action
+- Delays retraining if a coin is within 2% of: new entry, DCA trigger, stop loss, or take profit
+- User sees T+X countdown increment (training overdue) until all trades complete safely
+- Then automatically stops, retrains all stale coins, and restarts
+- Prevents taking the trader offline during critical moments
 
 If a coin shows "NOT TRAINED / OUTDATED", run training before starting the bot.
 

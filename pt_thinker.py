@@ -46,6 +46,13 @@ Notes on AI behavior and trading rules (informational only):
 	averaging the closest memory-pattern matches for the current pattern;
 	this per-timeframe predicted candle yields the high/low lines used by
 	the Thinker.
+
+- Pattern Matching:
+	Uses relative threshold matching (percentage of pattern magnitude) for
+	consistent behavior across different price levels and market conditions.
+	Thresholds are volatility-based (4.0× average volatility) and use a 0.1%
+	baseline for near-zero patterns. This matches the trainer's algorithm for
+	consistent prediction quality.
 """
 
 import os
@@ -1319,7 +1326,7 @@ def step_coin(sym: str):
 			del training_issues[len(tf_choices):]
 
 		# Fetch current pattern (multiple candles for pattern matching)
-		debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]} (pattern_size={PATTERN_SIZE})...")
+		debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]} (pattern_size={PATTERN_SIZE} → {PATTERN_SIZE-1} pct_changes)...")
 		kucoin_api_retry_count = 0
 		kucoin_empty_data_count = 0
 		kucoin_max_retries = 5
@@ -1350,7 +1357,7 @@ def step_coin(sym: str):
 			if len(history_list) < PATTERN_SIZE:
 				kucoin_empty_data_count += 1
 				if kucoin_empty_data_count >= kucoin_max_retries:
-					debug_print(f"[DEBUG] {sym}: KuCoin returned insufficient data after {kucoin_max_retries} attempts (need {PATTERN_SIZE} candles)")
+					debug_print(f"[DEBUG] {sym}: KuCoin returned insufficient data after {kucoin_max_retries} attempts (need {PATTERN_SIZE} candles to build pattern)")
 					# Skip this cycle rather than crashing
 					st['tf_choice_index'] = tf_choice_index
 					states[sym] = st
@@ -1359,26 +1366,35 @@ def step_coin(sym: str):
 				continue
 			
 			# Fetch last PATTERN_SIZE candles and convert to percentage changes
-			# For pattern_size=5, we need 4 prior candles (indices 1-4) to create the pattern
-			# The trainer creates patterns with (pattern_size - 1) values
+			# For pattern_size=5, we need 5 candles to create 4 percentage changes (close-to-close)
+			# The trainer creates patterns with (pattern_size - 1) percentage changes
+			# Pattern: [candle0_close, candle1_close, ...] → [pct_change1, pct_change2, ...]
 			current_pattern = []
+			temp_close_prices = []
 			try:
-				for i in range(1, PATTERN_SIZE):
+				# First, collect all close prices
+				for i in range(PATTERN_SIZE):
 					working_candle = _clean_candle_string(str(history_list[i]))
 					if len(working_candle) < 3:
 						raise ValueError(f"Candle {i} has insufficient fields: {len(working_candle)}")
-					openPrice = _safe_float_convert(working_candle[1], f"candle[{i}].open", 0.0)
 					closePrice = _safe_float_convert(working_candle[2], f"candle[{i}].close", 0.0)
-					if openPrice == 0:
-						raise ValueError(f"Zero openPrice at candle index {i}")
-					candle_pct = 100 * ((closePrice - openPrice) / openPrice)
-					current_pattern.append(candle_pct)
+					if closePrice == 0:
+						raise ValueError(f"Zero closePrice at candle index {i}")
+					temp_close_prices.append(closePrice)
+				
+				# Convert to close-to-close percentage changes (matching trainer logic)
+				for i in range(1, len(temp_close_prices)):
+					if temp_close_prices[i-1] != 0:
+						pct_change = 100 * ((temp_close_prices[i] - temp_close_prices[i-1]) / temp_close_prices[i-1])
+					else:
+						pct_change = 0.0
+					current_pattern.append(pct_change)
 				break
 			except Exception as e:
 				debug_print(f"[DEBUG] {sym}: Failed to parse candle data: {e}")
 				continue
 
-		debug_print(f"[DEBUG] {sym}: Market data fetched successfully. Current pattern (last {PATTERN_SIZE-1} candles): {[f'{v:.4f}%' for v in current_pattern]}")
+		debug_print(f"[DEBUG] {sym}: Market data fetched successfully. Current pattern ({PATTERN_SIZE-1} percentage changes): {[f'{v:.4f}%' for v in current_pattern]}")
 
 		# Load training data (cached for performance)
 		debug_print(f"[DEBUG] {sym}: Loading neural training files...")
@@ -1456,17 +1472,21 @@ def step_coin(sym: str):
 					continue
 				
 				# Calculate average difference across all candles in the pattern
+				# Relative percentage difference (threshold applies as % of pattern value)
+				# Example: memory=5%, current=6%, threshold=15% → diff = |6-5|/5 * 100 = 20% > 15% (no match)
+				# Example: memory=5%, current=5.5%, threshold=15% → diff = |5.5-5|/5 * 100 = 10% < 15% (match)
+				# This scales precision: small moves get tight absolute tolerances, large moves get proportional tolerances
 				total_diff = 0.0
 				valid_comparisons = 0
 				for i in range(pattern_length):
 					try:
 						current_val = current_pattern[i]
 						memory_val = float(memory_pattern[i])
-						average = (current_val + memory_val) / 2
-						if abs(average) < 1e-10:  # Essentially zero
-							diff = 0.0
-						else:
-							diff = abs((abs(current_val - memory_val) / average) * 100)
+						# Relative difference as percentage of pattern value
+						# Use minimum baseline of 0.05% to handle zero/tiny patterns consistently
+						# For patterns >0.05%: normal relative comparison; for patterns <0.05%: 0.05% is the noise floor
+						baseline = max(abs(memory_val), 0.05)
+						diff = (abs(current_val - memory_val) / baseline) * 100
 						total_diff += diff
 						valid_comparisons += 1
 					except Exception:
@@ -1532,7 +1552,7 @@ def step_coin(sym: str):
 				if mem_ind >= len(memory_list):
 					# Calculate match quality: 100% at threshold, >100% for better matches, logarithmic decay to 0%
 					# Quality formula: 200 / (1 + (closest_diff / perfect_threshold))
-					# This gives 200% at 0 diff (perfect), 100% at threshold, 50% at 3x threshold, 20% at 9x threshold
+					# With relative thresholds: 200% at 0% diff (perfect), 100% at threshold, 50% at 3x threshold, 20% at 9x threshold
 					if closest_diff < float('inf'):
 						match_quality = 200 / (1 + (closest_diff / perfect_threshold))
 					else:
@@ -1540,7 +1560,7 @@ def step_coin(sym: str):
 					match_qualities[tf_choice_index] = match_quality
 					
 					if any_perfect == 'no':
-						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No patterns matched threshold {perfect_threshold:.2f}%. Current pattern: {[f'{v:.2f}%' for v in current_pattern]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% (Quality: {match_quality:.0f}%)")
+						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
 						# ALWAYS generate predictions from closest patterns (even if they don't meet threshold)
 						if moves and high_moves and low_moves:
 							final_moves = sum(moves) / len(moves)
