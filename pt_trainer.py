@@ -2215,9 +2215,9 @@ while True:
 															limit_acc = bounce_accuracy_dict[tf]
 															sig_acc = signal_accuracy_dict.get(tf, 0.0) if signal_accuracy_dict else 0.0
 															if signal_accuracy_dict and tf in signal_accuracy_dict:
-																print(f'  {tf:8} | Limit: {limit_acc:5.2f}% | Signal: {sig_acc:5.2f}%')
+																print(f'  {tf:8}   Limit-Breach: {limit_acc:5.2f}%   Signal: {sig_acc:5.2f}%')
 															else:
-																print(f'  {tf:8} | Limit: {limit_acc:5.2f}%')
+																print(f'  {tf:8}   Limit-Breach: {limit_acc:5.2f}%')
 													
 													# Check for suspicious accuracy (99-100% often indicates incomplete training)
 													suspicious_accuracy = False

@@ -85,7 +85,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011408"
+VERSION = "26.011419"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -5173,7 +5173,7 @@ class ApolloHub(tk.Tk):
                         # Write success message to trader log
                         try:
                             if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
-                                msg = f"✓ Account info loaded: ${total_account_value:.2f} (${buying_power:.2f} buying power, ${holdings_sell_value:.2f} in holdings)\n\n"
+                                msg = f"Account connected: ${total_account_value:.2f} (${buying_power:.2f} buying power, ${holdings_sell_value:.2f} in holdings)\n\n"
                                 self.trader_text.insert("end", msg)
                         except Exception:
                             pass

@@ -17,8 +17,8 @@ Original Author: Stephen Hughes (garagesteve1155)
 Key behavioral notes (informational only):
 
 - Start trade signal:
-    The Thinker sends a start signal when the ask drops below at least 3
-    predicted lows; the trader executes and tracks DCA and profit logic.
+    The Thinker sends a start signal when neural levels meet configured thresholds
+    (long_signal_min, default 4); the trader executes and tracks DCA and profit logic.
 
 - DCA rules:
     DCA uses the AI's per-level price lines or a hardcoded drawdown % for
@@ -675,8 +675,8 @@ class CryptoAPITrading:
         Reads long_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
 
         Used for:
-        - Start gate: start trades at level 3+
-        - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
+        - Start gate: start trades when signal >= entry_signals.long_signal_min (default 4)
+        - DCA assist: stages offset from entry (e.g., if entry=4: stage 0 at L4, stage 1 at L5)
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, os.path.join(main_dir, sym))
@@ -695,8 +695,8 @@ class CryptoAPITrading:
         Reads short_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
 
         Used for:
-        - Start gate: start trades at level 3+
-        - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
+        - Start gate: start trades when signal <= entry_signals.short_signal_max (default 0)
+        - DCA assist: levels map to trader DCA stages for short positions
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, os.path.join(main_dir, sym))
@@ -805,8 +805,8 @@ class CryptoAPITrading:
         
         For each held coin, determines which DCA stages have been triggered in the current
         trade by counting buy orders since the last sell. The first buy after a sell (or
-        the first ever buy) is considered the trade entry at neural level 3. Each additional
-        buy represents one triggered DCA stage (stage 0, 1, 2, ...).
+        the first ever buy) is considered the trade entry (neural signal >= long_signal_min,
+        default 4). Each additional buy represents one triggered DCA stage (stage 0, 1, 2, ...).
         
         State preservation: If order history is temporarily unavailable but we're still
         holding the position, preserves existing DCA state rather than resetting to empty.
@@ -1806,7 +1806,7 @@ class CryptoAPITrading:
             self._last_heartbeat = current_time
             num_positions = len([h for h in holdings_list if h.get("asset_code") != "USDC"])
             cb_status = "PAUSED" if _circuit_breaker["is_open"] else "ACTIVE"
-            status_msg = f"Status: {cb_status} | Positions: {num_positions} | Buying Power: ${buying_power:,.2f} | Total Value: ${total_account_value:,.2f}"
+            status_msg = f"{cb_status}   Positions: {num_positions}   Buying Power: ${buying_power:,.2f}   Total Value: ${total_account_value:,.2f}"
             # Only print if status changed (prevents spam of identical messages)
             if status_msg != self._last_status_message:
                 print(status_msg, flush=True)
@@ -1865,20 +1865,22 @@ class CryptoAPITrading:
             triggered_levels = triggered_levels_count  # Number of DCA levels triggered
 
             # Determine the next DCA trigger for this coin (hardcoded % and optional neural level)
-            next_stage = triggered_levels_count  # stage 0 == first DCA after entry (trade starts at neural level 3)
+            next_stage = triggered_levels_count  # stage 0 == first DCA after entry
 
             # Hardcoded % for this stage (repeat -50% after we reach it)
             hard_next = self.dca_levels[next_stage] if next_stage < len(self.dca_levels) else self.dca_levels[-1]
 
             # Neural DCA only applies to first 4 DCA stages:
-            # stage 0-> neural 4, stage 1->5, stage 2->6, stage 3->7
+            # DCA neural levels offset from entry level (e.g., if entry=4: stage 0->N4, stage 1->N5, etc.)
             neural_distance_info = ""
             if next_stage < 4:
-                neural_next = next_stage + 4
+                trading_cfg = _load_trading_config()
+                long_min = max(1, min(7, int(trading_cfg.get("entry_signals", {}).get("long_signal_min", 4))))
+                neural_next = long_min + next_stage
                 # Calculate distance to next neural level
                 blue_lines = self._read_long_price_levels(symbol)
                 if blue_lines and neural_next <= len(blue_lines):
-                    target_price = blue_lines[neural_next - 1]  # N4 is index 3
+                    target_price = blue_lines[neural_next - 1]  # neural_next-1 for 0-based indexing
                     distance = current_buy_price - target_price
                     distance_pct = (distance / current_buy_price) * 100 if current_buy_price > 0 else 0
                     neural_distance_info = f" ({self._fmt_price(target_price)}, ${distance:.2f} / {distance_pct:.2f}% away)"
@@ -1900,7 +1902,9 @@ class CryptoAPITrading:
 
                 # Neural DCA: read actual price levels and use whichever is higher (triggers first as price drops)
                 if next_stage < 4:
-                    neural_level_needed_disp = next_stage + 4  # stage 0->N4, 1->N5, 2->N6, 3->N7
+                    trading_cfg = _load_trading_config()
+                    long_min = max(1, min(7, int(trading_cfg.get("entry_signals", {}).get("long_signal_min", 4))))
+                    neural_level_needed_disp = long_min + next_stage  # Offset from entry level
                     neural_levels = self._read_long_price_levels(symbol)  # highest->lowest == N1..N7
                     
                     neural_line_price = 0.0
@@ -2175,12 +2179,12 @@ class CryptoAPITrading:
                 state["was_above"] = above_now
 
             # DCA (NEURAL or hardcoded %, whichever hits first for the current stage)
-            # Trade starts at neural level 3 => trader is at stage 0.
-            # Neural-driven DCA stages (max 4):
-            #   stage 0 => neural 4 OR -2.5%
-            #   stage 1 => neural 5 OR -5.0%
-            #   stage 2 => neural 6 OR -10.0%
-            #   stage 3 => neural 7 OR -20.0%
+            # Trade entry requires neural signal >= long_signal_min (default 4), then DCA stages:
+            # Neural-driven DCA stages (max 4) offset from entry level:
+            #   stage 0 => neural (entry+0) OR -2.5%  [e.g., N4 if entry=4]
+            #   stage 1 => neural (entry+1) OR -5.0%  [e.g., N5 if entry=4]
+            #   stage 2 => neural (entry+2) OR -10.0% [e.g., N6 if entry=4]
+            #   stage 3 => neural (entry+3) OR -20.0% [e.g., N7 if entry=4]
             # After that: hardcoded only (-30, -40, -50, then repeat -50 forever).
             current_stage = len(self.dca_levels_triggered.get(symbol, []))
 
@@ -2193,7 +2197,9 @@ class CryptoAPITrading:
             neural_level_now = None
             neural_hit = False
             if current_stage < 4:
-                neural_level_needed = current_stage + 4
+                trading_cfg = _load_trading_config()
+                long_min = max(1, min(7, int(trading_cfg.get("entry_signals", {}).get("long_signal_min", 4))))
+                neural_level_needed = long_min + current_stage
                 neural_level_now = self._read_long_dca_signal(symbol)
 
                 # Keep it sane: don't DCA from neural if we're not even below cost basis.

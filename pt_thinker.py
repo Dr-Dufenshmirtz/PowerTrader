@@ -2305,7 +2305,7 @@ try:
 						
 						# Dynamic spacing: 2 spaces for 3-letter tickers, 1 for 4-letter, 0 for 5-letter
 						spacing = " " * max(0, 4 - len(_sym))
-						print(f"[{_sym}]{spacing}{summary['price_str']:>8s}  {summary['signal']:6s}  Next Buy: {long_str}  Next Exit: {short_str}  PM: {summary['pm_display']}", flush=True)
+						print(f"[{_sym}]{spacing}{summary['price_str']:>8s}  {summary['signal']:6s}  Next Buy: {long_str}  Resistance: {short_str}  PM: {summary['pm_display']}", flush=True)
 		
 		# Priority detection for auto-switch feature
 		# Find the coin closest to a trigger (buy or exit), with tiebreakers
