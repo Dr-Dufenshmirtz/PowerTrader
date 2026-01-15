@@ -16,18 +16,23 @@ Original Author: Stephen Hughes (garagesteve1155)
 
 Key behavioral notes (informational only):
 
-- Start trade signal:
-    The Thinker sends a start signal when neural levels meet configured thresholds
-    (long_signal_min, default 4); the trader executes and tracks DCA and profit logic.
+- Entry signal (long positions):
+    Start trades when long_signal >= entry_signals.long_signal_min (default 4)
+    AND short_signal <= entry_signals.short_signal_max (default 0).
+
+- Exit signal (MTF confirmation):
+    Trailing profit margin triggers sell when price crosses below trailing line,
+    BUT requires multi-timeframe confirmation: short_signal >= exit_signals.short_signal_min
+    (default 4) AND long_signal <= exit_signals.long_signal_max (default 0).
+    Stop-loss (-40%) ALWAYS executes, bypassing MTF check for safety.
 
 - DCA rules:
     DCA uses the AI's per-level price lines or a hardcoded drawdown % for
     the current DCA level — whichever triggers first. Max 2 DCA buys in a
     rolling 24-hour window to limit rapid overexposure.
 
-- Sell rules:
-    Uses a trailing profit margin: 5% if no DCA occurred on the trade,
-    or 2.5% if any DCA occurred. Trailing gap is 0.5%.
+- Trailing profit margin:
+    Target: 5% if no DCA occurred, 3% if DCA triggered. Gap: 0.5%.
 """
 
 import os
@@ -362,12 +367,16 @@ _trading_settings_cache = {
 		"profit_margin": {
 			"trailing_gap_pct": 0.5,
 			"target_no_dca_pct": 5.0,
-			"target_with_dca_pct": 2.5,
+			"target_with_dca_pct": 3.0,
 			"stop_loss_pct": -40.0
 		},
 		"entry_signals": {
 			"long_signal_min": 4,
 			"short_signal_max": 0
+		},
+		"exit_signals": {
+			"short_signal_min": 4,
+			"long_signal_max": 0
 		},
 		"position_sizing": {
 			"initial_allocation_pct": 0.01,
@@ -447,7 +456,7 @@ class CryptoAPITrading:
         self.trailing_pm = {}
         self.trailing_gap_pct = trading_cfg.get("profit_margin", {}).get("trailing_gap_pct", 0.5)
         self.pm_start_pct_no_dca = trading_cfg.get("profit_margin", {}).get("target_no_dca_pct", 5.0)
-        self.pm_start_pct_with_dca = trading_cfg.get("profit_margin", {}).get("target_with_dca_pct", 2.5)
+        self.pm_start_pct_with_dca = trading_cfg.get("profit_margin", {}).get("target_with_dca_pct", 3.0)
         self.stop_loss_pct = trading_cfg.get("profit_margin", {}).get("stop_loss_pct", -40.0)
 
         # Calculate initial cost basis for all holdings by examining recent buy order execution prices
@@ -2053,8 +2062,8 @@ class CryptoAPITrading:
                     trades_made = True
                     self.trailing_pm.pop(symbol, None)  # clear trailing state
                     self._reset_dca_window_for_trade(symbol, sold=True)
-                    print(f"[{symbol}] Stop-loss sell successful: {quantity:.8f} {symbol}{sim_prefix()}")
-                    debug_print(f"[DEBUG] TRADER: Stop-loss sell successful for {symbol}")
+                    print(f"🛑 [{symbol}] STOP-LOSS EXECUTED: {quantity:.8f} {symbol} sold | Loss: {gain_loss_percentage_sell:+.2f}%{sim_prefix()}")
+                    debug_print(f"[DEBUG] TRADER: Stop-loss sell successful for {symbol}, quantity={quantity}, loss={gain_loss_percentage_sell:.2f}%")
                     trading_cfg = _load_trading_config()
                     post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 30)
                     time.sleep(post_delay)
@@ -2138,6 +2147,67 @@ class CryptoAPITrading:
                             state["active"] = False
                             state["was_above"] = False
                         else:
+                            # MTF Exit Confirmation: Check if we have bearish confirmation to exit
+                            # Exception: Stop-loss ALWAYS executes (bypasses MTF check for safety)
+                            trading_cfg = _load_trading_config()
+                            stop_loss_threshold = float(trading_cfg.get("profit_margin", {}).get("stop_loss_pct", -40.0))
+                            is_stop_loss = (expected_pnl_pct <= stop_loss_threshold)
+                            
+                            if is_stop_loss:
+                                # Stop-loss triggered - bypass MTF check and sell immediately
+                                print(f"🛑 [{symbol}] STOP-LOSS triggered at {expected_pnl_pct:+.2f}% (threshold: {stop_loss_threshold}%)")
+                                print(f"[{symbol}] Bypassing MTF check for emergency exit{sim_prefix()}")
+                                debug_print(f"[DEBUG] TRADER: Stop-loss bypass for {symbol}, executing sell without MTF check")
+                            else:
+                                # Normal profit exit - require MTF confirmation
+                                exit_cfg = trading_cfg.get("exit_signals", {})
+                                short_signal_min = int(exit_cfg.get("short_signal_min", 4))
+                                long_signal_max = int(exit_cfg.get("long_signal_max", 0))
+                                
+                                short_signal = self._read_short_dca_signal(symbol)
+                                long_signal = self._read_long_dca_signal(symbol)
+                                
+                                debug_print(
+                                    f"[DEBUG] TRADER: MTF exit check for {symbol}: "
+                                    f"short_signal={short_signal} (need >={short_signal_min}), "
+                                    f"long_signal={long_signal} (need <={long_signal_max})"
+                                )
+                                
+                                # Both conditions must be true to allow sell
+                                mtf_confirmed = (short_signal >= short_signal_min) and (long_signal <= long_signal_max)
+                                
+                                if not mtf_confirmed:
+                                    # MTF check failed - block sell
+                                    if short_signal < short_signal_min:
+                                        print(
+                                            f"⏸️ [{symbol}] MTF BLOCK: Not enough bearish signals "
+                                            f"({short_signal}/7 bearish, need >={short_signal_min})"
+                                        )
+                                        debug_print(
+                                            f"[DEBUG] TRADER: MTF blocked sell for {symbol} - "
+                                            f"insufficient bearish confirmation"
+                                        )
+                                    if long_signal > long_signal_max:
+                                        print(
+                                            f"⏸️ [{symbol}] MTF BLOCK: Still too bullish "
+                                            f"({long_signal}/7 bullish, need <={long_signal_max})"
+                                        )
+                                        debug_print(
+                                            f"[DEBUG] TRADER: MTF blocked sell for {symbol} - "
+                                            f"excessive bullish signals"
+                                        )
+                                    # Don't reset state - allow trailing line to continue tracking
+                                    # Price might come back up or MTF might confirm on next cycle
+                                    continue
+                                else:
+                                    # MTF confirmed - proceed with sell
+                                    print(
+                                        f"✅ [{symbol}] MTF CONFIRMED: "
+                                        f"{short_signal}/7 bearish, {long_signal}/7 bullish"
+                                    )
+                                    debug_print(f"[DEBUG] TRADER: MTF exit confirmation passed for {symbol}")
+                            
+                            # MTF check passed or stop-loss - execute sell
                             print(f"[{symbol}] Trailing PM triggered: Price ${current_sell_price:.8f} fell below line ${state['line']:.8f}")
                             print(f"[{symbol}] Expected P&L: {expected_pnl_pct:+.2f}%{sim_prefix()}")
                             debug_print(f"[DEBUG] TRADER: Executing trailing PM sell for {symbol}, expected_pnl={expected_pnl_pct:.2f}%")
@@ -2161,8 +2231,8 @@ class CryptoAPITrading:
                                 # Trade ended -> reset rolling 24h DCA window for this coin
                                 self._reset_dca_window_for_trade(symbol, sold=True)
 
-                                print(f"[{symbol}] Sell order successful: {quantity:.8f} {symbol}{sim_prefix()}")
-                                debug_print(f"[DEBUG] TRADER: Trailing PM sell successful for {symbol}")
+                                print(f"✅ [{symbol}] POSITION CLOSED: {quantity:.8f} {symbol} sold | P&L: {expected_pnl_pct:+.2f}%{sim_prefix()}")
+                                debug_print(f"[DEBUG] TRADER: Trailing PM sell successful for {symbol}, quantity={quantity}, pnl={expected_pnl_pct:.2f}%")
                                 trading_cfg = _load_trading_config()
                                 post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 30)
                                 time.sleep(post_delay)
@@ -2250,7 +2320,9 @@ class CryptoAPITrading:
 
                         # Mark this stage as triggered in current cycle
                         self._dca_triggered_this_cycle.setdefault(symbol, set()).add(current_stage)
-                        debug_print(f"[DEBUG] TRADER: Marked DCA stage {current_stage + 1} as triggered for {symbol} this cycle")
+                        
+                        print(f"📊 [{symbol}] DCA BUY COMPLETED: Stage {current_stage + 1} | ${dca_amount:.2f} added to position{sim_prefix()}")
+                        debug_print(f"[DEBUG] TRADER: DCA stage {current_stage + 1} completed for {symbol}, amount=${dca_amount:.2f}")
 
                         # Only record a DCA buy timestamp on success (so skips never advance anything)
                         self._note_dca_buy(symbol)
@@ -2362,9 +2434,36 @@ class CryptoAPITrading:
             long_min = max(1, min(7, int(trading_cfg.get("entry_signals", {}).get("long_signal_min", 4))))
             short_max = max(0, min(7, int(trading_cfg.get("entry_signals", {}).get("short_signal_max", 0))))
             
-            if not (buy_count >= long_min and sell_count <= short_max):
+            debug_print(
+                f"[DEBUG] TRADER: Entry gate check for {base_symbol}: "
+                f"long_signal={buy_count} (need >={long_min}), "
+                f"short_signal={sell_count} (need <={short_max})"
+            )
+            
+            # Both conditions must be true to allow entry
+            entry_allowed = (buy_count >= long_min) and (sell_count <= short_max)
+            
+            if not entry_allowed:
+                # Entry gate failed - block buy
+                if buy_count < long_min:
+                    debug_print(
+                        f"[DEBUG] TRADER: Entry blocked for {base_symbol} - "
+                        f"insufficient bullish signals ({buy_count} < {long_min})"
+                    )
+                if sell_count > short_max:
+                    debug_print(
+                        f"[DEBUG] TRADER: Entry blocked for {base_symbol} - "
+                        f"excessive bearish signals ({sell_count} > {short_max})"
+                    )
                 start_index += 1
                 continue
+            
+            # Entry gate passed - proceed with buy
+            print(
+                f"✅ [{base_symbol}] ENTRY GATE PASSED: "
+                f"{buy_count}/7 bullish, {sell_count}/7 bearish"
+            )
+            debug_print(f"[DEBUG] TRADER: Entry confirmation passed for {base_symbol}, placing initial buy order")
 
             response = self.place_buy_order(
                 str(uuid.uuid4()),
@@ -2385,7 +2484,8 @@ class CryptoAPITrading:
                 # Reset trailing PM state for this coin (fresh trade, fresh trailing logic)
                 self.trailing_pm.pop(base_symbol, None)
 
-                print(f"[{base_symbol}] Entry signal triggered: Long={buy_count} Short={sell_count} | Allocating ${allocation_in_usd:.2f}{sim_prefix()}")
+                print(f"💰 [{base_symbol}] INITIAL POSITION OPENED: ${allocation_in_usd:.2f} allocated{sim_prefix()}")
+                debug_print(f"[DEBUG] TRADER: Initial buy order completed for {base_symbol}, amount=${allocation_in_usd:.2f}")
                 trading_cfg = _load_trading_config()
                 post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 30)
                 time.sleep(post_delay)

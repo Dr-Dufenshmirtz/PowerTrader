@@ -1553,6 +1553,30 @@ def step_coin(sym: str):
 					mem_ind += 1
 					continue
 
+				# Maximum cutoff: Only use patterns within 5x threshold to prevent wildly dissimilar patterns
+				# from polluting predictions. This ensures prediction quality even with no perfect matches.
+				# Example: threshold=15%, cutoff=75% - patterns beyond 75% similarity are excluded
+				max_cutoff = perfect_threshold * 5.0
+				if diff_avg > max_cutoff:
+					# Pattern too dissimilar - skip it
+					patterns_skipped += 1
+					mem_ind += 1
+					continue
+
+				# Directional validation: Prevent opposite-trending patterns from matching
+				# Example: bullish [+2%, +3%, +1%] should not match bearish [-2%, -3%, -1%]
+				# Calculate net direction (sum of all percentage changes in pattern)
+				current_direction = sum(current_pattern)
+				memory_direction = sum(float(memory_pattern[i]) for i in range(pattern_length))
+				# Require same directional sign (both positive or both negative)
+				# Allow near-zero patterns (sideways) to match either direction
+				if abs(current_direction) > 0.5 and abs(memory_direction) > 0.5:
+					if (current_direction > 0) != (memory_direction > 0):
+						# Opposite directions - skip this pattern
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+
 				unweighted.append(float(memory_pattern[len(memory_pattern) - 1]))
 				move_weights.append(float(weight_list[mem_ind]))
 				high_unweighted.append(high_diff)
@@ -2121,6 +2145,9 @@ def step_coin(sym: str):
 
 				_atomic_write_text('futures_short_profit_margin.txt', str(abs(pm)))
 				_atomic_write_text('short_dca_signal.txt', str(shorts))
+				
+				# Write inactive count for visual indication in hub
+				_atomic_write_text('inactive_count.txt', str(inactives))
 
 			except Exception:
 				PrintException()
@@ -2305,7 +2332,7 @@ try:
 						
 						# Dynamic spacing: 2 spaces for 3-letter tickers, 1 for 4-letter, 0 for 5-letter
 						spacing = " " * max(0, 4 - len(_sym))
-						print(f"[{_sym}]{spacing}{summary['price_str']:>8s}  {summary['signal']:6s}  Next Buy: {long_str}  Resistance: {short_str}  PM: {summary['pm_display']}", flush=True)
+						print(f"[{_sym}]{spacing}{summary['price_str']:>8s}  {summary['signal']:6s}  Next Buy: {long_str}  Next Sell: {short_str}  PM: {summary['pm_display']}", flush=True)
 		
 		# Priority detection for auto-switch feature
 		# Find the coin closest to a trigger (buy or exit), with tiebreakers

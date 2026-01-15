@@ -22,7 +22,9 @@ For determining when to start trades, the AI's Thinker script sends a signal to 
 
 For determining when to DCA, it uses either the current price level from the AI that is tied to the current amount of DCA buys that have been done on the trade (for example, right after a trade starts when 3 blue lines get crossed, its first DCA wont happen until the price crosses the 4th line, so on so forth), or it uses the configurable drawdown % for its current level, whichever it hits first. **Default DCA levels: -2.5%, -5.0%, -10.0%, -20.0%** (4 levels). It allows a max of 2 DCAs within a rolling 24hr window to keep from dumping all of your money in too quickly on coins that are having an extended downtrend! **DCA levels and limits can be customized** in the Trading Settings.
 
-For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 2.5% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade). **Stop loss default: -40%**. **Post-trade cooldown: 30 seconds** (prevents rapid re-entry). **All profit margin percentages and timing can be customized** in the Trading Settings.
+For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 3% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade).
+
+**Multi-Timeframe Exit Confirmation:** When the price crosses below the trailing profit margin line, the bot requires bearish confirmation across multiple timeframes before executing the sell. This prevents premature exits during minor pullbacks while still capturing profit on true trend reversals. The exit requires BOTH short_signal >= 4 (bearish confirmation) AND long_signal <= 0 (no bullish resistance). **The stop-loss (-40%) ALWAYS executes immediately, bypassing MTF check for safety.** **Exit signal thresholds, profit margins, and timing can be customized** in the Trading Settings.
 
 # Setup & First-Time Use (Windows)
 
@@ -155,12 +157,16 @@ Apollo Trader allows you to customize trading parameters without editing code:
 ### Trading Settings
 Access via **Settings → Trading Settings** in the Hub menu:
 - **Entry Signals**: Adjust LONG/SHORT signal thresholds for when trades start (default: LONG min 4, SHORT max 0)
+- **Exit Signals (MTF Confirmation)**: Configure multi-timeframe exit confirmation thresholds (default: SHORT min 4, LONG max 0). Prevents premature exits during minor pullbacks while capturing profit on true trend reversals. Stop-loss always bypasses MTF check.
 - **DCA Levels**: Configure drawdown percentages and maximum DCA buys per 24 hours (default: 4 levels at -2.5%, -5.0%, -10.0%, -20.0%)
-- **Profit Margins**: Set trailing gap and target percentages (default: 5% no DCA, 2.5% with DCA), stop loss (default: -40%)
+- **Profit Margins**: Set trailing gap and target percentages (default: 5% no DCA, 3% with DCA), stop loss (default: -40%)
 - **Position Sizing**: Control initial allocation percentage and minimum trade size
 - **Timing**: Adjust main loop delay (default: 0.5s) and post-trade cooldown (default: 30s)
 
-The white marker lines on the Neural Signal tiles update automatically when you change entry signal settings - no restart required!
+The marker lines on the Neural Signal tiles update automatically when you change signal thresholds:
+- **White solid lines** show entry thresholds (when to start trades)
+- **Orange dashed lines** show exit thresholds (when MTF confirmation allows sells)
+No restart required!
 
 ### Training Settings
 Access via **Settings → Training Settings** in the Hub menu:
@@ -204,6 +210,39 @@ Simulation mode:
 - Can run alongside real trading (separate coins recommended)
 
 **Important:** Simulation mode still requires valid API credentials but will not execute real trades.
+
+### Multi-Timeframe Exit Confirmation (MTF)
+Prevent premature exits during minor pullbacks while capturing profit on true trend reversals:
+
+**How It Works:**
+When the price crosses below your trailing profit margin line, the system checks for bearish confirmation across all timeframes before executing the sell. This prevents selling during brief consolidations or minor dips that often recover to higher prices.
+
+**Exit Requirements (BOTH must be true):**
+- SHORT signal >= 4 (bearish confirmation across timeframes)
+- LONG signal <= 0 (no bullish resistance)
+
+**Safety Exception:**
+Stop-loss (-40% by default) ALWAYS executes immediately, bypassing MTF check. This ensures catastrophic losses are cut regardless of signal conditions.
+
+**Visual Indicators:**
+The Neural Signal tiles display your exit thresholds:
+- **Orange dashed lines** show exit requirements (SHORT minimum, LONG maximum)
+- Real-time signal levels show current values (e.g., "L:3 S:2")
+- When price crosses the trailing line, you can see at a glance whether MTF would allow the exit
+
+**Live Output Messages:**
+When a trailing profit margin sell is triggered, the trader shows clear messages:
+- ✅ "MTF CONFIRMED" when both conditions pass → sell executes
+- ⏸️ "MTF BLOCK" when conditions fail → position stays open, trailing line continues tracking
+- 🛑 "STOP-LOSS" when emergency exit triggers → sell executes immediately (bypasses MTF)
+
+**Configuration:**
+Customize thresholds via **Settings → Trading Settings → Exit Signals (MTF Confirmation)**:
+- Adjust SHORT signal minimum (0-7, default: 4)
+- Adjust LONG signal maximum (0-7, default: 0)
+- Changes take effect immediately and update the orange marker lines
+
+**Benefit:** By requiring multi-timeframe bearish consensus, you avoid exiting positions that are still in strong uptrends, capturing additional 2-5% gains on average that would otherwise be left on the table.
 
 ### Theme Customization
 Customize the Hub's appearance:

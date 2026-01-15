@@ -85,7 +85,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011419"
+VERSION = "26.011508"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -349,6 +349,7 @@ class NeuralSignalTile(ttk.Frame):
     def __init__(self, parent: tk.Widget, coin: str, bar_height: int = 52, levels: int = 8):
         super().__init__(parent)
         self.coin = coin
+        self._inactive_count = 0  # Track how many timeframes are inactive
 
         self._hover_on = False
         self._selected_on = False
@@ -429,18 +430,35 @@ class NeuralSignalTile(ttk.Frame):
         long_min = max(1, min(7, int(long_min)))  # Clamp to valid range 1-7
         
         long_trade_y = int(round(yb - ((long_min - 1) * self._bar_h / self._display_levels)))
-        self._long_marker = self.canvas.create_line(x0, long_trade_y, x1, long_trade_y, fill=DARK_FG, width=2)
+        self._long_marker = self.canvas.create_line(x0, long_trade_y, x1, long_trade_y, fill=CHART_CANDLE_UP, width=2)
         
         # SHORT side marker (shows maximum short signal allowed for long entries)
         short_max = trading_cfg.get("entry_signals", {}).get("short_signal_max", 0)
         short_max = max(0, min(7, int(short_max)))  # Clamp to valid range 0-7
         
         short_trade_y = int(round(yb - (short_max * self._bar_h / self._display_levels)))
-        self._short_marker = self.canvas.create_line(x2, short_trade_y, x3, short_trade_y, fill=DARK_FG, width=2)
+        self._short_marker = self.canvas.create_line(x2, short_trade_y, x3, short_trade_y, fill=CHART_CANDLE_UP, width=2)
+        
+        # EXIT marker lines (red, for MTF exit confirmation)
+        # LONG side exit marker (shows maximum long signal allowed for exit)
+        long_max_exit = trading_cfg.get("exit_signals", {}).get("long_signal_max", 0)
+        long_max_exit = max(0, min(7, int(long_max_exit)))  # Clamp to valid range 0-7
+        
+        long_exit_y = int(round(yb - (long_max_exit * self._bar_h / self._display_levels)))
+        self._long_exit_marker = self.canvas.create_line(x0, long_exit_y, x1, long_exit_y, fill=CHART_CANDLE_DOWN, width=2)
+        
+        # SHORT side exit marker (shows minimum short signal required for exit)
+        short_min_exit = trading_cfg.get("exit_signals", {}).get("short_signal_min", 4)
+        short_min_exit = max(0, min(7, int(short_min_exit)))  # Clamp to valid range 0-7
+        
+        short_exit_y = int(round(yb - ((short_min_exit - 1) * self._bar_h / self._display_levels)))
+        self._short_exit_marker = self.canvas.create_line(x2, short_exit_y, x3, short_exit_y, fill=CHART_CANDLE_DOWN, width=2)
         
         # Store last known config values for change detection
         self._last_long_min = long_min
         self._last_short_max = short_max
+        self._last_long_max_exit = long_max_exit
+        self._last_short_min_exit = short_min_exit
 
         self.value_lbl = ttk.Label(self, text="L:0 S:0")
         self.value_lbl.pack(anchor="center", pady=(1, 0))
@@ -509,6 +527,16 @@ class NeuralSignalTile(ttk.Frame):
         for rid in seg_ids:
             self.canvas.itemconfigure(rid, fill=self._base_fill)
 
+        # Grey out top segments based on inactive timeframe count
+        # Example: 3 inactive timeframes = grey out top 3 segments (indices 6, 5, 4)
+        if self._inactive_count > 0:
+            inactive_grey = DARK_MUTED  # Subtle grey from palette
+            start_grey_idx = len(seg_ids) - 1  # Start from top (index 6 for 7 segments)
+            for i in range(self._inactive_count):
+                grey_idx = start_grey_idx - i
+                if 0 <= grey_idx < len(seg_ids):
+                    self.canvas.itemconfigure(seg_ids[grey_idx], fill=inactive_grey)
+
         # Level 0 -> show nothing (no highlight)
         if level <= 0:
             return
@@ -523,9 +551,10 @@ class NeuralSignalTile(ttk.Frame):
         for i in range(idx + 1):
             self.canvas.itemconfigure(seg_ids[i], fill=active_fill)
 
-    def set_values(self, long_sig: Any, short_sig: Any) -> None:
+    def set_values(self, long_sig: Any, short_sig: Any, inactive_count: int = 0) -> None:
         ls = self._clamp_level(long_sig)
         ss = self._clamp_level(short_sig)
+        self._inactive_count = max(0, min(7, int(inactive_count)))  # Clamp 0-7
 
         self.value_lbl.config(text=f"L:{ls} S:{ss}")
         self._set_level(self._long_segs, ls, self._long_fill)
@@ -540,10 +569,19 @@ class NeuralSignalTile(ttk.Frame):
         short_max = trading_cfg.get("entry_signals", {}).get("short_signal_max", 0)
         short_max = max(0, min(7, int(short_max)))  # Clamp to valid range 0-7
         
+        long_max_exit = trading_cfg.get("exit_signals", {}).get("long_signal_max", 0)
+        long_max_exit = max(0, min(7, int(long_max_exit)))  # Clamp to valid range 0-7
+        
+        short_min_exit = trading_cfg.get("exit_signals", {}).get("short_signal_min", 4)
+        short_min_exit = max(0, min(7, int(short_min_exit)))  # Clamp to valid range 0-7
+        
         # Only update if values changed
-        if long_min != self._last_long_min or short_max != self._last_short_max:
+        if (long_min != self._last_long_min or short_max != self._last_short_max or 
+            long_max_exit != self._last_long_max_exit or short_min_exit != self._last_short_min_exit):
             self._last_long_min = long_min
             self._last_short_max = short_max
+            self._last_long_max_exit = long_max_exit
+            self._last_short_min_exit = short_min_exit
             
             # Calculate geometry
             yb = self._pad + self._bar_h
@@ -552,13 +590,19 @@ class NeuralSignalTile(ttk.Frame):
             x2 = x1 + self._gap
             x3 = x2 + self._bar_w
             
-            # Update LONG marker position
+            # Update ENTRY markers
             long_trade_y = int(round(yb - ((long_min - 1) * self._bar_h / self._display_levels)))
             self.canvas.coords(self._long_marker, x0, long_trade_y, x1, long_trade_y)
             
-            # Update SHORT marker position
             short_trade_y = int(round(yb - (short_max * self._bar_h / self._display_levels)))
             self.canvas.coords(self._short_marker, x2, short_trade_y, x3, short_trade_y)
+            
+            # Update EXIT markers
+            long_exit_y = int(round(yb - (long_max_exit * self._bar_h / self._display_levels)))
+            self.canvas.coords(self._long_exit_marker, x0, long_exit_y, x1, long_exit_y)
+            
+            short_exit_y = int(round(yb - ((short_min_exit - 1) * self._bar_h / self._display_levels)))
+            self.canvas.coords(self._short_exit_marker, x2, short_exit_y, x3, short_exit_y)
 
 # Default configuration settings and file paths
 DEFAULT_SETTINGS = {
@@ -600,12 +644,16 @@ DEFAULT_TRADING_CONFIG = {
     "profit_margin": {
         "trailing_gap_pct": 0.5,
         "target_no_dca_pct": 5.0,
-        "target_with_dca_pct": 2.5,
+        "target_with_dca_pct": 3.0,
         "stop_loss_pct": -40.0
     },
     "entry_signals": {
         "long_signal_min": 4,
         "short_signal_max": 0
+    },
+    "exit_signals": {
+        "short_signal_min": 4,
+        "long_signal_max": 0
     },
     "position_sizing": {
         "initial_allocation_pct": 0.01,
@@ -648,7 +696,7 @@ DEFAULT_TRAINING_CONFIG = {
     "weight_decay_target": 1.0,
     "age_pruning_enabled": True,
     "age_pruning_percentile": 0.10,
-    "age_pruning_weight_limit": 1.0,
+    "age_pruning_weight_limit": 0.3,
     "timeframes": REQUIRED_THINKER_TIMEFRAMES
 }
 
@@ -937,6 +985,13 @@ def read_int_from_file(path: str) -> int:
 
 def read_short_signal(folder: str) -> int:
     txt = os.path.join(folder, "short_dca_signal.txt")
+    if os.path.isfile(txt):
+        return read_int_from_file(txt)
+    else:
+        return 0
+
+def read_inactive_count(folder: str) -> int:
+    txt = os.path.join(folder, "inactive_count.txt")
     if os.path.isfile(txt):
         return read_int_from_file(txt)
     else:
@@ -6977,6 +7032,7 @@ class ApolloHub(tk.Tk):
 
             long_sig = 0
             short_sig = 0
+            inactive_count = 0
             mt_candidates: List[float] = []
 
             # Long signal
@@ -7005,7 +7061,12 @@ class ApolloHub(tk.Tk):
                     except Exception:
                         pass
 
-            tile.set_values(long_sig, short_sig)
+            # Inactive count for visual indication
+            inactive_path = os.path.join(folder, "inactive_count.txt")
+            if os.path.isfile(inactive_path):
+                inactive_count = _cached(inactive_path, read_int_from_file, 0)
+
+            tile.set_values(long_sig, short_sig, inactive_count)
             
             # Update marker lines if config changed
             try:
@@ -8283,7 +8344,7 @@ class ApolloHub(tk.Tk):
         ttk.Label(profit_frame, text="Profit target for initial entry only", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(profit_frame, text="Target with DCA (%):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
-        target_with_dca_var = tk.StringVar(value=str(cfg.get("profit_margin", {}).get("target_with_dca_pct", 2.5)))
+        target_with_dca_var = tk.StringVar(value=str(cfg.get("profit_margin", {}).get("target_with_dca_pct", 3.0)))
         ttk.Entry(profit_frame, textvariable=target_with_dca_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
         ttk.Label(profit_frame, text="Profit target when DCA has triggered", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
@@ -8321,7 +8382,45 @@ class ApolloHub(tk.Tk):
         ttk.Label(entry_frame, text="Short signal maximum (0-7):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         short_max_var = tk.StringVar(value=str(cfg.get("entry_signals", {}).get("short_signal_max", 0)))
         ttk.Entry(entry_frame, textvariable=short_max_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
-        ttk.Label(entry_frame, text="Reserved for future short trading (unused)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ttk.Label(entry_frame, text="Maximum bearish signal allowed when starting trades", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            entry_frame,
+            text="⚠ Entry requires BOTH: long >= minimum AND short <= maximum. System checks across all 7 timeframes.",
+            foreground="orange",
+            font=("TkDefaultFont", 8, "bold")
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
+
+        # Exit Signals Section
+        exit_frame = ttk.LabelFrame(frm, text=" Exit Signals (MTF Confirmation) ", padding=15)
+        exit_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
+        exit_frame.columnconfigure(0, weight=0)
+        exit_frame.columnconfigure(1, weight=1)
+        exit_frame.columnconfigure(2, weight=0)
+
+        ttk.Label(
+            exit_frame,
+            text="Multi-timeframe confirmation required to exit positions. Prevents premature sells during minor pullbacks.",
+            foreground=DARK_FG,
+            wraplength=550
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        
+        ttk.Label(exit_frame, text="Short signal minimum (0-7):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        short_min_exit_var = tk.StringVar(value=str(cfg.get("exit_signals", {}).get("short_signal_min", 4)))
+        ttk.Entry(exit_frame, textvariable=short_min_exit_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Label(exit_frame, text="AI bearish signal strength required to exit (sell)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(exit_frame, text="Long signal maximum (0-7):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
+        long_max_exit_var = tk.StringVar(value=str(cfg.get("exit_signals", {}).get("long_signal_max", 0)))
+        ttk.Entry(exit_frame, textvariable=long_max_exit_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(exit_frame, text="Maximum bullish signal allowed for exit confirmation", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            exit_frame,
+            text="⚠ Exit requires BOTH: short >= minimum AND long <= maximum. Stop-loss (-40%) bypasses MTF check.",
+            foreground="orange",
+            font=("TkDefaultFont", 8, "bold")
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         # Position Sizing Section
         position_frame = ttk.LabelFrame(frm, text=" Position Sizing ", padding=15)
@@ -8491,6 +8590,17 @@ class ApolloHub(tk.Tk):
                     messagebox.showerror("Validation Error", "Short signal maximum must be between 0 and 7")
                     return
 
+                # Exit signals
+                short_min_exit = int(short_min_exit_var.get())
+                long_max_exit = int(long_max_exit_var.get())
+                
+                if not (0 <= short_min_exit <= 7):
+                    messagebox.showerror("Validation Error", "Exit short signal minimum must be between 0 and 7")
+                    return
+                if not (0 <= long_max_exit <= 7):
+                    messagebox.showerror("Validation Error", "Exit long signal maximum must be between 0 and 7")
+                    return
+
                 # Position sizing
                 if not (0 < alloc_pct <= 100):
                     messagebox.showerror("Validation Error", "Initial allocation % must be between 0 and 100")
@@ -8527,6 +8637,10 @@ class ApolloHub(tk.Tk):
                     "entry_signals": {
                         "long_signal_min": long_min,
                         "short_signal_max": short_max
+                    },
+                    "exit_signals": {
+                        "short_signal_min": short_min_exit,
+                        "long_signal_max": long_max_exit
                     },
                     "position_sizing": {
                         "initial_allocation_pct": alloc_pct,
@@ -8565,13 +8679,18 @@ class ApolloHub(tk.Tk):
                 profit = defaults.get("profit_margin", {})
                 trailing_gap_var.set(str(profit.get("trailing_gap_pct", 0.5)))
                 target_no_dca_var.set(str(profit.get("target_no_dca_pct", 5.0)))
-                target_with_dca_var.set(str(profit.get("target_with_dca_pct", 2.5)))
+                target_with_dca_var.set(str(profit.get("target_with_dca_pct", 3.0)))
                 stop_loss_var.set(str(profit.get("stop_loss_pct", -40.0)))
                 
                 # Reset Entry Signals fields
                 entry = defaults.get("entry_signals", {})
                 long_min_var.set(str(entry.get("long_signal_min", 4)))
                 short_max_var.set(str(entry.get("short_signal_max", 0)))
+                
+                # Reset Exit Signals fields
+                exit_sig = defaults.get("exit_signals", {})
+                short_min_exit_var.set(str(exit_sig.get("short_signal_min", 4)))
+                long_max_exit_var.set(str(exit_sig.get("long_signal_max", 0)))
                 
                 # Reset Position Sizing fields
                 position = defaults.get("position_sizing", {})
@@ -8880,9 +8999,9 @@ class ApolloHub(tk.Tk):
         ttk.Label(advanced_frame, text="Fraction of oldest patterns to consider for removal (0.05-0.20 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=25, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(advanced_frame, text="Age pruning weight limit:").grid(row=26, column=0, sticky="w", padx=(0, 10), pady=6)
-        age_pruning_weight_var = tk.StringVar(value=str(cfg.get("age_pruning_weight_limit", 1.0)))
+        age_pruning_weight_var = tk.StringVar(value=str(cfg.get("age_pruning_weight_limit", 0.3)))
         ttk.Entry(advanced_frame, textvariable=age_pruning_weight_var, width=15).grid(row=26, column=1, sticky="w", pady=6)
-        ttk.Label(advanced_frame, text="Only prune old patterns below this weight (0.5-1.5 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=27, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ttk.Label(advanced_frame, text="Only prune old patterns below this weight (0.1-1.0 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=27, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Timeframes Section with Checkboxes
         timeframes_frame = ttk.LabelFrame(frm, text=" Allowed Timeframes ", padding=15)
@@ -9148,7 +9267,7 @@ class ApolloHub(tk.Tk):
                 weight_decay_target_var.set(str(defaults.get("weight_decay_target", 1.0)))
                 age_pruning_enabled_var.set(bool(defaults.get("age_pruning_enabled", True)))
                 age_pruning_percentile_var.set(str(defaults.get("age_pruning_percentile", 0.10)))
-                age_pruning_weight_var.set(str(defaults.get("age_pruning_weight_limit", 1.0)))
+                age_pruning_weight_var.set(str(defaults.get("age_pruning_weight_limit", 0.3)))
                 
                 # Save to file (includes resetting timeframes to required 7)
                 _safe_write_json(config_path, defaults)

@@ -696,7 +696,7 @@ weight_decay_target = training_settings.get("weight_decay_target", 1.0) if os.pa
 # Remove oldest N% of patterns with low weights to prevent stale pattern accumulation
 age_pruning_enabled = training_settings.get("age_pruning_enabled", True) if os.path.isfile(import_path) else True
 age_pruning_percentile = training_settings.get("age_pruning_percentile", 0.10) if os.path.isfile(import_path) else 0.10
-age_pruning_weight_limit = training_settings.get("age_pruning_weight_limit", 1.0) if os.path.isfile(import_path) else 1.0
+age_pruning_weight_limit = training_settings.get("age_pruning_weight_limit", 0.3) if os.path.isfile(import_path) else 0.3
 
 # Calculate initial threshold as average of min and max (used as starting point, will be calculated per-timeframe based on volatility)
 initial_perfect_threshold = (min_threshold + max_threshold) / 2
