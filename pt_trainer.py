@@ -694,9 +694,9 @@ weight_decay_rate = training_settings.get("weight_decay_rate", 0.0001) if os.pat
 weight_decay_target = training_settings.get("weight_decay_target", 1.0) if os.path.isfile(import_path) else 1.0
 
 # Age-based pruning parameters
-# Remove oldest N% of patterns with low weights to prevent stale pattern accumulation
+# Remove statistically ancient patterns (age > mean + 3σ) with low weights to prevent stale pattern accumulation
+# This uses sigma-based pruning (consistent with weight pruning) instead of fixed percentiles
 age_pruning_enabled = training_settings.get("age_pruning_enabled", True) if os.path.isfile(import_path) else True
-age_pruning_percentile = training_settings.get("age_pruning_percentile", 0.10) if os.path.isfile(import_path) else 0.10
 age_pruning_weight_limit = training_settings.get("age_pruning_weight_limit", 0.3) if os.path.isfile(import_path) else 0.3
 
 # Calculate initial threshold as average of min and max (used as starting point, will be calculated per-timeframe based on volatility)
@@ -732,7 +732,7 @@ try:
 	debug_print(f"[DEBUG] TRAINER: Weight adjustment - base_step={weight_base_step}, cap={weight_step_cap}x (error-proportional scaling)")
 	debug_print(f"[DEBUG] TRAINER: Adaptive thresholds - base={weight_threshold_base}, range=[{weight_threshold_min}, {weight_threshold_max}], ewma_decay={volatility_ewma_decay}")
 	debug_print(f"[DEBUG] TRAINER: Temporal decay - rate={weight_decay_rate}, target={weight_decay_target} (half-life ~{int(0.693/weight_decay_rate)} validations)")
-	debug_print(f"[DEBUG] TRAINER: Age pruning - enabled={age_pruning_enabled}, percentile={age_pruning_percentile}, weight_limit={age_pruning_weight_limit}")
+	debug_print(f"[DEBUG] TRAINER: Age pruning - enabled={age_pruning_enabled}, sigma-based (mean+3σ outliers), weight_limit={age_pruning_weight_limit}")
 except:
 	pass
 # GUI hub input (no prompts)
@@ -2093,33 +2093,34 @@ while True:
 												sigma_pruned = original_count - len(filtered)
 												debug_print(f"[DEBUG] TRAINER: Sigma-based pruning removed {sigma_pruned} patterns")
 												
-												# Age-based pruning: remove oldest N% of patterns with low weights
-												# Only apply if enabled and we have enough patterns
-												age_pruned = 0
-												if age_pruning_enabled and len(filtered) > 100:
-													# Calculate the age cutoff (oldest percentile threshold)
-													ages_sorted = sorted([age for (_, _, _, _, age) in filtered], reverse=True)
-													cutoff_index = int(len(ages_sorted) * age_pruning_percentile)
-													if cutoff_index > 0 and cutoff_index < len(ages_sorted):
-														age_cutoff = ages_sorted[cutoff_index]
-														debug_print(f"[DEBUG] TRAINER: Age cutoff for oldest {age_pruning_percentile*100}%: {age_cutoff} validations")
-														
-														# Filter: keep pattern if (age <= cutoff) OR (weight >= limit)
-														# Remove only if (age > cutoff) AND (weight < limit)
-														age_filtered = []
-														for mem, w, hw, lw, age in filtered:
-															try:
-																if age <= age_cutoff or float(w) >= age_pruning_weight_limit:
-																	age_filtered.append((mem, w, hw, lw, age))
-															except (ValueError, TypeError):
-																age_filtered.append((mem, w, hw, lw, age))  # Keep on error
-														
-														age_pruned = len(filtered) - len(age_filtered)
-														filtered = age_filtered
-														debug_print(f"[DEBUG] TRAINER: Age-based pruning removed {age_pruned} stale patterns (age>{age_cutoff}, weight<{age_pruning_weight_limit})")
-												
-												# Unzip filtered results and rebuild all lists including ages
-												if filtered:
+											# Age-based pruning: remove statistically ancient patterns with low weights
+											# Only apply if enabled and we have enough patterns for meaningful statistics
+											age_pruned = 0
+											if age_pruning_enabled and len(filtered) > 100:
+												# Calculate age statistics for sigma-based pruning (consistent with weight pruning)
+												ages_list = [age for (_, _, _, _, age) in filtered]
+												try:
+													mean_age = statistics.mean(ages_list)
+													stdev_age = statistics.stdev(ages_list) if len(ages_list) > 1 else 0.0
+													# Prune patterns beyond mean + 3σ (extreme outliers in age distribution)
+													age_cutoff = mean_age + (3.0 * stdev_age)
+													debug_print(f"[DEBUG] TRAINER: Age stats - mean={mean_age:.1f}, stdev={stdev_age:.1f}, cutoff={age_cutoff:.1f} validations")
+													
+													# Filter: keep pattern if (age <= cutoff) OR (weight >= limit)
+													# Remove only if (age > cutoff) AND (weight < limit)
+													age_filtered = []
+													for mem, w, hw, lw, age in filtered:
+														try:
+															if age <= age_cutoff or float(w) >= age_pruning_weight_limit:
+																age_filtered.append((mem, w, hw, lw, age))
+														except (ValueError, TypeError):
+															age_filtered.append((mem, w, hw, lw, age))  # Keep on error
+													
+													age_pruned = len(filtered) - len(age_filtered)
+													filtered = age_filtered
+													debug_print(f"[DEBUG] TRAINER: Sigma-based age pruning removed {age_pruned} ancient patterns (age>{age_cutoff:.1f}, weight<{age_pruning_weight_limit})")
+												except Exception as age_stats_err:
+													debug_print(f"[DEBUG] TRAINER: Age stats calculation failed ({age_stats_err}), skipping age pruning")
 													_mem["memory_list"], _mem["weight_list"], _mem["high_weight_list"], _mem["low_weight_list"], ages = zip(*filtered)
 													_mem["memory_list"] = list(_mem["memory_list"])
 													_mem["weight_list"] = list(_mem["weight_list"])

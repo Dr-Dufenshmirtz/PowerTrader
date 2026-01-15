@@ -695,7 +695,6 @@ DEFAULT_TRAINING_CONFIG = {
     "weight_decay_rate": 0.0001,
     "weight_decay_target": 1.0,
     "age_pruning_enabled": True,
-    "age_pruning_percentile": 0.10,
     "age_pruning_weight_limit": 0.3,
     "timeframes": REQUIRED_THINKER_TIMEFRAMES
 }
@@ -8987,21 +8986,16 @@ class ApolloHub(tk.Tk):
             font=("TkDefaultFont", 8)
         ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(0, 15))
 
-        # Age-Based Pruning
-        ttk.Label(advanced_frame, text="Age-Based Pruning", font=("TkDefaultFont", 9, "bold")).grid(row=22, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        # Age-Based Pruning (Sigma-Based)
+        ttk.Label(advanced_frame, text="Age-Based Pruning (Sigma-Based)", font=("TkDefaultFont", 9, "bold")).grid(row=22, column=0, columnspan=2, sticky="w", pady=(0, 8))
         
         age_pruning_enabled_var = tk.BooleanVar(value=bool(cfg.get("age_pruning_enabled", True)))
-        ttk.Checkbutton(advanced_frame, text="Enable age-based pruning", variable=age_pruning_enabled_var).grid(row=23, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Checkbutton(advanced_frame, text="Enable age-based pruning (mean+3σ outliers)", variable=age_pruning_enabled_var).grid(row=23, column=0, columnspan=2, sticky="w", pady=(0, 10))
         
-        ttk.Label(advanced_frame, text="Age pruning percentile:").grid(row=24, column=0, sticky="w", padx=(0, 10), pady=6)
-        age_pruning_percentile_var = tk.StringVar(value=str(cfg.get("age_pruning_percentile", 0.10)))
-        ttk.Entry(advanced_frame, textvariable=age_pruning_percentile_var, width=15).grid(row=24, column=1, sticky="w", pady=6)
-        ttk.Label(advanced_frame, text="Fraction of oldest patterns to consider for removal (0.05-0.20 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=25, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        ttk.Label(advanced_frame, text="Age pruning weight limit:").grid(row=26, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(advanced_frame, text="Age pruning weight limit:").grid(row=24, column=0, sticky="w", padx=(0, 10), pady=6)
         age_pruning_weight_var = tk.StringVar(value=str(cfg.get("age_pruning_weight_limit", 0.3)))
-        ttk.Entry(advanced_frame, textvariable=age_pruning_weight_var, width=15).grid(row=26, column=1, sticky="w", pady=6)
-        ttk.Label(advanced_frame, text="Only prune old patterns below this weight (0.1-1.0 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=27, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ttk.Entry(advanced_frame, textvariable=age_pruning_weight_var, width=15).grid(row=24, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Only prune patterns beyond mean+3σ age if weight below this (0.1-1.0 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=25, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Timeframes Section with Checkboxes
         timeframes_frame = ttk.LabelFrame(frm, text=" Allowed Timeframes ", padding=15)
@@ -9174,7 +9168,6 @@ class ApolloHub(tk.Tk):
                 volatility_ewma = float(volatility_ewma_var.get())
                 weight_decay_rate = float(weight_decay_rate_var.get())
                 weight_decay_target = float(weight_decay_target_var.get())
-                age_pruning_percentile = float(age_pruning_percentile_var.get())
                 age_pruning_weight = float(age_pruning_weight_var.get())
                 
                 # Validate ranges
@@ -9192,9 +9185,6 @@ class ApolloHub(tk.Tk):
                     return
                 if weight_decay_rate < 0.0 or weight_decay_rate > 0.1:
                     messagebox.showerror("Validation Error", "Weight decay rate must be between 0.0 and 0.1")
-                    return
-                if age_pruning_percentile < 0.01 or age_pruning_percentile > 0.5:
-                    messagebox.showerror("Validation Error", "Age pruning percentile must be between 0.01 and 0.5")
                     return
                 
                 # Read existing config to preserve timeframes and check for pattern_size change
@@ -9230,7 +9220,6 @@ class ApolloHub(tk.Tk):
                     "weight_decay_rate": weight_decay_rate,
                     "weight_decay_target": weight_decay_target,
                     "age_pruning_enabled": bool(age_pruning_enabled_var.get()),
-                    "age_pruning_percentile": age_pruning_percentile,
                     "age_pruning_weight_limit": age_pruning_weight,
                     "timeframes": timeframes
                 }
@@ -9266,7 +9255,6 @@ class ApolloHub(tk.Tk):
                 weight_decay_rate_var.set(str(defaults.get("weight_decay_rate", 0.0001)))
                 weight_decay_target_var.set(str(defaults.get("weight_decay_target", 1.0)))
                 age_pruning_enabled_var.set(bool(defaults.get("age_pruning_enabled", True)))
-                age_pruning_percentile_var.set(str(defaults.get("age_pruning_percentile", 0.10)))
                 age_pruning_weight_var.set(str(defaults.get("age_pruning_weight_limit", 0.3)))
                 
                 # Save to file (includes resetting timeframes to required 7)

@@ -928,7 +928,7 @@ def new_coin_state():
 		'messaged': ['no'] * len(tf_choices),
 		'updated': [0] * len(tf_choices),
 		'perfects': ['active'] * len(tf_choices),
-		'match_qualities': [100.0] * len(tf_choices),  # Match quality percentage (100 = excellent, <50 = weak)
+		'match_qualities': [0.0] * len(tf_choices),  # Match quality percentage (200 = perfect, 100 = threshold, <50 = weak)
 		'training_issues': [0] * len(tf_choices),
 
 		# readiness gating (no placeholder-number checks; this is process-based)
@@ -1524,10 +1524,6 @@ def step_coin(sym: str):
 				
 				diff_avg = total_diff / valid_comparisons
 				patterns_checked += 1
-				
-				# Track closest match for diagnostics
-				if diff_avg < closest_diff:
-					closest_diff = diff_avg
 
 				# Parse high_diff and low_diff for all patterns (needed for later use)
 				# Use pre-validated parts from split (already verified len >= 3)
@@ -1577,6 +1573,10 @@ def step_coin(sym: str):
 						mem_ind += 1
 						continue
 
+				# Track closest match for diagnostics (only for patterns that passed all validation)
+				if diff_avg < closest_diff:
+					closest_diff = diff_avg
+
 				unweighted.append(float(memory_pattern[len(memory_pattern) - 1]))
 				move_weights.append(float(weight_list[mem_ind]))
 				high_unweighted.append(high_diff)
@@ -1597,43 +1597,41 @@ def step_coin(sym: str):
 				diffs_list.append(diff_avg)
 				mem_ind += 1
 
-				# Check if we've processed all memory patterns
-				if mem_ind >= len(memory_list):
-					# Calculate match quality: 100% at threshold, >100% for better matches, logarithmic decay to 0%
-					# Quality formula: 200 / (1 + (closest_diff / perfect_threshold))
-					# With relative thresholds: 200% at 0% diff (perfect), 100% at threshold, 50% at 3x threshold, 20% at 9x threshold
-					if closest_diff < float('inf'):
-						match_quality = 200 / (1 + (closest_diff / perfect_threshold))
-					else:
-						match_quality = 0.0  # Only 0 if no patterns exist at all
-					match_qualities[tf_choice_index] = match_quality
-					
-					if any_perfect == 'no':
-						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
-						# ALWAYS generate predictions from closest patterns (even if they don't meet threshold)
-						if moves and high_moves and low_moves:
-							final_moves = sum(moves) / len(moves)
-							high_final_moves = sum(high_moves) / len(high_moves)
-							low_final_moves = sum(low_moves) / len(low_moves)
-							perfects[tf_choice_index] = 'active'  # Mark active even if match quality is low
-						else:
-							final_moves = 0.0
-							high_final_moves = 0.0
-							low_final_moves = 0.0
-							perfects[tf_choice_index] = 'inactive'
-					elif moves and high_moves and low_moves:
-						# Only calculate averages if lists are non-empty
-						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped} (Quality: {match_quality:.0f}%)")
-						final_moves = sum(moves) / len(moves)
-						high_final_moves = sum(high_moves) / len(high_moves)
-						low_final_moves = sum(low_moves) / len(low_moves)
-						perfects[tf_choice_index] = 'active'
-					else:
-						final_moves = 0.0
-						high_final_moves = 0.0
-						low_final_moves = 0.0
-						perfects[tf_choice_index] = 'inactive'
-					break
+			# After processing all memory patterns, calculate quality and set active/inactive status
+			# Calculate match quality: 100% at threshold, >100% for better matches, logarithmic decay to 0%
+			# Quality formula: 200 / (1 + (closest_diff / perfect_threshold))
+			# With relative thresholds: 200% at 0% diff (perfect), 100% at threshold, 50% at 3x threshold, 20% at 9x threshold
+			if closest_diff < float('inf'):
+				match_quality = 200 / (1 + (closest_diff / perfect_threshold))
+			else:
+				match_quality = 0.0  # Only 0 if no patterns exist at all
+			match_qualities[tf_choice_index] = match_quality
+			
+			if any_perfect == 'no':
+				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
+				# ALWAYS generate predictions from closest patterns (even if they don't meet threshold)
+				if moves and high_moves and low_moves:
+					final_moves = sum(moves) / len(moves)
+					high_final_moves = sum(high_moves) / len(high_moves)
+					low_final_moves = sum(low_moves) / len(low_moves)
+					perfects[tf_choice_index] = 'active'  # Mark active even if match quality is low
+				else:
+					final_moves = 0.0
+					high_final_moves = 0.0
+					low_final_moves = 0.0
+					perfects[tf_choice_index] = 'inactive'
+			elif moves and high_moves and low_moves:
+				# Only calculate averages if lists are non-empty
+				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped} (Quality: {match_quality:.0f}%)")
+				final_moves = sum(moves) / len(moves)
+				high_final_moves = sum(high_moves) / len(high_moves)
+				low_final_moves = sum(low_moves) / len(low_moves)
+				perfects[tf_choice_index] = 'active'
+			else:
+				final_moves = 0.0
+				high_final_moves = 0.0
+				low_final_moves = 0.0
+				perfects[tf_choice_index] = 'inactive'
 
 		except Exception:
 			PrintException()
@@ -2020,6 +2018,11 @@ def step_coin(sym: str):
 						status = "INACTIVE"
 					else:
 						status = "STARTING"
+						
+					# For inactive timeframes, only show status (no boundaries or quality)
+					if status == "INACTIVE":
+						lines.append(f"[{sym}]  {tf:>6s}: {status}")
+						continue
 						
 					# Calculate distance to boundaries as percentage
 					low_bound = low_bound_prices[i]
