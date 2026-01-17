@@ -87,6 +87,12 @@ from cryptography.hazmat.primitives import serialization
 HUB_DATA_DIR = os.environ.get("POWERTRADER_HUB_DIR", os.path.join(os.path.dirname(__file__), "hub_data"))
 os.makedirs(HUB_DATA_DIR, exist_ok=True)
 
+# Trading algorithm constants
+DEFAULT_TRAILING_GAP_PCT = 0.5  # Trailing profit margin gap percentage
+DEFAULT_DCA_WINDOW_HOURS = 24  # Rolling DCA window in hours
+DEFAULT_MIN_ALLOCATION_USD = 0.5  # Minimum allocation in USD per coin
+DEFAULT_MAIN_LOOP_DELAY = 0.5  # Main loop delay in seconds
+
 # Debug mode support - reads from gui_settings.json to enable verbose logging
 _GUI_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
 _debug_mode_cache = {"enabled": False}
@@ -361,11 +367,11 @@ _trading_settings_cache = {
 		"dca": {
 			"levels": [-2.5, -5.0, -10.0, -20.0],
 			"max_buys_per_window": 2,
-			"window_hours": 24,
+			"window_hours": DEFAULT_DCA_WINDOW_HOURS,
 			"position_multiplier": 2.0
 		},
 		"profit_margin": {
-			"trailing_gap_pct": 0.5,
+			"trailing_gap_pct": DEFAULT_TRAILING_GAP_PCT,
 			"target_no_dca_pct": 5.0,
 			"target_with_dca_pct": 3.0,
 			"stop_loss_pct": -40.0
@@ -380,11 +386,11 @@ _trading_settings_cache = {
 		},
 		"position_sizing": {
 			"initial_allocation_pct": 0.01,
-			"min_allocation_usd": 0.5,
+			"min_allocation_usd": DEFAULT_MIN_ALLOCATION_USD,
 			"max_concurrent_positions": 3
 		},
 		"timing": {
-			"main_loop_delay_seconds": 0.5,
+			"main_loop_delay_seconds": DEFAULT_MAIN_LOOP_DELAY,
 			"post_trade_delay_seconds": 30
 		}
 	}
@@ -454,7 +460,7 @@ class CryptoAPITrading:
         # from above the trailing line to below it, capturing gains while allowing upside.
         # Structure: { "BTC": {"active": bool, "line": float, "peak": float, "was_above": bool}, ... }
         self.trailing_pm = {}
-        self.trailing_gap_pct = trading_cfg.get("profit_margin", {}).get("trailing_gap_pct", 0.5)
+        self.trailing_gap_pct = trading_cfg.get("profit_margin", {}).get("trailing_gap_pct", DEFAULT_TRAILING_GAP_PCT)
         self.pm_start_pct_no_dca = trading_cfg.get("profit_margin", {}).get("target_no_dca_pct", 5.0)
         self.pm_start_pct_with_dca = trading_cfg.get("profit_margin", {}).get("target_with_dca_pct", 3.0)
         self.stop_loss_pct = trading_cfg.get("profit_margin", {}).get("stop_loss_pct", -40.0)
@@ -491,7 +497,7 @@ class CryptoAPITrading:
         # over-allocating capital during prolonged downtrends. The window resets when a trade closes
         # (sell order executes). Default: max 2 DCA buys per 24 hours per coin.
         self.max_dca_buys_per_window = trading_cfg.get("dca", {}).get("max_buys_per_window", 2)
-        self.dca_window_seconds = trading_cfg.get("dca", {}).get("window_hours", 24) * 60 * 60
+        self.dca_window_seconds = trading_cfg.get("dca", {}).get("window_hours", DEFAULT_DCA_WINDOW_HOURS) * 60 * 60
         
         # DCA timestamp tracking: maintains lists of DCA buy timestamps for rolling window enforcement
         # Only includes buys after the most recent sell (current trade boundary) and within the window
@@ -2388,7 +2394,7 @@ class CryptoAPITrading:
 
         trading_cfg = _load_trading_config()
         allocation_pct = trading_cfg.get("position_sizing", {}).get("initial_allocation_pct", 0.01)
-        min_alloc = trading_cfg.get("position_sizing", {}).get("min_allocation_usd", 0.5)
+        min_alloc = trading_cfg.get("position_sizing", {}).get("min_allocation_usd", DEFAULT_MIN_ALLOCATION_USD)
         allocation_in_usd = total_account_value * (allocation_pct / len(crypto_symbols))
         if allocation_in_usd < min_alloc:
             allocation_in_usd = min_alloc
@@ -2543,7 +2549,7 @@ class CryptoAPITrading:
             try:
                 self.manage_trades()
                 trading_cfg = _load_trading_config()
-                loop_delay = trading_cfg.get("timing", {}).get("main_loop_delay_seconds", 0.5)
+                loop_delay = trading_cfg.get("timing", {}).get("main_loop_delay_seconds", DEFAULT_MAIN_LOOP_DELAY)
                 time.sleep(loop_delay)
             except Exception as e:
                 msg = traceback.format_exc()

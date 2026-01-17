@@ -50,9 +50,9 @@ Notes on AI behavior and trading rules (informational only):
 - Pattern Matching:
 	Uses relative threshold matching (percentage of pattern magnitude) for
 	consistent behavior across different price levels and market conditions.
-	Thresholds are volatility-based (4.0× average volatility) and use a 0.1%
-	baseline for near-zero patterns. This matches the trainer's algorithm for
-	consistent prediction quality.
+	Thresholds are volatility-based (5.0× average volatility) and use a
+	volatility-adaptive baseline (0.025× volatility, typically ~0.05%) for
+	near-zero patterns. Cutoff is 5.0× threshold for quality matching.
 """
 
 import os
@@ -86,6 +86,16 @@ from nacl.signing import SigningKey
 
 # instantiate KuCoin market client (kept at top-level like original)
 market = Market(url='https://api.kucoin.com')
+
+# Thinker algorithm constants
+DEFAULT_VOLATILITY = 2.0  # Default volatility fallback (typical crypto volatility %)
+MIN_PROFIT_MARGIN = 0.25  # Minimum profit margin % for trades (also used as default/fallback)
+GAP_ENFORCEMENT_MIN = 0.25  # Minimum gap % between neural levels
+GAP_INCREMENT = 0.25  # Gap modifier increment % when enforcing level separation
+KUCOIN_API_RATE_LIMIT = 0.15  # Seconds between KuCoin API calls (150ms, ~6.7 req/s)
+ROBINHOOD_API_RATE_LIMIT = 0.5  # Seconds between Robinhood API calls
+DEFAULT_DISTANCE = 0.5  # Default distance value for calculations
+MAX_CUTOFF_MULTIPLIER = 5.0  # Maximum pattern difference cutoff (× threshold) for quality matching
 
 # Windows DPAPI decryption
 def _decrypt_with_dpapi(encrypted_data: bytes) -> str:
@@ -739,26 +749,38 @@ def _parse_candle_time(history_list: list, index: int = 1) -> float:
 		return 0.0
 
 # Cache for training data to avoid repeated file reads (cleared on trainer updates)
-_training_data_cache = {}  # Key: (coin, timeframe), Value: (mtime, memories, weights, weights_high, weights_low, threshold)
+_training_data_cache = {}  # Key: (coin, timeframe, pattern_size), Value: (mtime, memories, weights, weights_high, weights_low, threshold)
 
-def _load_training_data_cached(coin: str, timeframe: str, folder: str) -> tuple:
+def _load_training_data_cached(coin: str, timeframe: str, folder: str, pattern_size: int) -> tuple:
 	"""Load training data with file modification time caching to avoid redundant reads.
+	
+	Args:
+		coin: Coin symbol (e.g., 'BTC')
+		timeframe: Timeframe (e.g., '1hour')
+		folder: Folder path where memory files are stored
+		pattern_size: Pattern size to load (e.g., 2, 3, 4, 5)
 	
 	Returns: (memories_list, weight_list, high_weight_list, low_weight_list, perfect_threshold)
 	Returns (None, None, None, None, None) if files missing or invalid.
 	"""
-	cache_key = (coin, timeframe)
+	cache_key = (coin, timeframe, pattern_size)
 	
-	# Build file paths
-	memories_file = os.path.join(folder, f'memories_{timeframe}.dat')
-	weights_file = os.path.join(folder, f'memory_weights_{timeframe}.dat')
-	weights_high_file = os.path.join(folder, f'memory_weights_high_{timeframe}.dat')
-	weights_low_file = os.path.join(folder, f'memory_weights_low_{timeframe}.dat')
-	threshold_file = os.path.join(folder, f'neural_perfect_threshold_{timeframe}.dat')
+	debug_print(f"[DEBUG] _load_training_data_cached({coin}, {timeframe}, p{pattern_size}): folder={folder}")
 	
-	# Check if all files exist
-	if not all(os.path.isfile(f) for f in [memories_file, weights_file, weights_high_file, weights_low_file, threshold_file]):
-		return None, None, None, None, None
+	# Build file paths with size-specific naming
+	memories_file = os.path.join(folder, f'memories_{timeframe}_p{pattern_size}.dat')
+	weights_file = os.path.join(folder, f'memory_weights_{timeframe}_p{pattern_size}.dat')
+	weights_high_file = os.path.join(folder, f'memory_weights_high_{timeframe}_p{pattern_size}.dat')
+	weights_low_file = os.path.join(folder, f'memory_weights_low_{timeframe}_p{pattern_size}.dat')
+	threshold_file = os.path.join(folder, f'neural_perfect_threshold_{timeframe}_p{pattern_size}.dat')
+	
+	# Check if all files exist - debug which files are missing
+	all_files = [memories_file, weights_file, weights_high_file, weights_low_file, threshold_file]
+	missing_files = [f for f in all_files if not os.path.isfile(f)]
+	if missing_files:
+		debug_print(f"[DEBUG] {coin} {timeframe} p{pattern_size}: Missing files: {[os.path.basename(f) for f in missing_files]}")
+		debug_print(f"[DEBUG] {coin} {timeframe} p{pattern_size}: Search folder: {folder}")
+		return None, None, None, None, None, None
 	
 	try:
 		# Get latest modification time across all files
@@ -786,15 +808,23 @@ def _load_training_data_cached(coin: str, timeframe: str, folder: str) -> tuple:
 			low_weight_list = f.read().translate(str.maketrans('', '', '\'"[],')).split(' ')
 		
 		with open(threshold_file, 'r') as f:
-			perfect_threshold = _safe_float_convert(f.read(), f"{coin}_{timeframe}_threshold", 0.5)
+			perfect_threshold = _safe_float_convert(f.read(), f"{coin}_{timeframe}_threshold", DEFAULT_THRESHOLD_FALLBACK)
+		
+		# Load volatility (default if file missing)
+		volatility_file = os.path.join(folder, f"volatility_{timeframe}_p{pattern_size}.dat")
+		volatility = DEFAULT_VOLATILITY
+		if os.path.exists(volatility_file):
+			with open(volatility_file, 'r') as f:
+				volatility = _safe_float_convert(f.read(), f"{coin}_{timeframe}_volatility", DEFAULT_VOLATILITY)
 		
 		# Cache the data
-		cached_data = (memory_list, weight_list, high_weight_list, low_weight_list, perfect_threshold)
+		cached_data = (memory_list, weight_list, high_weight_list, low_weight_list, perfect_threshold, volatility)
 		_training_data_cache[cache_key] = (latest_mtime, cached_data)
 		
 		return cached_data
-	except Exception:
-		return None, None, None, None, None
+	except Exception as e:
+		debug_print(f"[DEBUG] {coin} {timeframe} p{pattern_size}: Error loading training data: {type(e).__name__}: {e}")
+		return None, None, None, None, None, None
 
 # Rate limiter to prevent API overload and respect provider limits
 class APIRateLimiter:
@@ -807,8 +837,8 @@ class APIRateLimiter:
 	def __init__(self):
 		self._last_call_times = {}  # Key: api_name, Value: timestamp
 		self._min_intervals = {
-			'kucoin': 0.15,      # 150ms between KuCoin calls (~6.7 req/s)
-			'robinhood': 0.5,    # 500ms between Robinhood calls (conservative)
+			'kucoin': KUCOIN_API_RATE_LIMIT,      # 150ms between KuCoin calls (~6.7 req/s)
+			'robinhood': ROBINHOOD_API_RATE_LIMIT,    # 500ms between Robinhood calls (conservative)
 		}
 	
 	def wait_if_needed(self, api_name: str) -> float:
@@ -850,7 +880,7 @@ REQUIRED_THINKER_TIMEFRAMES = [
 	'1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week'
 ]
 
-distance = 0.5
+distance = DEFAULT_DISTANCE
 tf_choices = REQUIRED_THINKER_TIMEFRAMES
 
 # Load pattern_size from training_settings.json
@@ -859,7 +889,11 @@ try:
 	with open(training_settings_path, 'r') as f:
 		training_settings = json.load(f)
 		PATTERN_SIZE = training_settings["pattern_size"]
-		print(f"Loaded pattern_size={PATTERN_SIZE} from training_settings.json", flush=True)
+		ENABLE_PATTERN_FALLBACK = training_settings.get("enable_pattern_fallback", True)
+		min_threshold = training_settings.get("min_threshold", 10.0)
+		max_threshold = training_settings.get("max_threshold", 25.0)
+		DEFAULT_THRESHOLD_FALLBACK = (min_threshold + max_threshold) / 2.0  # Midpoint of user's threshold range
+		print(f"Loaded pattern_size={PATTERN_SIZE}, enable_pattern_fallback={ENABLE_PATTERN_FALLBACK} from training_settings.json", flush=True)
 except Exception as e:
 	# Print error immediately (before any other initialization) so Hub can capture it
 	print(f"FATAL ERROR: Failed to load training_settings.json: {e}", flush=True)
@@ -919,7 +953,7 @@ def new_coin_state():
 		'tf_update': ['yes'] * len(tf_choices),
 		'messages': ['none'] * len(tf_choices),
 		'last_messages': ['none'] * len(tf_choices),
-		'margins': [0.25] * len(tf_choices),
+		'margins': [MIN_PROFIT_MARGIN] * len(tf_choices),
 
 		'high_tf_prices': [float('inf')] * len(tf_choices),
 		'low_tf_prices': [0.0] * len(tf_choices),
@@ -972,42 +1006,62 @@ def _validate_coin_training(coin: str) -> tuple:
 		debug_print(f"[DEBUG] THINKER: Folder does not exist: {folder}")
 		return (False, REQUIRED_THINKER_TIMEFRAMES)
 	
+	# Check for required pattern sizes based on user setting
+	# If fallback enabled: at least ONE size from 2→PATTERN_SIZE must exist (cascade 5→4→3→2→INACTIVE)
+	# If fallback disabled: only PATTERN_SIZE must exist (legacy single-size mode)
 	for tf in REQUIRED_THINKER_TIMEFRAMES:
-		memory_file = os.path.join(folder, f"memories_{tf}.dat")
-		weight_file = os.path.join(folder, f"memory_weights_{tf}.dat")
-		weight_high_file = os.path.join(folder, f"memory_weights_high_{tf}.dat")
-		weight_low_file = os.path.join(folder, f"memory_weights_low_{tf}.dat")
-		threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}.dat")
+		found_any_size = False
 		
-		# Check if all required files exist and are non-empty
-		# Threshold files only contain a single number (can be 4 bytes), so check for 1+ bytes
-		# Memory/weight files need at least 10 bytes
-		files_to_check = [
-			(memory_file, 10),
-			(weight_file, 10),
-			(weight_high_file, 10),
-			(weight_low_file, 10),
-			(threshold_file, 1)
-		]
+		# Determine which pattern sizes to validate based on user setting
+		if ENABLE_PATTERN_FALLBACK:
+			pattern_sizes_to_check = range(2, PATTERN_SIZE + 1)  # Check all sizes (cascading fallback mode)
+		else:
+			pattern_sizes_to_check = [PATTERN_SIZE]  # Only check configured size (legacy mode)
 		
-		for fpath, min_size in files_to_check:
-			if not os.path.isfile(fpath):
-				debug_print(f"[DEBUG] THINKER: {coin} {tf} - File not found: {fpath}")
-				if tf not in missing:
-					missing.append(tf)
-				break
-			try:
-				fsize = os.path.getsize(fpath)
-				if fsize < min_size:
-					debug_print(f"[DEBUG] THINKER: {coin} {tf} - File too small ({fsize} bytes, need {min_size}): {fpath}")
-					if tf not in missing:
-						missing.append(tf)
+		for pattern_size in pattern_sizes_to_check:
+			memory_file = os.path.join(folder, f"memories_{tf}_p{pattern_size}.dat")
+			weight_file = os.path.join(folder, f"memory_weights_{tf}_p{pattern_size}.dat")
+			weight_high_file = os.path.join(folder, f"memory_weights_high_{tf}_p{pattern_size}.dat")
+			weight_low_file = os.path.join(folder, f"memory_weights_low_{tf}_p{pattern_size}.dat")
+			threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}_p{pattern_size}.dat")
+			
+			# Check if all required files exist and are non-empty for this size
+			# Threshold files only contain a single number (can be 4 bytes), so check for 1+ bytes
+			# Memory/weight files need at least 10 bytes
+			files_to_check = [
+				(memory_file, 10),
+				(weight_file, 10),
+				(weight_high_file, 10),
+				(weight_low_file, 10),
+				(threshold_file, 1)
+			]
+			
+			size_complete = True
+			for fpath, min_size in files_to_check:
+				if not os.path.isfile(fpath):
+					debug_print(f"[DEBUG] THINKER: {coin} {tf} size {pattern_size} - File not found: {fpath}")
+					size_complete = False
 					break
-			except Exception as e:
-				debug_print(f"[DEBUG] THINKER: {coin} {tf} - Error checking file size: {fpath}, error: {e}")
-				if tf not in missing:
-					missing.append(tf)
-				break
+				try:
+					fsize = os.path.getsize(fpath)
+					if fsize < min_size:
+						debug_print(f"[DEBUG] THINKER: {coin} {tf} size {pattern_size} - File too small ({fsize} bytes, need {min_size}): {fpath}")
+						size_complete = False
+						break
+				except Exception as e:
+					debug_print(f"[DEBUG] THINKER: {coin} {tf} size {pattern_size} - Error checking file size: {fpath}, error: {e}")
+					size_complete = False
+					break
+			
+			if size_complete:
+				found_any_size = True
+				debug_print(f"[DEBUG] THINKER: {coin} {tf} size {pattern_size} - Complete")
+		
+		# If no pattern sizes exist for this timeframe, mark as missing
+		if not found_any_size:
+			debug_print(f"[DEBUG] THINKER: {coin} {tf} - No complete pattern sizes found (need at least one size from 2-{PATTERN_SIZE})")
+			if tf not in missing:
+				missing.append(tf)
 	
 	if len(missing) == 0:
 		debug_print(f"[DEBUG] THINKER: {coin} validation passed - all timeframes complete")
@@ -1272,8 +1326,8 @@ def step_coin(sym: str):
 		with coin_directory(sym):
 			try:
 				# Prevent new trades (and DCA) by forcing signals to 0 and keeping PM at baseline.
-				_atomic_write_text('futures_long_profit_margin.txt', '0.25')
-				_atomic_write_text('futures_short_profit_margin.txt', '0.25')
+				_atomic_write_text('futures_long_profit_margin.txt', str(MIN_PROFIT_MARGIN))
+				_atomic_write_text('futures_short_profit_margin.txt', str(MIN_PROFIT_MARGIN))
 				_atomic_write_text('long_dca_signal.txt', '0')
 				_atomic_write_text('short_dca_signal.txt', '0')
 			except Exception:
@@ -1349,6 +1403,13 @@ def step_coin(sym: str):
 			training_issues.extend([0] * (len(tf_choices) - len(training_issues)))
 		elif len(training_issues) > len(tf_choices):
 			del training_issues[len(tf_choices):]
+		
+		pattern_sizes_used = st.get('pattern_sizes_used', [0] * len(tf_choices)) if st.get('pattern_sizes_used') else [0] * len(tf_choices)
+		# keep pattern_sizes_used aligned to tf_choices
+		if len(pattern_sizes_used) < len(tf_choices):
+			pattern_sizes_used.extend([0] * (len(tf_choices) - len(pattern_sizes_used)))
+		elif len(pattern_sizes_used) > len(tf_choices):
+			del pattern_sizes_used[len(tf_choices):]
 
 		# Fetch current pattern (multiple candles for pattern matching)
 		debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]} (pattern_size={PATTERN_SIZE} → {PATTERN_SIZE-1} pct_changes)...")
@@ -1421,17 +1482,42 @@ def step_coin(sym: str):
 
 		debug_print(f"[DEBUG] {sym}: Market data fetched successfully. Current pattern ({PATTERN_SIZE-1} percentage changes): {[f'{v:.4f}%' for v in current_pattern]}")
 
-		# Load training data (cached for performance)
-		debug_print(f"[DEBUG] {sym}: Loading neural training files...")
-		
-		# Load training data with caching to avoid redundant file reads
+		# Cascading fallback: Try pattern sizes from PATTERN_SIZE down to 2
+		# Only mark INACTIVE if no size produces matches
 		folder = os.getcwd()  # Already in coin directory via coin_directory() context
-		memory_list, weight_list, high_weight_list, low_weight_list, perfect_threshold = _load_training_data_cached(
-			sym, tf_choices[tf_choice_index], folder
-		)
+		memory_list = None
+		weight_list = None
+		high_weight_list = None
+		low_weight_list = None
+		perfect_threshold = None
+		matched_pattern_size = None
 		
+		# Determine which pattern sizes to try based on user setting
+		if ENABLE_PATTERN_FALLBACK:
+			pattern_sizes_to_try = range(PATTERN_SIZE, 1, -1)  # PATTERN_SIZE → 2 (cascading fallback)
+		else:
+			pattern_sizes_to_try = [PATTERN_SIZE]  # Only try configured size (legacy mode)
+		
+		for try_size in pattern_sizes_to_try:
+			debug_print(f"[DEBUG] {sym}: Attempting pattern matching with size {try_size} for {tf_choices[tf_choice_index]}...")
+			
+			# Load training data for this pattern size
+			memory_list, weight_list, high_weight_list, low_weight_list, perfect_threshold, volatility = _load_training_data_cached(
+				sym, tf_choices[tf_choice_index], folder, try_size
+			)
+			
+			if memory_list is None:
+				debug_print(f"[DEBUG] {sym}: Training files missing for size {try_size}, trying next smaller size...")
+				continue  # Try next smaller size
+			
+			# Found training data for this size - use it
+			matched_pattern_size = try_size
+			debug_print(f"[DEBUG] {sym}: Loaded training data for size {try_size}")
+			break
+		
+		# If no training data found for any size, mark as training issue
 		if memory_list is None:
-			debug_print(f"[DEBUG] {sym}: Training files missing or invalid for {tf_choices[tf_choice_index]}")
+			debug_print(f"[DEBUG] {sym}: No training files found for any pattern size (tried {PATTERN_SIZE} down to 2) for {tf_choices[tf_choice_index]}")
 			training_issues[tf_choice_index] = 1
 			st['training_issues'] = training_issues
 			st['tf_choice_index'] = (tf_choice_index + 1) % len(tf_choices)
@@ -1441,6 +1527,15 @@ def step_coin(sym: str):
 		try:
 			# If we can read/parse training files, this timeframe is NOT a training-file issue.
 			training_issues[tf_choice_index] = 0
+
+			# Extract pattern subset matching the loaded pattern size
+			# If we loaded size 3, use last 3 candles (2 pct changes)
+			# If we loaded size 4, use last 4 candles (3 pct changes), etc.
+			pattern_length = matched_pattern_size - 1  # Size 3 → 2 values, size 4 → 3 values
+			current_pattern_subset = current_pattern[-(pattern_length):]  # Take last N values
+			
+			debug_print(f"[DEBUG] {sym}: Using pattern size {matched_pattern_size} ({pattern_length} pct changes) for matching")
+			debug_print(f"[DEBUG] {sym}: Pattern subset: {[f'{v:.4f}%' for v in current_pattern_subset]}")
 
 			mem_ind = 0
 			diffs_list = []
@@ -1461,7 +1556,7 @@ def step_coin(sym: str):
 			patterns_matched = 0
 			closest_diff = float('inf')
 
-			debug_print(f"[DEBUG] {sym}: Processing {len(memory_list)} memory patterns...")
+			debug_print(f"[DEBUG] {sym}: Processing {len(memory_list)} memory patterns at size {matched_pattern_size}...")
 			while mem_ind < len(memory_list):
 				# Validate training data format before parsing
 				parts = memory_list[mem_ind].split('{}')
@@ -1486,9 +1581,7 @@ def step_coin(sym: str):
 					continue
 				
 				# For multi-candle patterns, compare ALL candles in the pattern
-				# memory_pattern contains (PATTERN_SIZE - 1) values, same as current_pattern
-				pattern_length = PATTERN_SIZE - 1
-				
+				# memory_pattern contains (matched_pattern_size - 1) values, same as current_pattern_subset
 				# Validate memory pattern has correct length
 				if len(memory_pattern) < pattern_length:
 					debug_print(f"[DEBUG] {sym}: Memory pattern too short ({len(memory_pattern)} < {pattern_length}) at index {mem_ind}")
@@ -1505,12 +1598,12 @@ def step_coin(sym: str):
 				valid_comparisons = 0
 				for i in range(pattern_length):
 					try:
-						current_val = current_pattern[i]
+						current_val = current_pattern_subset[i]
 						memory_val = float(memory_pattern[i])
 						# Relative difference as percentage of pattern value
-						# Use minimum baseline of 0.1% to handle zero/tiny patterns consistently
-						# For patterns >0.1%: normal relative comparison; for patterns <0.1%: 0.1% is the noise floor
-						baseline = max(abs(memory_val), 0.1)
+						# Use volatility-adaptive baseline (scaled by market conditions)
+						# Scales noise floor with market: high volatility → higher baseline, low volatility → tighter baseline
+						baseline = max(abs(memory_val), 0.025 * volatility)
 						diff = (abs(current_val - memory_val) / baseline) * 100
 						total_diff += diff
 						valid_comparisons += 1
@@ -1549,33 +1642,20 @@ def step_coin(sym: str):
 					mem_ind += 1
 					continue
 
-				# Maximum cutoff: Only use patterns within 5x threshold to prevent wildly dissimilar patterns
-				# from polluting predictions. This ensures prediction quality even with no perfect matches.
+				# Track closest match for diagnostics (even if later rejected by directional filter)
+				# This helps identify if directional filtering is too aggressive
+				if diff_avg < closest_diff:
+					closest_diff = diff_avg
+
+				# Maximum cutoff: Only use patterns within MAX_CUTOFF_MULTIPLIER × threshold for quality matching
+				# This ensures prediction quality while preventing wildly dissimilar patterns.
 				# Example: threshold=15%, cutoff=75% - patterns beyond 75% similarity are excluded
-				max_cutoff = perfect_threshold * 5.0
+				max_cutoff = perfect_threshold * MAX_CUTOFF_MULTIPLIER
 				if diff_avg > max_cutoff:
 					# Pattern too dissimilar - skip it
 					patterns_skipped += 1
 					mem_ind += 1
 					continue
-
-				# Directional validation: Prevent opposite-trending patterns from matching
-				# Example: bullish [+2%, +3%, +1%] should not match bearish [-2%, -3%, -1%]
-				# Calculate net direction (sum of all percentage changes in pattern)
-				current_direction = sum(current_pattern)
-				memory_direction = sum(float(memory_pattern[i]) for i in range(pattern_length))
-				# Require same directional sign (both positive or both negative)
-				# Allow near-zero patterns (sideways) to match either direction
-				if abs(current_direction) > 0.5 and abs(memory_direction) > 0.5:
-					if (current_direction > 0) != (memory_direction > 0):
-						# Opposite directions - skip this pattern
-						patterns_skipped += 1
-						mem_ind += 1
-						continue
-
-				# Track closest match for diagnostics (only for patterns that passed all validation)
-				if diff_avg < closest_diff:
-					closest_diff = diff_avg
 
 				unweighted.append(float(memory_pattern[len(memory_pattern) - 1]))
 				move_weights.append(float(weight_list[mem_ind]))
@@ -1608,30 +1688,37 @@ def step_coin(sym: str):
 			match_qualities[tf_choice_index] = match_quality
 			
 			if any_perfect == 'no':
-				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
+				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} (size {matched_pattern_size}): No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern_subset]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
 				# ALWAYS generate predictions from closest patterns (even if they don't meet threshold)
 				if moves and high_moves and low_moves:
 					final_moves = sum(moves) / len(moves)
 					high_final_moves = sum(high_moves) / len(high_moves)
 					low_final_moves = sum(low_moves) / len(low_moves)
 					perfects[tf_choice_index] = 'active'  # Mark active even if match quality is low
+					pattern_sizes_used[tf_choice_index] = matched_pattern_size if matched_pattern_size is not None else 0
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Using pattern size {matched_pattern_size} (fallback successful)")
 				else:
 					final_moves = 0.0
 					high_final_moves = 0.0
 					low_final_moves = 0.0
 					perfects[tf_choice_index] = 'inactive'
+					pattern_sizes_used[tf_choice_index] = 0
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No valid patterns at any size - marking INACTIVE")
 			elif moves and high_moves and low_moves:
 				# Only calculate averages if lists are non-empty
-				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped} (Quality: {match_quality:.0f}%)")
+				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} (size {matched_pattern_size}): Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped} (Quality: {match_quality:.0f}%)")
 				final_moves = sum(moves) / len(moves)
 				high_final_moves = sum(high_moves) / len(high_moves)
 				low_final_moves = sum(low_moves) / len(low_moves)
 				perfects[tf_choice_index] = 'active'
+				pattern_sizes_used[tf_choice_index] = matched_pattern_size if matched_pattern_size is not None else 0
 			else:
 				final_moves = 0.0
 				high_final_moves = 0.0
 				low_final_moves = 0.0
 				perfects[tf_choice_index] = 'inactive'
+				pattern_sizes_used[tf_choice_index] = 0
+				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No valid weighted predictions - marking INACTIVE")
 
 		except Exception:
 			PrintException()
@@ -1640,9 +1727,7 @@ def step_coin(sym: str):
 			high_final_moves = 0.0
 			low_final_moves = 0.0
 			perfects[tf_choice_index] = 'inactive'
-
-		# keep threshold persisted (original behavior)
-		_atomic_write_text('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.dat', str(perfect_threshold))
+			pattern_sizes_used[tf_choice_index] = 0
 
 		# Compute new high/low predictions
 		# For price predictions, we need the most recent (last) candle's close price
@@ -1775,7 +1860,8 @@ def step_coin(sym: str):
 
 				# (original comparisons)
 				if current > high_bound_prices[inder] and high_tf_prices[inder] != low_tf_prices[inder]:
-					message = 'SHORT on ' + tf_choices[inder] + ' timeframe.\t' + format(((high_bound_prices[inder] - current) / abs(current)) * 100, '.8f') + '\tHigh: ' + str(high_bound_prices[inder])
+					size_info = f" [size {pattern_sizes_used[inder]}]" if pattern_sizes_used[inder] > 0 else ""
+					message = 'SHORT on ' + tf_choices[inder] + ' timeframe' + size_info + '.\t' + format(((high_bound_prices[inder] - current) / abs(current)) * 100, '.8f') + '\tHigh: ' + str(high_bound_prices[inder])
 					if messaged[inder] != 'yes':
 						messaged[inder] = 'yes'
 					margins[inder] = ((high_tf_prices[inder] - current) / abs(current)) * 100
@@ -1791,7 +1877,8 @@ def step_coin(sym: str):
 					tf_sides[inder] = 'short'
 
 				elif current < low_bound_prices[inder] and high_tf_prices[inder] != low_tf_prices[inder]:
-					message = 'LONG on ' + tf_choices[inder] + ' timeframe.\t' + format(((low_bound_prices[inder] - current) / abs(current)) * 100, '.8f') + '\tLow: ' + str(low_bound_prices[inder])
+					size_info = f" [size {pattern_sizes_used[inder]}]" if pattern_sizes_used[inder] > 0 else ""
+					message = 'LONG on ' + tf_choices[inder] + ' timeframe' + size_info + '.\t' + format(((low_bound_prices[inder] - current) / abs(current)) * 100, '.8f') + '\tLow: ' + str(low_bound_prices[inder])
 					if messaged[inder] != 'yes':
 						messaged[inder] = 'yes'
 
@@ -1814,7 +1901,8 @@ def step_coin(sym: str):
 						else:
 							message = 'INACTIVE on ' + tf_choices[inder] + ' timeframe.\tLow: ' + str(low_bound_prices[inder]) + '\tHigh: ' + str(high_bound_prices[inder])
 					else:
-						message = 'WITHIN on ' + tf_choices[inder] + ' timeframe.\tLow: ' + str(low_bound_prices[inder]) + '\tHigh: ' + str(high_bound_prices[inder])
+						size_info = f" [size {pattern_sizes_used[inder]}]" if pattern_sizes_used[inder] > 0 else ""
+						message = 'WITHIN on ' + tf_choices[inder] + ' timeframe' + size_info + '.\tLow: ' + str(low_bound_prices[inder]) + '\tHigh: ' + str(high_bound_prices[inder])
 
 					margins[inder] = 0.0
 
@@ -1901,18 +1989,18 @@ def step_coin(sym: str):
 							except Exception:
 								high_perc_diff = 0.0
 
-						if low_perc_diff < 0.25 + gap_modifier or new_low_bound_prices[og_index + 1] > new_low_bound_prices[og_index]:
+						if low_perc_diff < GAP_ENFORCEMENT_MIN + gap_modifier or new_low_bound_prices[og_index + 1] > new_low_bound_prices[og_index]:
 							new_price = new_low_bound_prices[og_index + 1] - (new_low_bound_prices[og_index + 1] * 0.0005)
 							new_low_bound_prices[og_index + 1] = new_price
 							continue
 
-						if high_perc_diff < 0.25 + gap_modifier or new_high_bound_prices[og_index + 1] < new_high_bound_prices[og_index]:
+						if high_perc_diff < GAP_ENFORCEMENT_MIN + gap_modifier or new_high_bound_prices[og_index + 1] < new_high_bound_prices[og_index]:
 							new_price = new_high_bound_prices[og_index + 1] + (new_high_bound_prices[og_index + 1] * 0.0005)
 							new_high_bound_prices[og_index + 1] = new_price
 							continue
 
 					og_index += 1
-					gap_modifier += 0.25
+					gap_modifier += GAP_INCREMENT
 					if og_index >= len(new_low_bound_prices) - 1:
 						break
 
@@ -2018,10 +2106,28 @@ def step_coin(sym: str):
 						status = "INACTIVE"
 					else:
 						status = "STARTING"
+					
+					# Get pattern size info for this timeframe
+					pattern_size_used = pattern_sizes_used[i] if i < len(pattern_sizes_used) else 0
+					size_indicator = f"[p{pattern_size_used}]" if pattern_size_used > 0 else "[p0]"
 						
-					# For inactive timeframes, only show status (no boundaries or quality)
+					# For inactive timeframes, show status with debug info
 					if status == "INACTIVE":
-						lines.append(f"[{sym}]  {tf:>6s}: {status}")
+						# Get match quality and training issue info for troubleshooting
+						quality = match_qualities[i] if i < len(match_qualities) else 0.0
+						training_issue = training_issues[i] if i < len(training_issues) else 0
+						
+						# Build debug info
+						if training_issue == 1:
+							reason = "training data missing"
+						elif pattern_size_used == 0:
+							reason = "no pattern files"
+						elif quality == 0.0:
+							reason = "no matches found"
+						else:
+							reason = f"quality {quality:.0f}% too low"
+						
+						lines.append(f"[{sym}]  {tf:>6s}: {status} {size_indicator} ({reason})")
 						continue
 						
 					# Calculate distance to boundaries as percentage
@@ -2052,7 +2158,7 @@ def step_coin(sym: str):
 					else:
 						quality_icon = f"Signal: {quality:.0f}% WEAK"  # Weak match
 						
-					lines.append(f"[{sym}]  {tf:>6s}: {status:6s} {bounds_text}   {quality_icon}")
+					lines.append(f"[{sym}]  {tf:>6s}: {status:6s} {bounds_text}   {quality_icon} {size_indicator}")
 								
 				# Combine all parts
 				display_cache[sym] = '\n'.join(lines)
@@ -2124,12 +2230,12 @@ def step_coin(sym: str):
 				try:
 					if len(current_pms) > 0:
 						pm = sum(current_pms) / len(current_pms)
-						if pm < 0.25:
-							pm = 0.25
+						if pm < MIN_PROFIT_MARGIN:
+							pm = MIN_PROFIT_MARGIN
 					else:
-						pm = 0.25
+						pm = MIN_PROFIT_MARGIN
 				except Exception:
-					pm = 0.25
+					pm = MIN_PROFIT_MARGIN
 
 				_atomic_write_text('futures_long_profit_margin.txt', str(pm))
 				_atomic_write_text('long_dca_signal.txt', str(longs))
@@ -2139,12 +2245,12 @@ def step_coin(sym: str):
 				try:
 					if len(current_pms) > 0:
 						pm = sum(current_pms) / len(current_pms)
-						if pm < 0.25:
-							pm = 0.25
+						if pm < MIN_PROFIT_MARGIN:
+							pm = MIN_PROFIT_MARGIN
 					else:
-						pm = 0.25
+						pm = MIN_PROFIT_MARGIN
 				except Exception:
-					pm = 0.25
+					pm = MIN_PROFIT_MARGIN
 
 				_atomic_write_text('futures_short_profit_margin.txt', str(abs(pm)))
 				_atomic_write_text('short_dca_signal.txt', str(shorts))
@@ -2217,12 +2323,9 @@ def step_coin(sym: str):
 		st['messaged'] = messaged
 		st['match_qualities'] = match_qualities
 		st['training_issues'] = training_issues
-
-		states[sym] = st
-
-# Track first iteration for startup message
-_first_run = True
+		st['pattern_sizes_used'] = pattern_sizes_used
 _startup_message_shown = False
+_first_run = True
 _last_training_warning_time = 0.0  # Throttle training warnings to once per 60 seconds
 
 print("Starting main loop...\n", flush=True)

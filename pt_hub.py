@@ -85,7 +85,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011516"
+VERSION = "26.011613"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -686,6 +686,7 @@ DEFAULT_TRAINING_CONFIG = {
     "min_threshold": 10.0,
     "max_threshold": 25.0,
     "pattern_size": 4,
+    "enable_pattern_fallback": True,
     "weight_base_step": 0.25,
     "weight_step_cap_multiplier": 2.0,
     "weight_threshold_base": 0.1,
@@ -1920,8 +1921,12 @@ class AccountValueChart(ttk.Frame):
         # Draw the line
         self.ax.plot(xs, ys, linewidth=1.5, color=CHART_ACCOUNT_LINE)
         
-        # Fill area under the line (shaded) - creates a gradient effect
-        self.ax.fill_between(xs, ys, alpha=0.15, color=CHART_ACCOUNT_LINE)
+        # Fill area under the line (shaded) - extends to x-axis at y=0
+        self.ax.fill_between(xs, ys, 0, alpha=0.15, color=CHART_ACCOUNT_LINE)
+        
+        # Set y-axis to start at 0 so fill reaches x-axis
+        y_max = max(ys)
+        self.ax.set_ylim(0, y_max * 1.2)  # Add 20% padding at top
 
         # --- Trade dots (BUY / DCA / SELL) for ALL coins ---
         try:
@@ -2742,11 +2747,6 @@ class ApolloHub(tk.Tk):
         m_settings.add_command(label="Training Settings...", command=self.open_training_settings_dialog)
         m_settings.add_separator()
         m_settings.add_checkbutton(
-            label="Debug Mode",
-            command=self.toggle_debug_mode,
-            variable=self.debug_mode_var
-        )
-        m_settings.add_checkbutton(
             label="Simulation Mode",
             command=self.toggle_simulation_mode,
             variable=self.simulation_mode_var
@@ -2760,7 +2760,14 @@ class ApolloHub(tk.Tk):
             fg=DARK_FG,
             activebackground=DARK_SELECT_BG,
             activeforeground=DARK_SELECT_FG,
+            selectcolor=DARK_FG,
         )
+        m_file.add_checkbutton(
+            label="Debug Mode",
+            command=self.toggle_debug_mode,
+            variable=self.debug_mode_var
+        )
+        m_file.add_separator()
         m_file.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="Help", menu=m_file)
 
@@ -4359,24 +4366,59 @@ class ApolloHub(tk.Tk):
         except Exception:
             return False
         
-        # Verify ALL required timeframes have valid memory files
-        for tf in REQUIRED_THINKER_TIMEFRAMES:
-            memory_file = os.path.join(folder, f"memories_{tf}.dat")
-            weight_file = os.path.join(folder, f"memory_weights_{tf}.dat")
-            threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}.dat")
+        # Determine which pattern sizes to check based on training settings
+        try:
+            training_cfg = _safe_read_json("training_settings.json")
+            if not isinstance(training_cfg, dict):
+                training_cfg = {}
+            pattern_size = training_cfg.get("pattern_size", 4)
+            enable_pattern_fallback = training_cfg.get("enable_pattern_fallback", True)
             
-            # All three files must exist and be non-empty
-            for fpath in [memory_file, weight_file, threshold_file]:
-                if not os.path.isfile(fpath):
-                    return False
-                try:
-                    # Threshold files contain single float values (e.g., "5.0", "25.0") and are legitimately small
-                    # Memory/weight files contain pattern data and should be larger
-                    min_size = 2 if "threshold" in os.path.basename(fpath) else 10
-                    if os.path.getsize(fpath) < min_size:
-                        return False
-                except Exception:
-                    return False
+            # Determine pattern sizes to check
+            if enable_pattern_fallback:
+                # Multi-size training: check sizes 2 through pattern_size
+                pattern_sizes_to_check = list(range(2, pattern_size + 1))
+            else:
+                # Single-size training: check only the specified pattern_size
+                pattern_sizes_to_check = [pattern_size]
+        except Exception:
+            # Fallback to reasonable defaults if settings can't be read
+            pattern_sizes_to_check = [2, 3, 4]
+        
+        # Verify ALL required timeframes have valid memory files for at least one pattern size
+        # Multi-size pattern training creates files with _p{N} suffix (e.g., memories_1hour_p2.dat)
+        # We need at least one complete set (memories, weights, threshold) for any pattern size
+        for tf in REQUIRED_THINKER_TIMEFRAMES:
+            found_valid_pattern_size = False
+            for ps in pattern_sizes_to_check:
+                memory_file = os.path.join(folder, f"memories_{tf}_p{ps}.dat")
+                weight_file = os.path.join(folder, f"memory_weights_{tf}_p{ps}.dat")
+                threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}_p{ps}.dat")
+                
+                # Check if all three files exist and are valid
+                all_exist = True
+                for fpath in [memory_file, weight_file, threshold_file]:
+                    if not os.path.isfile(fpath):
+                        all_exist = False
+                        break
+                    try:
+                        # Threshold files contain single float values (e.g., "5.0", "25.0") and are legitimately small
+                        # Memory/weight files contain pattern data and should be larger
+                        min_size = 2 if "threshold" in os.path.basename(fpath) else 10
+                        if os.path.getsize(fpath) < min_size:
+                            all_exist = False
+                            break
+                    except Exception:
+                        all_exist = False
+                        break
+                
+                if all_exist:
+                    found_valid_pattern_size = True
+                    break
+            
+            # If no valid pattern size found for this timeframe, training is incomplete
+            if not found_valid_pattern_size:
+                return False
         
         return True
 
@@ -5499,122 +5541,191 @@ class ApolloHub(tk.Tk):
                     if not coin_folder:
                         continue
                     
-                    bounce_accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
-                    signal_accuracy_file = os.path.join(coin_folder, "signal_accuracy.txt")
-                    
                     # Initialize history for this coin if not present
                     if coin not in self.trainer_log_history:
                         self.trainer_log_history[coin] = []
                     
-                    if not os.path.isfile(bounce_accuracy_file):
-                        # No training data yet - add a helpful message
-                        msg = f"Training Status ({coin})\n"
-                        msg += f"Status: Not yet trained\n\n"
-                        msg += f"ℹ This coin has not been trained yet.\n"
-                        msg += f"Click 'Start Trainer' to begin training for {coin}.\n\n"
-                        
-                        # Add to history
-                        for line in msg.split("\n"):
-                            if line or msg.endswith("\n"):
-                                self.trainer_log_history[coin].append(line)
-                        
-                        # Display if this coin is currently selected
-                        current_coin = (self.trainer_coin_var.get() or "").strip().upper()
-                        if coin == current_coin:
-                            self.trainer_text.insert("end", msg)
-                            self.trainer_text.see("end")
-                            # Reset scroll flag when loading initial status
-                            self._trainer_log_user_scrolled_away = False
-                        
-                        continue
-                    
-                    try:
-                        # Read bounce accuracy file
-                        with open(bounce_accuracy_file, 'r', encoding='utf-8') as f:
-                            bounce_lines = f.read().strip().split('\n')
-                        
-                        if len(bounce_lines) < 2:
-                            continue
-                        
-                        # Parse bounce accuracy content
-                        timestamp = bounce_lines[0].replace('Last Updated: ', '').strip()
-                        bounce_average = bounce_lines[1].replace('Average: ', '').strip()
-                        
-                        # Parse bounce accuracy per timeframe
-                        bounce_tf_dict = {}
-                        suspicious_accuracy = False
-                        for line in bounce_lines[2:]:
-                            if ':' in line:
-                                parts = line.split(':')
-                                tf = parts[0].strip()
-                                value = parts[1].strip()
-                                bounce_tf_dict[tf] = value
-                                # Check if any timeframe has >= 99% accuracy
-                                try:
-                                    accuracy_value = float(value.replace('%', ''))
-                                    if accuracy_value >= 99.0:
-                                        suspicious_accuracy = True
-                                except:
-                                    pass
-                        
-                        # Try to read signal accuracy file
-                        signal_average = None
-                        signal_tf_dict = {}
-                        if os.path.isfile(signal_accuracy_file):
+                    # Find all pattern-specific accuracy files for this coin
+                    pattern_sizes = []
+                    for filename in os.listdir(coin_folder):
+                        if filename.startswith("bounce_accuracy_p") and filename.endswith(".txt"):
                             try:
-                                with open(signal_accuracy_file, 'r', encoding='utf-8') as f:
-                                    signal_lines = f.read().strip().split('\n')
-                                
-                                if len(signal_lines) >= 2:
-                                    signal_average = signal_lines[1].replace('Average: ', '').strip()
-                                    
-                                    # Parse signal accuracy per timeframe
-                                    for line in signal_lines[2:]:
-                                        if ':' in line:
-                                            parts = line.split(':')
-                                            tf = parts[0].strip()
-                                            value = parts[1].strip()
-                                            signal_tf_dict[tf] = value
+                                pattern_size = int(filename.replace("bounce_accuracy_p", "").replace(".txt", ""))
+                                pattern_sizes.append(pattern_size)
                             except:
-                                pass  # Signal accuracy not critical, skip if unavailable
-                        
-                        # Use the same training validation logic as the training window
-                        if self._coin_is_trained(coin):
+                                pass
+                    
+                    # Sort pattern sizes lowest to highest
+                    pattern_sizes.sort()
+                    
+                    # Check if coin is actually trained (has memory files) even if no accuracy files exist
+                    is_coin_trained = self._coin_is_trained(coin)
+                    
+                    if not pattern_sizes:
+                        # No pattern-specific accuracy files found - check if coin has training files
+                        if not is_coin_trained:
+                            # No training data yet - add a helpful message
+                            msg = f"Training Status ({coin})\n"
+                            msg += f"Status: Not yet trained\n\n"
+                            msg += f"ℹ This coin has not been trained yet.\n"
+                            msg += f"Click 'Start Trainer' to begin training for {coin}.\n\n"
+                            
+                            # Add to history
+                            for line in msg.split("\n"):
+                                if line or msg.endswith("\n"):
+                                    self.trainer_log_history[coin].append(line)
+                            
+                            # Display if this coin is currently selected
+                            current_coin = (self.trainer_coin_var.get() or "").strip().upper()
+                            if coin == current_coin:
+                                self.trainer_text.insert("end", msg)
+                                self.trainer_text.see("end")
+                                # Reset scroll flag when loading initial status
+                                self._trainer_log_user_scrolled_away = False
+                            
+                            continue
+                        else:
+                            # Coin is trained but has old accuracy file format - count it as trained
                             trained_coins_found += 1
+                            
+                            # Show message that coin is trained but accuracy display unavailable
+                            msg = f"Training Status ({coin})\n"
+                            msg += f"Status: TRAINED\n\n"
+                            msg += f"✓ {coin} has completed training and is ready for trading.\n"
+                            msg += f"ℹ Training accuracy details are not available (trained with older version).\n"
+                            msg += f"Retrain to see detailed accuracy metrics.\n\n"
+                            
+                            # Add to history
+                            for line in msg.split("\n"):
+                                if line or msg.endswith("\n"):
+                                    self.trainer_log_history[coin].append(line)
+                            
+                            # Display if this coin is currently selected
+                            current_coin = (self.trainer_coin_var.get() or "").strip().upper()
+                            if coin == current_coin:
+                                self.trainer_text.insert("end", msg)
+                                self.trainer_text.see("end")
+                                # Reset scroll flag when loading initial status
+                                self._trainer_log_user_scrolled_away = False
+                            
+                            continue
+                    
+                    # Pattern-specific accuracy files exist - use normal display
+                    if is_coin_trained:
+                        trained_coins_found += 1
+                    
+                    # Build message for all pattern sizes (lowest to highest)
+                    full_msg = ""
+                    
+                    for pattern_size in pattern_sizes:
+                        try:
+                            bounce_accuracy_file = os.path.join(coin_folder, f"bounce_accuracy_p{pattern_size}.txt")
+                            signal_accuracy_file = os.path.join(coin_folder, f"signal_accuracy_p{pattern_size}.txt")
+                            
+                            # Read bounce accuracy file
+                            with open(bounce_accuracy_file, 'r', encoding='utf-8') as f:
+                                bounce_lines = f.read().strip().split('\n')
+                            
+                            if len(bounce_lines) < 2:
+                                continue
+                            
+                            # Parse bounce accuracy content
+                            timestamp = bounce_lines[0].replace('Last Updated: ', '').strip()
+                            
+                            # Skip the "Pattern Size:" line if present, then get average
+                            avg_line_idx = 1
+                            if len(bounce_lines) > 2 and 'Pattern Size:' in bounce_lines[1]:
+                                avg_line_idx = 2
+                            
+                            if len(bounce_lines) <= avg_line_idx:
+                                continue
+                            
+                            bounce_average = bounce_lines[avg_line_idx].replace('Average: ', '').strip()
+                            
+                            # Parse bounce accuracy per timeframe
+                            bounce_tf_dict = {}
+                            suspicious_accuracy = False
+                            for line in bounce_lines[avg_line_idx + 1:]:
+                                if ':' in line:
+                                    parts = line.split(':')
+                                    tf = parts[0].strip()
+                                    value = parts[1].strip()
+                                    bounce_tf_dict[tf] = value
+                                    # Check if any timeframe has >= 99% accuracy
+                                    try:
+                                        accuracy_value = float(value.replace('%', ''))
+                                        if accuracy_value >= 99.0:
+                                            suspicious_accuracy = True
+                                    except:
+                                        pass
+                            
+                            # Try to read signal accuracy file
+                            signal_average = None
+                            signal_tf_dict = {}
+                            if os.path.isfile(signal_accuracy_file):
+                                try:
+                                    with open(signal_accuracy_file, 'r', encoding='utf-8') as f:
+                                        signal_lines = f.read().strip().split('\n')
+                                    
+                                    if len(signal_lines) >= 2:
+                                        # Skip the "Pattern Size:" line if present, then get average
+                                        sig_avg_idx = 1
+                                        if len(signal_lines) > 2 and 'Pattern Size:' in signal_lines[1]:
+                                            sig_avg_idx = 2
+                                        
+                                        if len(signal_lines) > sig_avg_idx:
+                                            signal_average = signal_lines[sig_avg_idx].replace('Average: ', '').strip()
+                                            
+                                            # Parse signal accuracy per timeframe
+                                            for line in signal_lines[sig_avg_idx + 1:]:
+                                                if ':' in line:
+                                                    parts = line.split(':')
+                                                    tf = parts[0].strip()
+                                                    value = parts[1].strip()
+                                                    signal_tf_dict[tf] = value
+                                except:
+                                    pass  # Signal accuracy not critical, skip if unavailable
+                            
+                            # Format and display for this pattern size
+                            msg = f"Training Accuracy Results ({coin}) - Pattern Size {pattern_size}\n"
+                            msg += f"Last trained: {timestamp}\n\n"
+                            msg += f"Average Limit-Breach Accuracy: {bounce_average}\n"
+                            if signal_average:
+                                msg += f"Average Signal Accuracy:       {signal_average}\n"
+                            msg += f"\nPer Timeframe:\n"
+                            
+                            # Display per-timeframe results
+                            for tf in sorted(bounce_tf_dict.keys()):
+                                bounce_val = bounce_tf_dict[tf]
+                                if signal_tf_dict and tf in signal_tf_dict:
+                                    signal_val = signal_tf_dict[tf]
+                                    msg += f"  {tf:8} | Limit: {bounce_val:>6} | Signal: {signal_val:>6}\n"
+                                else:
+                                    msg += f"  {tf:8} | Limit: {bounce_val:>6}\n"
+                            msg += "\n"
+                            
+                            # Add warning if suspicious accuracy detected
+                            if suspicious_accuracy:
+                                msg += f"⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.\n"
+                                msg += f"⚠ Please verify that training completed properly and memories were saved.\n"
+                                msg += f"\n"
+                            
+                            full_msg += msg + "\n"
                         
-                        # Format and display
-                        msg = f"Training Accuracy Results ({coin})\n"
-                        msg += f"Last trained: {timestamp}\n\n"
-                        msg += f"Average Limit-Breach Accuracy: {bounce_average}\n"
-                        if signal_average:
-                            msg += f"Average Signal Accuracy:       {signal_average}\n"
-                        msg += f"\nPer Timeframe:\n"
-                        
-                        # Display per-timeframe results
-                        for tf in sorted(bounce_tf_dict.keys()):
-                            bounce_val = bounce_tf_dict[tf]
-                            if signal_tf_dict and tf in signal_tf_dict:
-                                signal_val = signal_tf_dict[tf]
-                                msg += f"  {tf:8} | Limit: {bounce_val:>6} | Signal: {signal_val:>6}\n"
-                            else:
-                                msg += f"  {tf:8} | Limit: {bounce_val:>6}\n"
-                        msg += "\n"
-                        
-                        # Add warning if suspicious accuracy detected
-                        if suspicious_accuracy:
-                            msg += f"⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.\n"
-                            msg += f"⚠ Please verify that training completed properly and memories were saved.\n"
-                            msg += f"\n\n"
-                        
-                        # Display error if coin is not fully trained
-                        if not self._coin_is_trained(coin):
-                            msg += f"❌ ERROR: Training incomplete - missing or invalid model files.\n"
-                            msg += f"❌ Please retrain this coin to complete the training process.\n"
-                            msg += f"\n\n"
-                        
-                        # Split message into lines and add to history (coin already initialized above)
-                        for line in msg.split("\n"):
-                            if line or msg.endswith("\n"):  # Preserve empty lines if they were in the original
+                        except Exception as e:
+                            # Silently skip files that can't be read
+                            pass
+                    
+                    # Display error if coin is not fully trained
+                    if not self._coin_is_trained(coin):
+                        full_msg += f"❌ ERROR: Training incomplete - missing or invalid model files.\n"
+                        full_msg += f"❌ Please retrain this coin to complete the training process.\n"
+                        full_msg += f"\n"
+                    
+                    # Split message into lines and add to history (coin already initialized above)
+                    if full_msg:
+                        for line in full_msg.split("\n"):
+                            if line or full_msg.endswith("\n"):  # Preserve empty lines if they were in the original
                                 self.trainer_log_history[coin].append(line)
                         
                         # Keep history manageable
@@ -5624,14 +5735,10 @@ class ApolloHub(tk.Tk):
                         # Insert into trainer log if this coin is currently selected
                         current_coin = (self.trainer_coin_var.get() or "").strip().upper()
                         if coin == current_coin:
-                            self.trainer_text.insert("end", msg)
+                            self.trainer_text.insert("end", full_msg)
                             self.trainer_text.see("end")
                             # Reset scroll flag when loading initial status
                             self._trainer_log_user_scrolled_away = False
-                    
-                    except Exception as e:
-                        # Silently skip files that can't be read
-                        pass
             
             # If no trained coins were found, display a helpful message in Thinker log
             if trained_coins_found == 0:
@@ -8865,43 +8972,51 @@ class ApolloHub(tk.Tk):
         pattern_size_var = tk.StringVar(value=str(cfg.get("pattern_size", 4)))
         ttk.Entry(learning_frame, textvariable=pattern_size_var, width=15).grid(row=0, column=1, sticky="w", pady=6)
 
+        # Enable pattern fallback checkbox
+        enable_fallback_var = tk.BooleanVar(value=cfg.get("enable_pattern_fallback", True))
+        ttk.Checkbutton(
+            learning_frame,
+            text="Enable cascading pattern fallback (train sizes 2→max, fewer INACTIVE timeframes)",
+            variable=enable_fallback_var
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 5))
+
         ttk.Label(
             learning_frame,
             text="Number of candles per pattern (2-5 range; 4=balanced, 5=specific). ⚠ Changing requires full retrain!",
             foreground="orange",
             font=("TkDefaultFont", 8, "bold")
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 15))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 15))
 
         ttk.Label(
             learning_frame,
             text="Volatility-adaptive threshold: System automatically scales threshold based on market conditions (4.0x volatility).",
             foreground=DARK_FG,
             wraplength=550
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # Minimum threshold
-        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
         min_threshold_var = tk.StringVar(value=str(cfg.get("min_threshold", 10.0)))
-        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=4, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
             text="Lower bound for relative threshold (prevents too strict matching in low volatility)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # Maximum threshold
-        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
         max_threshold_var = tk.StringVar(value=str(cfg.get("max_threshold", 20.0)))
-        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
+        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=6, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
             text="Upper bound for relative threshold (caps volatility scaling to prevent too loose matching)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(
             learning_frame,
@@ -8909,7 +9024,7 @@ class ApolloHub(tk.Tk):
             foreground=DARK_FG,
             font=("TkDefaultFont", 8, "italic"),
             wraplength=550
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Advanced Weight System Section
         advanced_frame = ttk.LabelFrame(frm, text=" Advanced Weight System ", padding=15)
@@ -9056,14 +9171,53 @@ class ApolloHub(tk.Tk):
             deleted_count = 0
             error_count = 0
             
+            # Determine pattern size range to delete from training settings
+            try:
+                training_cfg = _safe_read_json("training_settings.json")
+                if not isinstance(training_cfg, dict):
+                    training_cfg = {}
+                max_pattern_size = training_cfg.get("pattern_size", 4)
+                enable_pattern_fallback = training_cfg.get("enable_pattern_fallback", True)
+                
+                # Delete all possible pattern sizes (from 2 to max configured)
+                # This ensures cleanup even if settings changed
+                if enable_pattern_fallback:
+                    pattern_sizes_to_delete = list(range(2, max_pattern_size + 1))
+                else:
+                    # For single-size training, still check a reasonable range in case settings changed
+                    pattern_sizes_to_delete = list(range(2, max(max_pattern_size + 1, 6)))
+            except Exception:
+                # Fallback: delete common pattern sizes 2-5
+                pattern_sizes_to_delete = [2, 3, 4, 5]
+            
             for coin in self.coins:
                 folder = self.coin_folders.get(coin, "")
                 if not folder or not os.path.isdir(folder):
                     continue
                 
-                # Training files to delete (per timeframe)
+                # Training files to delete (per timeframe and pattern size)
                 for tf in REQUIRED_THINKER_TIMEFRAMES:
-                    files_to_delete = [
+                    # Delete pattern-specific files for all configured pattern sizes
+                    for ps in pattern_sizes_to_delete:
+                        files_to_delete = [
+                            f"memories_{tf}_p{ps}.dat",
+                            f"memory_weights_{tf}_p{ps}.dat",
+                            f"memory_weights_high_{tf}_p{ps}.dat",
+                            f"memory_weights_low_{tf}_p{ps}.dat",
+                            f"neural_perfect_threshold_{tf}_p{ps}.dat"
+                        ]
+                        
+                        for filename in files_to_delete:
+                            filepath = os.path.join(folder, filename)
+                            try:
+                                if os.path.exists(filepath):
+                                    os.remove(filepath)
+                                    deleted_count += 1
+                            except Exception:
+                                error_count += 1
+                    
+                    # Also delete legacy files without pattern size suffix (if they exist)
+                    legacy_files = [
                         f"memories_{tf}.dat",
                         f"memory_weights_{tf}.dat",
                         f"memory_weights_high_{tf}.dat",
@@ -9071,7 +9225,7 @@ class ApolloHub(tk.Tk):
                         f"neural_perfect_threshold_{tf}.dat"
                     ]
                     
-                    for filename in files_to_delete:
+                    for filename in legacy_files:
                         filepath = os.path.join(folder, filename)
                         try:
                             if os.path.exists(filepath):
@@ -9187,17 +9341,26 @@ class ApolloHub(tk.Tk):
                     messagebox.showerror("Validation Error", "Weight decay rate must be between 0.0 and 0.1")
                     return
                 
-                # Read existing config to preserve timeframes and check for pattern_size change
+                # Read existing config to preserve timeframes and check for pattern_size/fallback change
                 existing_cfg = _safe_read_json(config_path) if os.path.isfile(config_path) else {}
                 timeframes = existing_cfg.get("timeframes", REQUIRED_THINKER_TIMEFRAMES)
                 old_pattern_size = existing_cfg.get("pattern_size", 4)
+                old_enable_fallback = existing_cfg.get("enable_pattern_fallback", True)
+                new_enable_fallback = bool(enable_fallback_var.get())
                 
-                # Warn if pattern_size changed (requires retraining)
-                if pattern_size != old_pattern_size:
+                # Warn if pattern_size OR fallback setting changed (requires retraining)
+                if pattern_size != old_pattern_size or new_enable_fallback != old_enable_fallback:
+                    changes = []
+                    if pattern_size != old_pattern_size:
+                        changes.append(f"  Pattern size: {old_pattern_size} → {pattern_size} candles")
+                    if new_enable_fallback != old_enable_fallback:
+                        changes.append(f"  Cascading fallback: {'ON' if old_enable_fallback else 'OFF'} → {'ON' if new_enable_fallback else 'OFF'}")
+                    
                     confirm = messagebox.askyesno(
-                        "Pattern Size Changed",
-                        f"Pattern size changed from {old_pattern_size} to {pattern_size} candles.\n\n"
-                        "This requires retraining ALL coins from scratch (existing patterns incompatible).\n\n"
+                        "Training Mode Changed",
+                        f"Pattern training settings changed:\n" +
+                        "\n".join(changes) +
+                        "\n\nThis requires retraining ALL coins from scratch.\n\n"
                         "Continue?",
                         icon='warning'
                     )
@@ -9211,6 +9374,7 @@ class ApolloHub(tk.Tk):
                     "min_threshold": min_threshold,
                     "max_threshold": max_threshold,
                     "pattern_size": pattern_size,
+                    "enable_pattern_fallback": bool(enable_fallback_var.get()),
                     "weight_base_step": weight_base_step,
                     "weight_step_cap_multiplier": weight_step_cap,
                     "weight_threshold_base": weight_threshold_base,
@@ -9246,6 +9410,7 @@ class ApolloHub(tk.Tk):
                 max_threshold_var.set(str(defaults.get("max_threshold", 25.0)))
                 pruning_sigma_var.set(str(defaults.get("pruning_sigma_level", 3.0)))
                 pattern_size_var.set(str(defaults.get("pattern_size", 4)))
+                enable_fallback_var.set(bool(defaults.get("enable_pattern_fallback", True)))
                 weight_base_step_var.set(str(defaults.get("weight_base_step", 0.25)))
                 weight_step_cap_var.set(str(defaults.get("weight_step_cap_multiplier", 2.0)))
                 weight_threshold_base_var.set(str(defaults.get("weight_threshold_base", 0.1)))
