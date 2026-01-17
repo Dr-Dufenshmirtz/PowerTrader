@@ -687,7 +687,7 @@ class CryptoAPITrading:
     @staticmethod
     def _read_long_dca_signal(symbol: str) -> int:
         """
-        Reads long_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
+        Reads long_dca_signal.dat from the per-coin folder (same folder rules as trader.py).
 
         Used for:
         - Start gate: start trades when signal >= entry_signals.long_signal_min (default 4)
@@ -695,7 +695,7 @@ class CryptoAPITrading:
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, os.path.join(main_dir, sym))
-        path = os.path.join(folder, "long_dca_signal.txt")
+        path = os.path.join(folder, "long_dca_signal.dat")
         try:
             with open(path, "r") as f:
                 raw = f.read().strip()
@@ -707,7 +707,7 @@ class CryptoAPITrading:
     @staticmethod
     def _read_short_dca_signal(symbol: str) -> int:
         """
-        Reads short_dca_signal.txt from the per-coin folder (same folder rules as trader.py).
+        Reads short_dca_signal.dat from the per-coin folder (same folder rules as trader.py).
 
         Used for:
         - Start gate: start trades when signal <= entry_signals.short_signal_max (default 0)
@@ -715,7 +715,7 @@ class CryptoAPITrading:
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, os.path.join(main_dir, sym))
-        path = os.path.join(folder, "short_dca_signal.txt")
+        path = os.path.join(folder, "short_dca_signal.dat")
         try:
             with open(path, "r") as f:
                 raw = f.read().strip()
@@ -727,7 +727,7 @@ class CryptoAPITrading:
     @staticmethod
     def _read_long_price_levels(symbol: str) -> list:
         """
-        Reads low_bound_prices.txt from the per-coin folder and returns a list of LONG (blue) price levels.
+        Reads low_bound_prices.dat from the per-coin folder and returns a list of LONG (blue) price levels.
         Returned ordering is highest->lowest so:
           N1 = 1st blue line (top)
           ...
@@ -735,7 +735,7 @@ class CryptoAPITrading:
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
-        path = os.path.join(folder, "low_bound_prices.txt")
+        path = os.path.join(folder, "low_bound_prices.dat")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = (f.read() or "").strip()
@@ -772,7 +772,7 @@ class CryptoAPITrading:
     @staticmethod
     def _read_short_price_levels(symbol: str) -> list:
         """
-        Reads high_bound_prices.txt from the per-coin folder and returns a list of SHORT (orange) price levels.
+        Reads high_bound_prices.dat from the per-coin folder and returns a list of SHORT (orange) price levels.
         Returned ordering is lowest->highest so:
           N1 = 1st orange line (bottom)
           ...
@@ -780,7 +780,7 @@ class CryptoAPITrading:
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
-        path = os.path.join(folder, "high_bound_prices.txt")
+        path = os.path.join(folder, "high_bound_prices.dat")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = (f.read() or "").strip()
@@ -1905,7 +1905,7 @@ class CryptoAPITrading:
 
             # DCA display line calculation - picks whichever trigger line is higher (NEURAL vs HARD).
             # Hardcoded gives an actual price line: cost_basis * (1 + hard_next%).
-            # Neural uses actual predicted price levels from low_bound_prices.txt.
+            # Neural uses actual predicted price levels from low_bound_prices.dat.
             dca_line_source = "HARD"
             dca_line_price = 0.0
             dca_line_pct = 0.0

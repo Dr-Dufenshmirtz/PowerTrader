@@ -42,17 +42,30 @@ Notes on AI behavior and trading rules (informational only):
 - Training summary:
 	Training iterates over the historical candles for a coin on multiple
 	timeframes and records each observed pattern along with the next
-	candle's outcome. The trainer generates predictions by weighted
-	averaging the closest memory-pattern matches for the current pattern;
-	this per-timeframe predicted candle yields the high/low lines used by
-	the Thinker.
+	candle's outcome. The trainer generates predictions by kernel-weighted
+	averaging of the closest memory-pattern matches, where closer matches
+	get exponentially higher weight. This per-timeframe predicted candle
+	yields the high/low lines used by the Thinker.
 
 - Pattern Matching:
 	Uses relative threshold matching (percentage of pattern magnitude) for
 	consistent behavior across different price levels and market conditions.
 	Thresholds are volatility-based (5.0× average volatility) and use a
-	volatility-adaptive baseline (0.025× volatility, typically ~0.05%) for
-	near-zero patterns. Cutoff is 5.0× threshold for quality matching.
+	volatility-adaptive baseline (0.05× volatility, typically ~0.1%) for
+	near-zero patterns. Kernel weighting uses exponential distance penalty
+	(e^(-diff/threshold)) scaled by threshold enforcement setting.
+
+- Threshold Enforcement (configurable in training_settings.json):
+	• Tight (1×): Strong distance penalty, only uses very similar patterns
+	• Balanced (2×): Moderate penalty, default setting
+	• Loose (5×): Weak penalty, considers wider range of patterns
+	• None (10×): Minimal penalty, nearly uniform weighting
+
+- Prediction Candles:
+	Generates future-timestamped prediction candles showing AI's expected
+	price action for the next interval. Accumulates predictions across all
+	timeframes and writes to prediction_candles.json for Hub visualization.
+	Displays as white candle extending beyond current price action.
 """
 
 import os
@@ -69,6 +82,7 @@ import hmac
 import json
 import uuid
 import logging
+import math
 from contextlib import contextmanager
 
 # Ensure clean console output (avoid encoding issues)
@@ -95,7 +109,9 @@ GAP_INCREMENT = 0.25  # Gap modifier increment % when enforcing level separation
 KUCOIN_API_RATE_LIMIT = 0.15  # Seconds between KuCoin API calls (150ms, ~6.7 req/s)
 ROBINHOOD_API_RATE_LIMIT = 0.5  # Seconds between Robinhood API calls
 DEFAULT_DISTANCE = 0.5  # Default distance value for calculations
-MAX_CUTOFF_MULTIPLIER = 5.0  # Maximum pattern difference cutoff (× threshold) for quality matching
+BASE_MAX_CUTOFF_MULTIPLIER = 1.25  # Base multiplier for pattern exclusion (× threshold × enforcement)
+BASE_PERFECT_MATCH_MULTIPLIER = 1.0  # Base multiplier for fallback trigger (× threshold × enforcement)
+BASE_KERNEL_BANDWIDTH = 2.5  # Base kernel bandwidth in threshold-widths (× enforcement, lower = stronger distance penalty)
 
 # Windows DPAPI decryption
 def _decrypt_with_dpapi(encrypted_data: bytes) -> str:
@@ -239,6 +255,19 @@ def restart_program():
 		os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 	except Exception as e:
 		print(f'Error during program restart: {e}', flush=True)
+
+def _timeframe_to_seconds(timeframe: str) -> int:
+	"""Convert timeframe string to seconds for timestamp calculation."""
+	timeframe_map = {
+		'1hour': 3600,
+		'2hour': 7200,
+		'4hour': 14400,
+		'8hour': 28800,
+		'12hour': 43200,
+		'1day': 86400,
+		'1week': 604800
+	}
+	return timeframe_map.get(timeframe, 3600)  # Default to 1 hour if unknown
 
 # Utility: PrintException prints a helpful one-line context for exceptions
 # by locating the source file/line and printing the offending line. This
@@ -893,7 +922,18 @@ try:
 		min_threshold = training_settings.get("min_threshold", 10.0)
 		max_threshold = training_settings.get("max_threshold", 25.0)
 		DEFAULT_THRESHOLD_FALLBACK = (min_threshold + max_threshold) / 2.0  # Midpoint of user's threshold range
-		print(f"Loaded pattern_size={PATTERN_SIZE}, enable_pattern_fallback={ENABLE_PATTERN_FALLBACK} from training_settings.json", flush=True)
+		
+		# Load threshold enforcement setting and calculate effective multipliers
+		threshold_enforcement = training_settings.get("threshold_enforcement", "Balanced")
+		enforcement_multipliers = {"Tight": 1, "Balanced": 2, "Loose": 5, "None": 10}
+		enforcement_value = enforcement_multipliers.get(threshold_enforcement, 2)  # Default to Balanced (2)
+		
+		# Calculate effective multipliers (base × enforcement)
+		MAX_CUTOFF_MULTIPLIER = BASE_MAX_CUTOFF_MULTIPLIER * enforcement_value
+		PERFECT_MATCH_MULTIPLIER = BASE_PERFECT_MATCH_MULTIPLIER * enforcement_value
+		KERNEL_BANDWIDTH = BASE_KERNEL_BANDWIDTH * enforcement_value
+		
+		print(f"Loaded pattern_size={PATTERN_SIZE}, enable_pattern_fallback={ENABLE_PATTERN_FALLBACK}, threshold_enforcement={threshold_enforcement} (cutoff={MAX_CUTOFF_MULTIPLIER:.2f}x, perfect={PERFECT_MATCH_MULTIPLIER:.2f}x, kernel={KERNEL_BANDWIDTH:.2f}x) from training_settings.json", flush=True)
 except Exception as e:
 	# Print error immediately (before any other initialization) so Hub can capture it
 	print(f"FATAL ERROR: Failed to load training_settings.json: {e}", flush=True)
@@ -968,6 +1008,9 @@ def new_coin_state():
 		# readiness gating (no placeholder-number checks; this is process-based)
 		'bounds_version': 0,
 		'last_display_bounds_version': -1,
+
+		# Prediction candles for Hub chart visualization (accumulates across timeframes)
+		'prediction_candles': {},
 
 	}
 
@@ -1189,9 +1232,9 @@ def init_coin(sym: str):
 	with coin_directory(sym):
 
 		# per-coin "version" + on/off files (no collisions between coins)
-		_atomic_write_text('alerts_version.txt', '5/3/2022/9am')
-		_atomic_write_text('futures_long_onoff.txt', 'OFF')
-		_atomic_write_text('futures_short_onoff.txt', 'OFF')
+		_atomic_write_text('alerts_version.dat', '5/3/2022/9am')
+		_atomic_write_text('futures_long_onoff.dat', 'OFF')
+		_atomic_write_text('futures_short_onoff.dat', 'OFF')
 
 		st = new_coin_state()
 
@@ -1296,7 +1339,7 @@ def step_coin(sym: str):
 	2. Fetches latest candle data from KuCoin for each timeframe
 	3. Loads trained memories/weights from disk
 	4. Generates weighted-average predictions for current candle high/low
-	5. Writes predicted levels to signal files (low_bound_prices.txt, high_bound_prices.txt)
+	5. Writes predicted levels to signal files (low_bound_prices.dat, high_bound_prices.dat)
 	6. Generates trading signals based on predicted levels vs current price
 	7. Writes long/short DCA signals for trader to consume
 	
@@ -1326,10 +1369,10 @@ def step_coin(sym: str):
 		with coin_directory(sym):
 			try:
 				# Prevent new trades (and DCA) by forcing signals to 0 and keeping PM at baseline.
-				_atomic_write_text('futures_long_profit_margin.txt', str(MIN_PROFIT_MARGIN))
-				_atomic_write_text('futures_short_profit_margin.txt', str(MIN_PROFIT_MARGIN))
-				_atomic_write_text('long_dca_signal.txt', '0')
-				_atomic_write_text('short_dca_signal.txt', '0')
+				_atomic_write_text('futures_long_profit_margin.dat', str(MIN_PROFIT_MARGIN))
+				_atomic_write_text('futures_short_profit_margin.dat', str(MIN_PROFIT_MARGIN))
+				_atomic_write_text('long_dca_signal.dat', '0')
+				_atomic_write_text('short_dca_signal.dat', '0')
 			except Exception:
 				pass
 		try:
@@ -1410,6 +1453,11 @@ def step_coin(sym: str):
 			pattern_sizes_used.extend([0] * (len(tf_choices) - len(pattern_sizes_used)))
 		elif len(pattern_sizes_used) > len(tf_choices):
 			del pattern_sizes_used[len(tf_choices):]
+		
+		# Load prediction candles dictionary from state (persists across timeframe cycles)
+		if 'prediction_candles' not in st:
+			st['prediction_candles'] = {}
+		prediction_candles = st['prediction_candles']
 
 		# Fetch current pattern (multiple candles for pattern matching)
 		debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]} (pattern_size={PATTERN_SIZE} → {PATTERN_SIZE-1} pct_changes)...")
@@ -1508,14 +1556,252 @@ def step_coin(sym: str):
 			
 			if memory_list is None:
 				debug_print(f"[DEBUG] {sym}: Training files missing for size {try_size}, trying next smaller size...")
-				continue  # Try next smaller size
+				continue  # Try next smaller size - skip pattern processing
 			
-			# Found training data for this size - use it
-			matched_pattern_size = try_size
-			debug_print(f"[DEBUG] {sym}: Loaded training data for size {try_size}")
-			break
+			# Found training data for this size - will process it to check quality
+			matched_pattern_size = try_size  # Set for this iteration's pattern processing
+			any_perfect = 'no'  # Initialize before try block in case of early failure
+			final_moves = 0.0
+			high_final_moves = 0.0
+			low_final_moves = 0.0
+			debug_print(f"[DEBUG] {sym}: Found training data for size {try_size}, checking pattern quality...")
+			# Don't break yet - need to process patterns and check any_perfect
 		
-		# If no training data found for any size, mark as training issue
+			try:
+				# If we can read/parse training files, this timeframe is NOT a training-file issue.
+				training_issues[tf_choice_index] = 0
+
+				# Extract pattern subset matching the loaded pattern size
+				# If we loaded size 3, use last 3 candles (2 pct changes)
+				# If we loaded size 4, use last 4 candles (3 pct changes), etc.
+				pattern_length = matched_pattern_size - 1  # Size 3 → 2 values, size 4 → 3 values
+				current_pattern_subset = current_pattern[-(pattern_length):]  # Take last N values
+				
+				debug_print(f"[DEBUG] {sym}: Using pattern size {matched_pattern_size} ({pattern_length} pct changes) for matching")
+				debug_print(f"[DEBUG] {sym}: Pattern subset: {[f'{v:.4f}%' for v in current_pattern_subset]}")
+
+				mem_ind = 0
+				diffs_list = []
+				perfect_dexs = []
+				perfect_diffs = []
+				moves = []
+				move_weights = []
+				unweighted = []
+				high_unweighted = []
+				low_unweighted = []
+				high_moves = []
+				low_moves = []
+				
+				# Track pattern matching statistics for diagnostics
+				patterns_checked = 0
+				patterns_skipped = 0
+				patterns_matched = 0
+				closest_diff = float('inf')
+
+				debug_print(f"[DEBUG] {sym}: Processing {len(memory_list)} memory patterns at size {matched_pattern_size}...")
+				while mem_ind < len(memory_list):
+					# Validate training data format before parsing
+					parts = memory_list[mem_ind].split('{}')
+					if len(parts) < 3:
+						# Corrupted/incomplete training data - skip this pattern
+						debug_print(f"[DEBUG] {sym}: Skipping corrupted memory pattern at index {mem_ind} (insufficient parts: {len(parts)})")
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+					
+					try:
+						memory_pattern = _clean_training_string(parts[0]).split('|')
+						if not memory_pattern:
+							# Empty pattern after cleaning - skip
+							patterns_skipped += 1
+							mem_ind += 1
+							continue
+					except Exception:
+						debug_print(f"[DEBUG] {sym}: Failed to parse memory pattern at index {mem_ind}")
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+					
+					# For multi-candle patterns, compare ALL candles in the pattern
+					# memory_pattern contains (matched_pattern_size - 1) values, same as current_pattern_subset
+					# Validate memory pattern has correct length
+					if len(memory_pattern) < pattern_length:
+						debug_print(f"[DEBUG] {sym}: Memory pattern too short ({len(memory_pattern)} < {pattern_length}) at index {mem_ind}")
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+					
+					# Calculate average difference across all candles in the pattern
+					# Relative percentage difference (threshold applies as % of pattern value)
+					# Example: memory=5%, current=6%, threshold=15% → diff = |6-5|/5 * 100 = 20% > 15% (no match)
+					# Example: memory=5%, current=5.5%, threshold=15% → diff = |5.5-5|/5 * 100 = 10% < 15% (match)
+					# This scales precision: small moves get tight absolute tolerances, large moves get proportional tolerances
+					total_diff = 0.0
+					valid_comparisons = 0
+					for i in range(pattern_length):
+						try:
+							current_val = current_pattern_subset[i]
+							memory_val = float(memory_pattern[i])
+							# Relative difference as percentage of pattern value
+							# Use volatility-adaptive baseline (scaled by market conditions)
+							# Scales noise floor with market: high volatility → higher baseline, low volatility → tighter baseline
+							baseline = max(abs(memory_val), 0.05 * volatility)
+							diff = (abs(current_val - memory_val) / baseline) * 100
+							total_diff += diff
+							valid_comparisons += 1
+						except Exception:
+							continue
+					
+					if valid_comparisons == 0:
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+					
+					diff_avg = total_diff / valid_comparisons
+					patterns_checked += 1
+
+					# Parse high_diff and low_diff for all patterns (needed for later use)
+					# Use pre-validated parts from split (already verified len >= 3)
+					try:
+						high_diff = float(_clean_training_string(parts[1])) / 100
+						low_diff = float(_clean_training_string(parts[2])) / 100
+					except (ValueError, IndexError) as e:
+						# Failed to parse high/low diffs - skip this pattern
+						debug_print(f"[DEBUG] {sym}: Failed to parse high/low diffs at index {mem_ind}: {e}")
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+
+					# Accept patterns within PERFECT_MATCH_MULTIPLIER × threshold as "good enough"
+					# This determines whether to use this pattern size or fallback to smaller size
+					if diff_avg <= (perfect_threshold * PERFECT_MATCH_MULTIPLIER):
+						any_perfect = 'yes'
+						patterns_matched += 1
+
+					# Validate weight list indices before accessing
+					if mem_ind >= len(weight_list) or mem_ind >= len(high_weight_list) or mem_ind >= len(low_weight_list):
+						debug_print(f"[DEBUG] {sym}: Weight list length mismatch at index {mem_ind} (memory: {len(memory_list)}, weight: {len(weight_list)}, high: {len(high_weight_list)}, low: {len(low_weight_list)}) - skipping pattern")
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+
+					# Track closest match for diagnostics (even if later rejected by directional filter)
+					# This helps identify if directional filtering is too aggressive
+					if diff_avg < closest_diff:
+						closest_diff = diff_avg
+
+					# Maximum cutoff: Only use patterns within MAX_CUTOFF_MULTIPLIER × threshold for quality matching
+					# This ensures prediction quality while preventing wildly dissimilar patterns.
+					# Example: threshold=15%, cutoff=75% - patterns beyond 75% similarity are excluded
+					max_cutoff = perfect_threshold * MAX_CUTOFF_MULTIPLIER
+					if diff_avg > max_cutoff:
+						# Pattern too dissimilar - skip it
+						patterns_skipped += 1
+						mem_ind += 1
+						continue
+
+					unweighted.append(float(memory_pattern[len(memory_pattern) - 1]))
+					move_weights.append(float(weight_list[mem_ind]))
+					high_unweighted.append(high_diff)
+					low_unweighted.append(low_diff)
+
+					if float(weight_list[mem_ind]) != 0.0:
+						moves.append(float(memory_pattern[len(memory_pattern) - 1]) * float(weight_list[mem_ind]))
+
+					if float(high_weight_list[mem_ind]) != 0.0:
+						high_moves.append(high_diff * float(high_weight_list[mem_ind]))
+
+					if float(low_weight_list[mem_ind]) != 0.0:
+						low_moves.append(low_diff * float(low_weight_list[mem_ind]))
+
+					perfect_dexs.append(mem_ind)
+					perfect_diffs.append(diff_avg)
+
+					diffs_list.append(diff_avg)
+					mem_ind += 1
+
+				# After processing all memory patterns, calculate quality and set active/inactive status
+				# Calculate match quality: 100% at threshold, >100% for better matches, logarithmic decay to 0%
+				# Quality formula: 200 / (1 + (closest_diff / perfect_threshold))
+				# With relative thresholds: 200% at 0% diff (perfect), 100% at threshold, 50% at 3x threshold, 20% at 9x threshold
+				if closest_diff < float('inf'):
+					match_quality = 200 / (1 + (closest_diff / perfect_threshold))
+				else:
+					match_quality = 0.0  # Only 0 if no patterns exist at all
+				match_qualities[tf_choice_index] = match_quality
+				
+				if any_perfect == 'no':
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} (size {matched_pattern_size}): No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern_subset]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
+					# ALWAYS generate predictions from closest patterns (even if they don't meet threshold)
+					if moves and high_moves and low_moves:
+						# Kernel-weighted average (closer matches weighted higher, normalized by threshold)
+						kernel_weights = [math.exp(-d / (perfect_threshold * KERNEL_BANDWIDTH)) for d in diffs_list]
+						total_weight = sum(kernel_weights)
+						final_moves = sum(m * w for m, w in zip(moves, kernel_weights)) / total_weight
+						high_final_moves = sum(h * w for h, w in zip(high_moves, kernel_weights)) / total_weight
+						low_final_moves = sum(l * w for l, w in zip(low_moves, kernel_weights)) / total_weight
+						perfects[tf_choice_index] = 'active'  # Mark active even if match quality is low
+						pattern_sizes_used[tf_choice_index] = matched_pattern_size if matched_pattern_size is not None else 0
+						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Using pattern size {matched_pattern_size} (fallback successful)")
+					else:
+						final_moves = 0.0
+						high_final_moves = 0.0
+						low_final_moves = 0.0
+						perfects[tf_choice_index] = 'inactive'
+						pattern_sizes_used[tf_choice_index] = 0
+						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No valid patterns at any size - marking INACTIVE")
+				elif moves and high_moves and low_moves:
+					# Only calculate averages if lists are non-empty
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} (size {matched_pattern_size}): Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped} (Quality: {match_quality:.0f}%)")
+					# Kernel-weighted average (closer matches weighted higher, normalized by threshold)
+					kernel_weights = [math.exp(-d / (perfect_threshold * KERNEL_BANDWIDTH)) for d in diffs_list]
+					total_weight = sum(kernel_weights)
+					final_moves = sum(m * w for m, w in zip(moves, kernel_weights)) / total_weight
+					high_final_moves = sum(h * w for h, w in zip(high_moves, kernel_weights)) / total_weight
+					low_final_moves = sum(l * w for l, w in zip(low_moves, kernel_weights)) / total_weight
+					perfects[tf_choice_index] = 'active'
+					pattern_sizes_used[tf_choice_index] = matched_pattern_size if matched_pattern_size is not None else 0
+				else:
+					final_moves = 0.0
+					high_final_moves = 0.0
+					low_final_moves = 0.0
+					perfects[tf_choice_index] = 'inactive'
+					pattern_sizes_used[tf_choice_index] = 0
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No valid weighted predictions - marking INACTIVE")
+
+			except Exception:
+				PrintException()
+				training_issues[tf_choice_index] = 1
+				final_moves = 0.0
+				high_final_moves = 0.0
+				low_final_moves = 0.0
+				perfects[tf_choice_index] = 'inactive'
+				pattern_sizes_used[tf_choice_index] = 0
+
+			# After processing patterns for this size, check if quality is good enough
+			if any_perfect == 'yes':
+				# Found good matches - use this size
+				matched_pattern_size = try_size
+				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Size {try_size} has good matches, using this size")
+				break
+			else:
+				# No good matches at this size
+				if try_size == 2:
+					# Last size also failed - mark as inactive
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Size {try_size} (last size) has no good matches - marking INACTIVE")
+					perfects[tf_choice_index] = 'inactive'
+					pattern_sizes_used[tf_choice_index] = 0
+					final_moves = 0.0
+					high_final_moves = 0.0
+					low_final_moves = 0.0
+					matched_pattern_size = None
+					break
+				else:
+					# Try next smaller size
+					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Size {try_size} has no good matches, trying smaller size...")
+					continue
+		
+		# If no training data found for any size, mark as training issue (will be checked after loop)
 		if memory_list is None:
 			debug_print(f"[DEBUG] {sym}: No training files found for any pattern size (tried {PATTERN_SIZE} down to 2) for {tf_choices[tf_choice_index]}")
 			training_issues[tf_choice_index] = 1
@@ -1524,210 +1810,12 @@ def step_coin(sym: str):
 			states[sym] = st
 			return
 
-		try:
-			# If we can read/parse training files, this timeframe is NOT a training-file issue.
-			training_issues[tf_choice_index] = 0
-
-			# Extract pattern subset matching the loaded pattern size
-			# If we loaded size 3, use last 3 candles (2 pct changes)
-			# If we loaded size 4, use last 4 candles (3 pct changes), etc.
-			pattern_length = matched_pattern_size - 1  # Size 3 → 2 values, size 4 → 3 values
-			current_pattern_subset = current_pattern[-(pattern_length):]  # Take last N values
-			
-			debug_print(f"[DEBUG] {sym}: Using pattern size {matched_pattern_size} ({pattern_length} pct changes) for matching")
-			debug_print(f"[DEBUG] {sym}: Pattern subset: {[f'{v:.4f}%' for v in current_pattern_subset]}")
-
-			mem_ind = 0
-			diffs_list = []
-			any_perfect = 'no'
-			perfect_dexs = []
-			perfect_diffs = []
-			moves = []
-			move_weights = []
-			unweighted = []
-			high_unweighted = []
-			low_unweighted = []
-			high_moves = []
-			low_moves = []
-			
-			# Track pattern matching statistics for diagnostics
-			patterns_checked = 0
-			patterns_skipped = 0
-			patterns_matched = 0
-			closest_diff = float('inf')
-
-			debug_print(f"[DEBUG] {sym}: Processing {len(memory_list)} memory patterns at size {matched_pattern_size}...")
-			while mem_ind < len(memory_list):
-				# Validate training data format before parsing
-				parts = memory_list[mem_ind].split('{}')
-				if len(parts) < 3:
-					# Corrupted/incomplete training data - skip this pattern
-					debug_print(f"[DEBUG] {sym}: Skipping corrupted memory pattern at index {mem_ind} (insufficient parts: {len(parts)})")
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-				
-				try:
-					memory_pattern = _clean_training_string(parts[0]).split('|')
-					if not memory_pattern:
-						# Empty pattern after cleaning - skip
-						patterns_skipped += 1
-						mem_ind += 1
-						continue
-				except Exception:
-					debug_print(f"[DEBUG] {sym}: Failed to parse memory pattern at index {mem_ind}")
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-				
-				# For multi-candle patterns, compare ALL candles in the pattern
-				# memory_pattern contains (matched_pattern_size - 1) values, same as current_pattern_subset
-				# Validate memory pattern has correct length
-				if len(memory_pattern) < pattern_length:
-					debug_print(f"[DEBUG] {sym}: Memory pattern too short ({len(memory_pattern)} < {pattern_length}) at index {mem_ind}")
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-				
-				# Calculate average difference across all candles in the pattern
-				# Relative percentage difference (threshold applies as % of pattern value)
-				# Example: memory=5%, current=6%, threshold=15% → diff = |6-5|/5 * 100 = 20% > 15% (no match)
-				# Example: memory=5%, current=5.5%, threshold=15% → diff = |5.5-5|/5 * 100 = 10% < 15% (match)
-				# This scales precision: small moves get tight absolute tolerances, large moves get proportional tolerances
-				total_diff = 0.0
-				valid_comparisons = 0
-				for i in range(pattern_length):
-					try:
-						current_val = current_pattern_subset[i]
-						memory_val = float(memory_pattern[i])
-						# Relative difference as percentage of pattern value
-						# Use volatility-adaptive baseline (scaled by market conditions)
-						# Scales noise floor with market: high volatility → higher baseline, low volatility → tighter baseline
-						baseline = max(abs(memory_val), 0.025 * volatility)
-						diff = (abs(current_val - memory_val) / baseline) * 100
-						total_diff += diff
-						valid_comparisons += 1
-					except Exception:
-						continue
-				
-				if valid_comparisons == 0:
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-				
-				diff_avg = total_diff / valid_comparisons
-				patterns_checked += 1
-
-				# Parse high_diff and low_diff for all patterns (needed for later use)
-				# Use pre-validated parts from split (already verified len >= 3)
-				try:
-					high_diff = float(_clean_training_string(parts[1])) / 100
-					low_diff = float(_clean_training_string(parts[2])) / 100
-				except (ValueError, IndexError) as e:
-					# Failed to parse high/low diffs - skip this pattern
-					debug_print(f"[DEBUG] {sym}: Failed to parse high/low diffs at index {mem_ind}: {e}")
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-
-				# ALWAYS accept patterns that meet threshold for match counting
-				if diff_avg <= perfect_threshold:
-					any_perfect = 'yes'
-					patterns_matched += 1
-
-				# Validate weight list indices before accessing
-				if mem_ind >= len(weight_list) or mem_ind >= len(high_weight_list) or mem_ind >= len(low_weight_list):
-					debug_print(f"[DEBUG] {sym}: Weight list length mismatch at index {mem_ind} (memory: {len(memory_list)}, weight: {len(weight_list)}, high: {len(high_weight_list)}, low: {len(low_weight_list)}) - skipping pattern")
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-
-				# Track closest match for diagnostics (even if later rejected by directional filter)
-				# This helps identify if directional filtering is too aggressive
-				if diff_avg < closest_diff:
-					closest_diff = diff_avg
-
-				# Maximum cutoff: Only use patterns within MAX_CUTOFF_MULTIPLIER × threshold for quality matching
-				# This ensures prediction quality while preventing wildly dissimilar patterns.
-				# Example: threshold=15%, cutoff=75% - patterns beyond 75% similarity are excluded
-				max_cutoff = perfect_threshold * MAX_CUTOFF_MULTIPLIER
-				if diff_avg > max_cutoff:
-					# Pattern too dissimilar - skip it
-					patterns_skipped += 1
-					mem_ind += 1
-					continue
-
-				unweighted.append(float(memory_pattern[len(memory_pattern) - 1]))
-				move_weights.append(float(weight_list[mem_ind]))
-				high_unweighted.append(high_diff)
-				low_unweighted.append(low_diff)
-
-				if float(weight_list[mem_ind]) != 0.0:
-					moves.append(float(memory_pattern[len(memory_pattern) - 1]) * float(weight_list[mem_ind]))
-
-				if float(high_weight_list[mem_ind]) != 0.0:
-					high_moves.append(high_diff * float(high_weight_list[mem_ind]))
-
-				if float(low_weight_list[mem_ind]) != 0.0:
-					low_moves.append(low_diff * float(low_weight_list[mem_ind]))
-
-				perfect_dexs.append(mem_ind)
-				perfect_diffs.append(diff_avg)
-
-				diffs_list.append(diff_avg)
-				mem_ind += 1
-
-			# After processing all memory patterns, calculate quality and set active/inactive status
-			# Calculate match quality: 100% at threshold, >100% for better matches, logarithmic decay to 0%
-			# Quality formula: 200 / (1 + (closest_diff / perfect_threshold))
-			# With relative thresholds: 200% at 0% diff (perfect), 100% at threshold, 50% at 3x threshold, 20% at 9x threshold
-			if closest_diff < float('inf'):
-				match_quality = 200 / (1 + (closest_diff / perfect_threshold))
-			else:
-				match_quality = 0.0  # Only 0 if no patterns exist at all
-			match_qualities[tf_choice_index] = match_quality
-			
-			if any_perfect == 'no':
-				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} (size {matched_pattern_size}): No patterns matched threshold {perfect_threshold:.2f}% relative tolerance. Current pattern: {[f'{v:.2f}%' for v in current_pattern_subset]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}% relative (Quality: {match_quality:.0f}%)")
-				# ALWAYS generate predictions from closest patterns (even if they don't meet threshold)
-				if moves and high_moves and low_moves:
-					final_moves = sum(moves) / len(moves)
-					high_final_moves = sum(high_moves) / len(high_moves)
-					low_final_moves = sum(low_moves) / len(low_moves)
-					perfects[tf_choice_index] = 'active'  # Mark active even if match quality is low
-					pattern_sizes_used[tf_choice_index] = matched_pattern_size if matched_pattern_size is not None else 0
-					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Using pattern size {matched_pattern_size} (fallback successful)")
-				else:
-					final_moves = 0.0
-					high_final_moves = 0.0
-					low_final_moves = 0.0
-					perfects[tf_choice_index] = 'inactive'
-					pattern_sizes_used[tf_choice_index] = 0
-					debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No valid patterns at any size - marking INACTIVE")
-			elif moves and high_moves and low_moves:
-				# Only calculate averages if lists are non-empty
-				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} (size {matched_pattern_size}): Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped} (Quality: {match_quality:.0f}%)")
-				final_moves = sum(moves) / len(moves)
-				high_final_moves = sum(high_moves) / len(high_moves)
-				low_final_moves = sum(low_moves) / len(low_moves)
-				perfects[tf_choice_index] = 'active'
-				pattern_sizes_used[tf_choice_index] = matched_pattern_size if matched_pattern_size is not None else 0
-			else:
-				final_moves = 0.0
-				high_final_moves = 0.0
-				low_final_moves = 0.0
-				perfects[tf_choice_index] = 'inactive'
-				pattern_sizes_used[tf_choice_index] = 0
-				debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No valid weighted predictions - marking INACTIVE")
-
-		except Exception:
-			PrintException()
-			training_issues[tf_choice_index] = 1
-			final_moves = 0.0
-			high_final_moves = 0.0
-			low_final_moves = 0.0
-			perfects[tf_choice_index] = 'inactive'
-			pattern_sizes_used[tf_choice_index] = 0
+		# If all pattern sizes failed quality check (even size 2), skip prediction calculation
+		if matched_pattern_size is None:
+			debug_print(f"[DEBUG] {sym}: All pattern sizes failed quality check for {tf_choices[tf_choice_index]} - skipping prediction")
+			st['tf_choice_index'] = (tf_choice_index + 1) % len(tf_choices)
+			states[sym] = st
+			return
 
 		# Compute new high/low predictions
 		# For price predictions, we need the most recent (last) candle's close price
@@ -1758,6 +1846,23 @@ def step_coin(sym: str):
 		else:
 			high_tf_prices[tf_choice_index] = high_new_price
 			low_tf_prices[tf_choice_index] = low_new_price
+
+		# Calculate prediction candle for Hub chart visualization (only for active timeframes)
+		if perfects[tf_choice_index] != 'inactive':
+			from datetime import datetime, timedelta
+			current_tf = tf_choices[tf_choice_index]
+			tf_seconds = _timeframe_to_seconds(current_tf)
+			future_timestamp = datetime.now() + timedelta(seconds=tf_seconds)
+			
+			# Build prediction candle: open=current close, high/low from predictions, close from final_moves
+			pred_close = start_price * (1 + (final_moves / 100))
+			prediction_candles[current_tf] = {
+				'timestamp': future_timestamp.isoformat(),
+				'open': round(start_price, 2),
+				'high': round(high_tf_prices[tf_choice_index], 2),
+				'low': round(low_tf_prices[tf_choice_index], 2),
+				'close': round(pred_close, 2)
+			}
 
 		# Advance tf index; if full sweep complete, compute signals
 		tf_choice_index += 1
@@ -2042,9 +2147,16 @@ def step_coin(sym: str):
 			high_content = ' '.join(high_labeled)
 			last_bounds = _last_written_bounds.get(sym, {})
 			if last_bounds.get('low') != low_content or last_bounds.get('high') != high_content:
-				_atomic_write_text('low_bound_prices.txt', low_content)
-				_atomic_write_text('high_bound_prices.txt', high_content)
+				_atomic_write_text('low_bound_prices.dat', low_content)
+				_atomic_write_text('high_bound_prices.dat', high_content)
 				_last_written_bounds[sym] = {'low': low_content, 'high': high_content}
+
+			# Write prediction candles for Hub chart visualization
+			if prediction_candles:
+				_atomic_write_json('prediction_candles.json', prediction_candles)
+			
+			# Save prediction candles back to state and reset for next cycle
+			st['prediction_candles'] = {}
 
 			# cache display text for this coin (main loop prints everything on one screen)
 			try:
@@ -2109,7 +2221,7 @@ def step_coin(sym: str):
 					
 					# Get pattern size info for this timeframe
 					pattern_size_used = pattern_sizes_used[i] if i < len(pattern_sizes_used) else 0
-					size_indicator = f"[p{pattern_size_used}]" if pattern_size_used > 0 else "[p0]"
+					size_indicator = f"{pattern_size_used}p" if pattern_size_used > 0 else "0p"
 						
 					# For inactive timeframes, show status with debug info
 					if status == "INACTIVE":
@@ -2150,15 +2262,15 @@ def step_coin(sym: str):
 					# Add match quality indicator (ASCII only for Hub display compatibility)
 					quality = match_qualities[i] if i < len(match_qualities) else 100.0
 					if quality >= 100:
-						quality_icon = f"Signal: {quality:.0f}% PERFECT"  # Excellent match
+						quality_icon = f"Signal: {size_indicator} {quality:.0f}% MINT"  # Excellent match
 					elif quality >= 67:
-						quality_icon = f"Signal: {quality:.0f}% STRONG"  # Good match
+						quality_icon = f"Signal: {size_indicator}  {quality:.0f}% GOOD"  # Good match
 					elif quality >= 33:
-						quality_icon = f"Signal: {quality:.0f}% MARGINAL"  # Good match
+						quality_icon = f"Signal: {size_indicator}  {quality:.0f}% EDGE"  # Marginal match
 					else:
-						quality_icon = f"Signal: {quality:.0f}% WEAK"  # Weak match
+						quality_icon = f"Signal: {size_indicator}  {quality:.0f}% WEAK"  # Weak match
 						
-					lines.append(f"[{sym}]  {tf:>6s}: {status:6s} {bounds_text}   {quality_icon} {size_indicator}")
+					lines.append(f"[{sym}]  {tf:>6s}: {status:6s} {bounds_text}   {quality_icon}")
 								
 				# Combine all parts
 				display_cache[sym] = '\n'.join(lines)
@@ -2237,8 +2349,8 @@ def step_coin(sym: str):
 				except Exception:
 					pm = MIN_PROFIT_MARGIN
 
-				_atomic_write_text('futures_long_profit_margin.txt', str(pm))
-				_atomic_write_text('long_dca_signal.txt', str(longs))
+				_atomic_write_text('futures_long_profit_margin.dat', str(pm))
+				_atomic_write_text('long_dca_signal.dat', str(longs))
 
 				# short pm
 				current_pms = [m for m in margins if m != 0]
@@ -2252,11 +2364,11 @@ def step_coin(sym: str):
 				except Exception:
 					pm = MIN_PROFIT_MARGIN
 
-				_atomic_write_text('futures_short_profit_margin.txt', str(abs(pm)))
-				_atomic_write_text('short_dca_signal.txt', str(shorts))
+				_atomic_write_text('futures_short_profit_margin.dat', str(abs(pm)))
+				_atomic_write_text('short_dca_signal.dat', str(shorts))
 				
 				# Write inactive count for visual indication in hub
-				_atomic_write_text('inactive_count.txt', str(inactives))
+				_atomic_write_text('inactive_count.dat', str(inactives))
 
 			except Exception:
 				PrintException()

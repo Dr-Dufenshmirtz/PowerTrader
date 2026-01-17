@@ -4,6 +4,18 @@ Fully automated crypto trading powered by a custom price prediction AI and a str
 **Version:** Apollo Trader 26 
 **Features:** Debug mode, simulation mode, configurable themes, enhanced error handling, and comprehensive settings system.
 
+## Recent Updates
+
+**Enhanced AI Pattern Matching:**
+- **Kernel-Weighted Predictions**: AI now uses exponential distance weighting (e^(-diff/threshold)) where closer pattern matches contribute more to predictions. This significantly improves prediction accuracy by prioritizing the most similar historical patterns.
+- **Threshold Enforcement Setting**: New configurable strictness levels (Tight/Balanced/Loose/None) control how the AI filters and weights patterns. Tight mode uses only very similar patterns for highest confidence, while Loose mode considers a wider range for volatile markets.
+- **Improved Baseline Sensitivity**: Volatility-adaptive baseline increased from 0.05% to 0.1% (2× improvement) for better handling of micro-movements in low-volatility conditions.
+- **Prediction Candles**: AI now generates future-timestamped prediction candles visible on charts (white candle), showing multi-timeframe consensus on expected price action.
+
+**System Improvements:**
+- **Enhanced File Security**: System signal files now use `.dat` extension instead of `.txt` to discourage accidental manual editing that could corrupt trading data.
+- **Directionality Verification**: Confirmed pattern matching treats bull and bear patterns symmetrically using abs() for consistent behavior regardless of market direction.
+
 "It's an instance-based (kNN/kernel-style) predictor with online per-instance reliability weighting, used as a multi-timeframe trading signal." - ChatGPT on the type of AI used in this trading bot.
 
 So what exactly does that mean?
@@ -99,8 +111,9 @@ ApolloTrader uses a simple folder structure:
 
 Each coin folder contains:
 - Training data and pattern memories
-- Neural prediction files (`low_bound_prices.txt`, `high_bound_prices.txt`)
-- Trading signals and status files
+- Neural prediction files (`low_bound_prices.dat`, `high_bound_prices.dat`)
+- Trading signals and status files (`.dat` extension to discourage manual editing)
+- Prediction candles output (`prediction_candles.json`)
 
 ### Optional: Customize Trading Behavior
 
@@ -174,6 +187,16 @@ Access via **Settings → Training Settings** in the Hub menu:
 - **Auto-retrain**: Enable automatic retraining when data becomes stale
 - **Pattern Matching**: Configurable thresholds for pattern similarity (uses relative percentage matching)
 - **Volatility Adaptation**: Training automatically adjusts matching thresholds based on each coin's volatility (4.0x multiplier)
+- **Threshold Enforcement** (Tight/Balanced/Loose/None): Controls how strictly the AI filters patterns:
+  - **Tight (1×)**: Only uses very similar patterns, highest confidence but fewer data points
+  - **Balanced (2×)**: Default setting, good balance between confidence and coverage
+  - **Loose (5×)**: Uses wider range of patterns, more forgiving in volatile markets
+  - **None (10×)**: Minimal filtering, considers most available patterns
+  
+  This setting scales three algorithm parameters:
+  - Exclusion cutoff (how dissimilar before rejecting)
+  - Perfect match threshold (when to accept pattern size)
+  - Kernel bandwidth (distance weighting strength)
 
 Changes to settings files take effect immediately for the trading bot (hot-reload with caching).
 
@@ -266,10 +289,12 @@ The Enhanced Edition includes robust error recovery and improved AI pattern matc
 - **Graceful Degradation**: System continues operating even when individual components fail
 
 **Pattern Matching Improvements:**
+- **Kernel-Weighted Averaging**: Predictions use exponential distance weighting (e^(-diff/threshold)) where closer pattern matches contribute more to the final prediction. Weighting strength scales with threshold enforcement setting.
 - **Relative Threshold Matching**: Thresholds are now relative to pattern magnitude (percentage-based)
 - **Scale-Invariant**: Works consistently across different price levels and market conditions
 - **Volatility-Based Adaptation**: Thresholds automatically adjust using 4.0× average volatility
-- **Zero-Value Protection**: Uses 0.1% baseline for near-zero patterns (prevents division-by-zero)
+- **Zero-Value Protection**: Uses 0.1% baseline for near-zero patterns (prevents division-by-zero, 2× previous value)
+- **Threshold Enforcement Setting**: Configurable strictness (Tight/Balanced/Loose/None) for pattern filtering
 - **Simplified Algorithm**: Removed complex PID controller in favor of transparent volatility-based system
 
 ### Chart & UI Improvements
@@ -277,6 +302,7 @@ The Enhanced Edition includes robust error recovery and improved AI pattern matc
 - **Chart Refresh Rate**: Configurable update interval (default: 10 seconds)
 - **Neural Level Display**: Shows only timeframe labels on chart (1h, 2h, etc.) with automatic overlap hiding
 - **Last Neurals Timestamp**: Charts display when neural predictions were last updated
+- **Prediction Candles**: AI-generated future candle showing expected price action across all timeframes. Displayed as white filled candle extending beyond current price data. OHLC values represent multi-timeframe consensus prediction.
 - **Optimized Padding**: Improved chart margins for better label visibility
 - **Flow Status Indicators**: Visual checkmarks (✓) and hourglasses (⧗) show system state between stages
 

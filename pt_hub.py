@@ -155,6 +155,7 @@ CHART_DCA_LINE = "#FF4081"
 CHART_ASK_LINE = "#FFD54F"
 CHART_BID_LINE = "#00E5FF"
 CHART_ACCOUNT_LINE = "#00E5FF"
+CHART_PREDICTION = "#E6EDF3"
 
 # Font settings (Modern Segoe UI)
 LOG_FONT_FAMILY = "Cascadia Mono"
@@ -186,6 +187,7 @@ DEFAULT_THEME = {
     "chart_ask_line": CHART_ASK_LINE,
     "chart_bid_line": CHART_BID_LINE,
     "chart_account_line": CHART_ACCOUNT_LINE,
+    "chart_prediction": CHART_PREDICTION,
     "font_family": "Segoe UI",
     "font_size": 11,
     "log_font_family": "Cascadia Mono",
@@ -199,7 +201,7 @@ def _load_theme_settings():
     global DARK_BG, DARK_BG2, DARK_PANEL, DARK_PANEL2, DARK_BORDER
     global DARK_FG, DARK_MUTED, DARK_ACCENT, DARK_ACCENT2, DARK_SELECT_BG, DARK_SELECT_FG
     global CHART_CANDLE_UP, CHART_CANDLE_DOWN, CHART_NEURAL_LONG, CHART_NEURAL_SHORT
-    global CHART_SELL_LINE, CHART_DCA_LINE, CHART_ASK_LINE, CHART_BID_LINE, CHART_ACCOUNT_LINE
+    global CHART_SELL_LINE, CHART_DCA_LINE, CHART_ASK_LINE, CHART_BID_LINE, CHART_ACCOUNT_LINE, CHART_PREDICTION
     global LOG_FONT_FAMILY, LOG_FONT_SIZE, CHART_FONT_FAMILY, CHART_LABEL_FONT_SIZE
     
     # Check if custom theme path is provided
@@ -226,7 +228,7 @@ def _load_theme_settings():
         global DARK_BG, DARK_BG2, DARK_PANEL, DARK_PANEL2, DARK_BORDER, DARK_FG, LIVE_OUTPUT_FG
         global DARK_MUTED, DARK_ACCENT, DARK_ACCENT2, DARK_SELECT_BG, DARK_SELECT_FG
         global CHART_CANDLE_UP, CHART_CANDLE_DOWN, CHART_NEURAL_LONG, CHART_NEURAL_SHORT
-        global CHART_SELL_LINE, CHART_DCA_LINE, CHART_ASK_LINE, CHART_BID_LINE, CHART_ACCOUNT_LINE
+        global CHART_SELL_LINE, CHART_DCA_LINE, CHART_ASK_LINE, CHART_BID_LINE, CHART_ACCOUNT_LINE, CHART_PREDICTION
         global LOG_FONT_FAMILY, LOG_FONT_SIZE, CHART_FONT_FAMILY, CHART_LABEL_FONT_SIZE
         
         DARK_BG = theme.get("bg", DARK_BG)
@@ -250,6 +252,7 @@ def _load_theme_settings():
         CHART_ASK_LINE = theme.get("chart_ask_line", CHART_ASK_LINE)
         CHART_BID_LINE = theme.get("chart_bid_line", CHART_BID_LINE)
         CHART_ACCOUNT_LINE = theme.get("chart_account_line", CHART_ACCOUNT_LINE)
+        CHART_PREDICTION = theme.get("chart_prediction", CHART_PREDICTION)
         LOG_FONT_FAMILY = theme.get("log_font_family", LOG_FONT_FAMILY)
         LOG_FONT_SIZE = theme.get("log_font_size", LOG_FONT_SIZE)
         CHART_FONT_FAMILY = theme.get("chart_font_family", CHART_FONT_FAMILY)
@@ -687,6 +690,7 @@ DEFAULT_TRAINING_CONFIG = {
     "max_threshold": 25.0,
     "pattern_size": 4,
     "enable_pattern_fallback": True,
+    "threshold_enforcement": "Balanced",
     "weight_base_step": 0.25,
     "weight_step_cap_multiplier": 2.0,
     "weight_threshold_base": 0.1,
@@ -899,7 +903,7 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
 
 def read_price_levels_from_html(path: str) -> List[Tuple[str, float]]:
     """
-    pt_thinker writes labeled boundaries into low_bound_prices.txt / high_bound_prices.txt.
+    pt_thinker writes labeled boundaries into low_bound_prices.dat / high_bound_prices.dat.
 
     Format: "1h:43210.1 2h:43100.0 4h:42950.5"
 
@@ -984,14 +988,14 @@ def read_int_from_file(path: str) -> int:
         return 0
 
 def read_short_signal(folder: str) -> int:
-    txt = os.path.join(folder, "short_dca_signal.txt")
+    txt = os.path.join(folder, "short_dca_signal.dat")
     if os.path.isfile(txt):
         return read_int_from_file(txt)
     else:
         return 0
 
 def read_inactive_count(folder: str) -> int:
-    txt = os.path.join(folder, "inactive_count.txt")
+    txt = os.path.join(folder, "inactive_count.dat")
     if os.path.isfile(txt):
         return read_int_from_file(txt)
     else:
@@ -1250,8 +1254,8 @@ class CandleChart(ttk.Frame):
         candles = self.fetcher.get_klines(self.coin, tf, limit=limit)
 
         folder = coin_folders.get(self.coin, "")
-        low_path = os.path.join(folder, "low_bound_prices.txt")
-        high_path = os.path.join(folder, "high_bound_prices.txt")
+        low_path = os.path.join(folder, "low_bound_prices.dat")
+        high_path = os.path.join(folder, "high_bound_prices.dat")
 
         # --- Cached neural reads (per path, by mtime) ---
         if not hasattr(self, "_neural_cache"):
@@ -1276,7 +1280,7 @@ class CandleChart(ttk.Frame):
         long_levels_labeled = filter_neural_levels_by_timeframe(long_levels_all, tf)
         short_levels_labeled = filter_neural_levels_by_timeframe(short_levels_all, tf)
 
-        long_sig_path = os.path.join(folder, "long_dca_signal.txt")
+        long_sig_path = os.path.join(folder, "long_dca_signal.dat")
         long_sig = _cached(long_sig_path, read_int_from_file, 0) if folder else 0
         short_sig = read_short_signal(folder) if folder else 0
 
@@ -1336,10 +1340,63 @@ class CandleChart(ttk.Frame):
         for r in rects:
             self.ax.add_patch(r)
 
+        # Draw prediction candle (white outlined) for selected timeframe
+        pred_x = None
+        pred_candle = None
+        try:
+            pred_path = os.path.join(folder, "prediction_candles.json")
+            if folder and os.path.isfile(pred_path):
+                with open(pred_path, "r", encoding="utf-8") as f:
+                    pred_data = json.load(f)
+                
+                pred_candle = pred_data.get(tf)
+                if pred_candle:
+                    pred_x = len(candles)  # Position after last regular candle
+                    pred_o = float(pred_candle["open"])
+                    pred_c = float(pred_candle["close"])
+                    pred_h = float(pred_candle["high"])
+                    pred_l = float(pred_candle["low"])
+                    
+                    # White color for prediction candle
+                    pred_color = CHART_PREDICTION
+                    
+                    # Draw wick (solid like regular candles)
+                    self.ax.plot([pred_x, pred_x], [pred_l, pred_h], linewidth=1, color=pred_color)
+                    
+                    # Draw body (filled like regular candles)
+                    pred_bottom = min(pred_o, pred_c)
+                    pred_height = abs(pred_c - pred_o)
+                    if pred_height < 1e-12:
+                        pred_height = 1e-12
+                    
+                    pred_rect = Rectangle(
+                        (pred_x - 0.35, pred_bottom),
+                        0.7,
+                        pred_height,
+                        facecolor=pred_color,
+                        edgecolor=pred_color,
+                        linewidth=1,
+                        alpha=1.0,
+                    )
+                    self.ax.add_patch(pred_rect)
+        except Exception:
+            pass
+
         # Lock y-limits to candle range so overlay lines can go offscreen without expanding the chart.
         try:
-            y_low = min(float(c["low"]) for c in candles)
-            y_high = max(float(c["high"]) for c in candles)
+            all_lows = [float(c["low"]) for c in candles]
+            all_highs = [float(c["high"]) for c in candles]
+            
+            # Include prediction candle in y-limits if present
+            if pred_candle is not None:
+                try:
+                    all_lows.append(float(pred_candle["low"]))
+                    all_highs.append(float(pred_candle["high"]))
+                except Exception:
+                    pass
+            
+            y_low = min(all_lows)
+            y_high = max(all_highs)
             pad = (y_high - y_low) * 0.03
             if not math.isfinite(pad) or pad <= 0:
                 pad = max(abs(y_low) * 0.001, 1e-6)
@@ -1559,7 +1616,11 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
-        self.ax.set_xlim(-0.5, (len(candles) - 0.5) + 0.6)
+        # Set x-axis limits (include prediction candle if present)
+        max_x = (len(candles) - 0.5) + 0.6
+        if pred_x is not None:
+            max_x = pred_x + 0.6
+        self.ax.set_xlim(-0.5, max_x)
 
         self.ax.set_title(f"{self.coin} ({tf})", color=DARK_FG, fontsize=CHART_LABEL_FONT_SIZE, fontfamily=CHART_FONT_FAMILY)
 
@@ -6525,7 +6586,7 @@ class ApolloHub(tk.Tk):
             if not folder:
                 return None
             
-            signal_path = os.path.join(folder, "long_dca_signal.txt")
+            signal_path = os.path.join(folder, "long_dca_signal.dat")
             try:
                 with open(signal_path, "r", encoding="utf-8") as f:
                     signal = int(float((f.read() or "0").strip()))
@@ -6537,7 +6598,7 @@ class ApolloHub(tk.Tk):
                 return None
             
             # Read predicted low prices (buy entry levels)
-            low_path = os.path.join(folder, "low_bound_prices.txt")
+            low_path = os.path.join(folder, "low_bound_prices.dat")
             low_levels = read_price_levels_from_html(low_path)
             
             if not low_levels:
@@ -7142,7 +7203,7 @@ class ApolloHub(tk.Tk):
             mt_candidates: List[float] = []
 
             # Long signal
-            long_path = os.path.join(folder, "long_dca_signal.txt")
+            long_path = os.path.join(folder, "long_dca_signal.dat")
             if os.path.isfile(long_path):
                 long_sig = _cached(long_path, read_int_from_file, 0)
                 try:
@@ -7151,7 +7212,7 @@ class ApolloHub(tk.Tk):
                     pass
 
             # Short signal (prefer txt; fallback to memory.json)
-            short_txt = os.path.join(folder, "short_dca_signal.txt")
+            short_txt = os.path.join(folder, "short_dca_signal.dat")
             if os.path.isfile(short_txt):
                 short_sig = _cached(short_txt, read_int_from_file, 0)
                 try:
@@ -7168,7 +7229,7 @@ class ApolloHub(tk.Tk):
                         pass
 
             # Inactive count for visual indication
-            inactive_path = os.path.join(folder, "inactive_count.txt")
+            inactive_path = os.path.join(folder, "inactive_count.dat")
             if os.path.isfile(inactive_path):
                 inactive_count = _cached(inactive_path, read_int_from_file, 0)
 
@@ -8987,36 +9048,60 @@ class ApolloHub(tk.Tk):
             font=("TkDefaultFont", 8, "bold")
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 15))
 
+        # Threshold enforcement dropdown
+        ttk.Label(learning_frame, text="Threshold enforcement:").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
+        threshold_enforcement_var = tk.StringVar(value=cfg.get("threshold_enforcement", "Balanced"))
+        enforcement_combo = ttk.Combobox(
+            learning_frame,
+            textvariable=threshold_enforcement_var,
+            values=["Tight", "Balanced", "Loose", "None"],
+            state="readonly",
+            width=12
+        )
+        enforcement_combo.grid(row=3, column=1, sticky="w", pady=6)
+        
         ttk.Label(
             learning_frame,
-            text="Volatility-adaptive threshold: System automatically scales threshold based on market conditions (4.0x volatility).",
+            text="Controls pattern filtering strictness:\n"
+                 "  • Tight (1×): High confidence, uses only very similar patterns\n"
+                 "  • Balanced (2×): Default, good balance of quality and coverage\n"
+                 "  • Loose (5×): More forgiving, better for volatile markets\n"
+                 "  • None (10×): Minimal filtering, considers most patterns",
+            foreground=DARK_FG,
+            font=("TkDefaultFont", 8),
+            wraplength=550
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        ttk.Label(
+            learning_frame,
+            text="Volatility-adaptive threshold: System automatically scales threshold based on market conditions.",
             foreground=DARK_FG,
             wraplength=550
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # Minimum threshold
-        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
         min_threshold_var = tk.StringVar(value=str(cfg.get("min_threshold", 10.0)))
-        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=4, column=1, sticky="w", pady=6)
+        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=6, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
             text="Lower bound for relative threshold (prevents too strict matching in low volatility)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # Maximum threshold
-        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=6)
         max_threshold_var = tk.StringVar(value=str(cfg.get("max_threshold", 20.0)))
-        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=6, column=1, sticky="w", pady=6)
+        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=8, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
             text="Upper bound for relative threshold (caps volatility scaling to prevent too loose matching)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(
             learning_frame,
@@ -9024,7 +9109,7 @@ class ApolloHub(tk.Tk):
             foreground=DARK_FG,
             font=("TkDefaultFont", 8, "italic"),
             wraplength=550
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Advanced Weight System Section
         advanced_frame = ttk.LabelFrame(frm, text=" Advanced Weight System ", padding=15)
@@ -9313,6 +9398,12 @@ class ApolloHub(tk.Tk):
                     messagebox.showerror("Validation Error", "Pattern size must be between 2 and 10 candles")
                     return
                 
+                # Validate threshold enforcement
+                threshold_enforcement = threshold_enforcement_var.get()
+                if threshold_enforcement not in ["Tight", "Balanced", "Loose", "None"]:
+                    messagebox.showerror("Validation Error", "Threshold enforcement must be Tight, Balanced, Loose, or None")
+                    return
+                
                 # Validate Phase 1-4 parameters
                 weight_base_step = float(weight_base_step_var.get())
                 weight_step_cap = float(weight_step_cap_var.get())
@@ -9375,6 +9466,7 @@ class ApolloHub(tk.Tk):
                     "max_threshold": max_threshold,
                     "pattern_size": pattern_size,
                     "enable_pattern_fallback": bool(enable_fallback_var.get()),
+                    "threshold_enforcement": threshold_enforcement_var.get(),
                     "weight_base_step": weight_base_step,
                     "weight_step_cap_multiplier": weight_step_cap,
                     "weight_threshold_base": weight_threshold_base,
@@ -9411,6 +9503,7 @@ class ApolloHub(tk.Tk):
                 pruning_sigma_var.set(str(defaults.get("pruning_sigma_level", 3.0)))
                 pattern_size_var.set(str(defaults.get("pattern_size", 4)))
                 enable_fallback_var.set(bool(defaults.get("enable_pattern_fallback", True)))
+                threshold_enforcement_var.set(defaults.get("threshold_enforcement", "Balanced"))
                 weight_base_step_var.set(str(defaults.get("weight_base_step", 0.25)))
                 weight_step_cap_var.set(str(defaults.get("weight_step_cap_multiplier", 2.0)))
                 weight_threshold_base_var.set(str(defaults.get("weight_threshold_base", 0.1)))

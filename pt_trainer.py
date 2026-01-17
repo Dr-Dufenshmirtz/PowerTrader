@@ -28,7 +28,9 @@ Key behavioral notes (informational only):
 	scale-invariant behavior across different price levels. Thresholds are
 	automatically adjusted based on volatility (5.0× average volatility) and
 	clamped to configured min/max bounds. Zero/tiny patterns use a
-	volatility-adaptive baseline (0.025× volatility) to prevent division-by-zero.
+	volatility-adaptive baseline (0.05× volatility, typically ~0.1%) to
+	prevent division-by-zero. Directionality-agnostic using abs() for both
+	bull and bear patterns.
 
 - Thinker/Trader integration:
 	The Thinker uses predicted highs/lows from each timeframe to decide
@@ -1579,7 +1581,7 @@ for current_pattern_size in pattern_sizes_to_train:
 										# This scales precision: small moves get tight absolute tolerances, large moves get proportional tolerances
 										# Use volatility-adaptive baseline to handle zero/tiny patterns consistently
 										# Scales noise floor with market: high volatility → higher baseline, low volatility → tighter baseline
-										baseline = max(abs(memory_candle), 0.025 * avg_volatility)
+										baseline = max(abs(memory_candle), 0.05 * avg_volatility)
 										difference = (abs(current_candle - memory_candle) / baseline) * 100
 										checks.append(difference)
 							
