@@ -27,6 +27,13 @@ Relevant behavior notes (informational only):
     `hub_data` directory so each component can run independently while the
     hub shows a unified view.
 
+- Coin Categories:
+    Coins are organized into three strategic categories with different trading behavior:
+    * Active Trading: Full buy/sell automation (counts toward position limits)
+    * Accumulation: Buy-only for long-term holding (stop-loss only sells, unlimited positions)
+    * Liquidation: Sell-only to exit positions (auto-removes at dust threshold, unlimited positions)
+    Color-coded in UI: Active (default), Accumulation (green), Liquidation (red/pink)
+
 - Auto-Start Thinker:
     After manual training completes successfully, the Thinker automatically
     starts (unless already running or in autopilot mode). This provides a
@@ -85,7 +92,7 @@ matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Segoe UI', 'Arial', 'DejaVu Sans']
 
 # Version: YY.MMDDHH (Year, Month, Day, Hour of last save)
-VERSION = "26.011613"
+VERSION = "26.011719"
 
 # Windows DPAPI encryption helpers
 def _encrypt_with_dpapi(data: str) -> bytes:
@@ -610,7 +617,11 @@ class NeuralSignalTile(ttk.Frame):
 # Default configuration settings and file paths
 DEFAULT_SETTINGS = {
     "main_neural_dir": "",  # if blank, defaults to script directory
-    "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
+    "coins": {
+        "active": ["ETH", "SOL", "XRP", "LINK"],
+        "accumulate": ["BTC"],
+        "liquidate": ["DOGE"]
+    },
     "default_timeframe": "1hour",
     "timeframes": [
         "1min", "5min", "15min", "30min",
@@ -725,9 +736,43 @@ def _safe_read_json(path: str) -> Optional[dict]:
 
 def _safe_write_json(path: str, data: dict) -> None:
     tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    
+    # Windows-specific: retry logic for file locks (antivirus, etc.)
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            # Write to temp file
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            
+            # Try atomic replace (works on Unix and Windows 3.3+)
+            os.replace(tmp, path)
+            return  # Success!
+            
+        except (PermissionError, OSError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(0.2)  # Wait for file lock release
+                continue
+            
+            # Last resort: direct write (not atomic, but works when file is locked for reading)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                # Clean up temp file if it exists
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass  # Ignore cleanup errors
+                return  # Direct write succeeded
+            except Exception:
+                # Clean up and re-raise original error
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                raise e  # Re-raise original permission error
 
 def _load_trading_config() -> dict:
     """Load trading config with caching (similar to gui_settings pattern)."""
@@ -1987,7 +2032,7 @@ class AccountValueChart(ttk.Frame):
         
         # Set y-axis to start at 0 so fill reaches x-axis
         y_max = max(ys)
-        self.ax.set_ylim(0, y_max * 1.2)  # Add 20% padding at top
+        self.ax.set_ylim(0, y_max * 1.05)  # Add 5% padding at top
 
         # --- Trade dots (BUY / DCA / SELL) for ALL coins ---
         try:
@@ -2182,10 +2227,13 @@ class ApolloHub(tk.Tk):
         except Exception:
             # Fallback to simple geometry without position
             self.geometry("1400x820")
+        
+        # Create splash screen after geometry is set (will stay on top and cover hub during initialization)
+        self.splash = self._create_splash_screen()
 
-        # Set custom taskbar icon if at.ico exists in project directory
+        # Set custom taskbar icon if icon.ico exists in project directory
         # This gives the app a professional appearance in Windows taskbar
-        icon_path = os.path.join(os.path.dirname(__file__), "at.ico")
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
         if os.path.isfile(icon_path):
             try:
                 self.iconbitmap(icon_path)
@@ -2311,8 +2359,23 @@ class ApolloHub(tk.Tk):
         # account value chart widget (created in _build_layout)
         self.account_chart = None
 
-        # coin folders (neural outputs)
-        self.coins = [c.upper().strip() for c in self.settings["coins"]]
+        # coin folders (neural outputs) - combine all three categories
+        coins_dict = self.settings.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+        if isinstance(coins_dict, dict):
+            self.coins = (
+                coins_dict.get("active", []) + 
+                coins_dict.get("accumulate", []) + 
+                coins_dict.get("liquidate", [])
+            )
+            # Store category mappings for UI color coding
+            self._coin_categories = {
+                **{c: "active" for c in coins_dict.get("active", [])},
+                **{c: "accumulate" for c in coins_dict.get("accumulate", [])},
+                **{c: "liquidate" for c in coins_dict.get("liquidate", [])}
+            }
+        else:
+            self.coins = []
+            self._coin_categories = {}
 
         # On startup (like on Settings-save), create missing alt folders and copy the trainer into them.
         self._ensure_alt_coin_folders_and_trainer_on_startup()
@@ -2390,7 +2453,139 @@ class ApolloHub(tk.Tk):
         # Auto-start thinker if coins are trained (delayed to ensure UI is ready)
         self.after(2000, self._auto_start_thinker_if_trained)
 
+        # Maximize window after UI is fully rendered and sash positions are set
+        def _maximize_window():
+            try:
+                # Maximize main window first
+                self.state('zoomed')
+                
+                # Destroy splash screen after a delay to make transition less flashy
+                def _destroy_splash():
+                    try:
+                        if hasattr(self, 'splash') and self.splash:
+                            self.splash.destroy()
+                            self.splash = None
+                    except Exception:
+                        pass
+                
+                # Wait 2 seconds after maximizing before removing splash
+                self.after(2000, _destroy_splash)
+            except Exception:
+                pass
+        self.after(100, _maximize_window)
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _create_splash_screen(self) -> tk.Toplevel:
+        """Create and display a splash screen while the main window loads."""
+        splash = tk.Toplevel()
+        splash.overrideredirect(True)  # Remove window decorations
+        splash.attributes('-topmost', True)  # Keep splash above main window
+        
+        # Load splash.jpg image
+        try:
+            from PIL import Image, ImageTk
+            splash_image_path = os.path.join(os.path.dirname(__file__), "splash.jpg")
+            
+            if os.path.isfile(splash_image_path):
+                # Load the splash image and resize to half size
+                img = Image.open(splash_image_path)
+                original_width, original_height = img.size
+                splash_width = original_width // 2
+                splash_height = original_height // 2
+                img = img.resize((splash_width, splash_height), Image.Resampling.LANCZOS)
+                
+                # Add border thickness
+                border_thickness = 5
+                total_width = splash_width + (border_thickness * 2)
+                total_height = splash_height + (border_thickness * 2)
+                
+                # Get screen dimensions for centering
+                screen_width = splash.winfo_screenwidth()
+                screen_height = splash.winfo_screenheight()
+                
+                # Center splash screen
+                x = (screen_width - total_width) // 2
+                y = (screen_height - total_height) // 2
+                splash.geometry(f"{total_width}x{total_height}+{x}+{y}")
+                
+                # Set background to border color
+                splash.configure(bg=DARK_ACCENT)
+                
+                # Convert image for tkinter
+                photo = ImageTk.PhotoImage(img)
+                
+                # Create container frame for image and text overlay
+                container = tk.Frame(splash, bg=DARK_ACCENT)
+                container.pack(fill="both", expand=True)
+                
+                # Create canvas to overlay text directly on image (truly transparent)
+                canvas = tk.Canvas(
+                    container,
+                    width=splash_width,
+                    height=splash_height,
+                    bg=DARK_ACCENT,
+                    highlightthickness=0
+                )
+                canvas.place(x=border_thickness, y=border_thickness)
+                
+                # Draw image on canvas
+                canvas.create_image(0, 0, anchor="nw", image=photo)
+                canvas.image = photo  # Keep reference to prevent garbage collection
+                
+                # Draw text directly on canvas (no background box)
+                canvas.create_text(
+                    splash_width - 210,
+                    splash_height - 172,
+                    text="Fueling up, prepare for launch...",
+                    font=("Segoe UI", 10, "bold"),
+                    fill=DARK_ACCENT
+                )
+                
+                # Update splash to ensure it's visible
+                splash.update()
+                
+                return splash
+        except Exception as e:
+            # If image loading fails, create a simple fallback splash
+            pass
+        
+        # Fallback splash if image loading failed
+        screen_width = splash.winfo_screenwidth()
+        screen_height = splash.winfo_screenheight()
+        splash_width = 500
+        splash_height = 300
+        x = (screen_width - splash_width) // 2
+        y = (screen_height - splash_height) // 2
+        splash.geometry(f"{splash_width}x{splash_height}+{x}+{y}")
+        splash.configure(bg=DARK_BG)
+        
+        frame = tk.Frame(splash, bg=DARK_ACCENT, bd=2, relief="solid")
+        frame.pack(fill="both", expand=True)
+        
+        inner_frame = tk.Frame(frame, bg=DARK_BG)
+        inner_frame.pack(fill="both", expand=True, padx=2, pady=2)
+        
+        title_label = tk.Label(
+            inner_frame,
+            text="APOLLO TRADER",
+            font=("Segoe UI", 36, "bold"),
+            bg=DARK_BG,
+            fg=DARK_ACCENT
+        )
+        title_label.pack(pady=(80, 10))
+        
+        version_label = tk.Label(
+            inner_frame,
+            text=f"Version {VERSION}",
+            font=("Segoe UI", 12),
+            bg=DARK_BG,
+            fg=DARK_FG
+        )
+        version_label.pack(pady=(0, 80))
+        
+        splash.update()
+        return splash
 
     # Theme styling methods
     def _apply_forced_dark_mode(self) -> None:
@@ -2576,6 +2771,38 @@ class ApolloHub(tk.Tk):
                 bordercolor=DARK_ACCENT2,
                 padding=(10, 6),
             )
+            
+            # Accumulation coin tabs (subtle green - high alpha)
+            accumulate_color = CHART_CANDLE_UP  # Green
+            style.configure(
+                "ChartTabAccumulate.TButton",
+                background=DARK_BG2,
+                foreground=accumulate_color,
+                bordercolor=DARK_BORDER,
+                padding=(10, 6),
+            )
+            style.map(
+                "ChartTabAccumulate.TButton",
+                background=[("active", DARK_PANEL2), ("pressed", DARK_PANEL)],
+                foreground=[("active", accumulate_color)],
+                bordercolor=[("active", DARK_ACCENT2), ("focus", DARK_ACCENT)],
+            )
+            
+            # Liquidation coin tabs (subtle red - high alpha)
+            liquidate_color = CHART_CANDLE_DOWN  # Red/Pink
+            style.configure(
+                "ChartTabLiquidate.TButton",
+                background=DARK_BG2,
+                foreground=liquidate_color,
+                bordercolor=DARK_BORDER,
+                padding=(10, 6),
+            )
+            style.map(
+                "ChartTabLiquidate.TButton",
+                background=[("active", DARK_PANEL2), ("pressed", DARK_PANEL)],
+                foreground=[("active", liquidate_color)],
+                bordercolor=[("active", DARK_ACCENT2), ("focus", DARK_ACCENT)],
+            )
         except Exception:
             pass
 
@@ -2667,8 +2894,26 @@ class ApolloHub(tk.Tk):
             merged["main_neural_dir"] = os.path.abspath(os.path.dirname(__file__))
         
         # Normalize coin symbols to uppercase and strip whitespace
-        # This ensures consistent coin folder names and case-insensitive matching
-        merged["coins"] = [c.upper().strip() for c in merged.get("coins", [])]
+        # Migrate old format (list) to new format (dict with categories)
+        coins_raw = merged.get("coins", [])
+        if isinstance(coins_raw, list):
+            # Old format: migrate to new three-category structure (all coins go to active)
+            merged["coins"] = {
+                "active": [c.upper().strip() for c in coins_raw if c.strip()],
+                "accumulate": [],
+                "liquidate": []
+            }
+        elif isinstance(coins_raw, dict):
+            # New format: normalize each category
+            merged["coins"] = {
+                "active": [c.upper().strip() for c in coins_raw.get("active", []) if c.strip()],
+                "accumulate": [c.upper().strip() for c in coins_raw.get("accumulate", []) if c.strip()],
+                "liquidate": [c.upper().strip() for c in coins_raw.get("liquidate", []) if c.strip()]
+            }
+        else:
+            # Fallback: empty categories
+            merged["coins"] = {"active": [], "accumulate": [], "liquidate": []}
+        
         return merged
 
     def _save_settings(self) -> None:
@@ -2703,7 +2948,17 @@ class ApolloHub(tk.Tk):
             - copy neural_trainer.py from the MAIN folder into the new coin folder
         """
         try:
-            coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
+            # Get all coins from all three categories
+            coins_dict = self.settings.get("coins", {})
+            if isinstance(coins_dict, dict):
+                all_coins = (
+                    coins_dict.get("active", []) + 
+                    coins_dict.get("accumulate", []) + 
+                    coins_dict.get("liquidate", [])
+                )
+            else:
+                all_coins = []
+            coins = [str(c).strip().upper() for c in all_coins if str(c).strip()]
             main_dir = (self.settings.get("main_neural_dir") or self.project_dir or os.getcwd()).strip()
 
             trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
@@ -2738,7 +2993,17 @@ class ApolloHub(tk.Tk):
         """
         try:
             main_dir = (self.settings.get("main_neural_dir") or self.project_dir or os.getcwd()).strip()
-            coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
+            # Get all coins from all three categories
+            coins_dict = self.settings.get("coins", {})
+            if isinstance(coins_dict, dict):
+                all_coins = (
+                    coins_dict.get("active", []) + 
+                    coins_dict.get("accumulate", []) + 
+                    coins_dict.get("liquidate", [])
+                )
+            else:
+                all_coins = []
+            coins = [str(c).strip().upper() for c in all_coins if str(c).strip()]
             
             for coin in coins:
                 coin_dir = os.path.join(main_dir, coin)
@@ -3452,13 +3717,26 @@ class ApolloHub(tk.Tk):
             # style selected tab
             for txt, b in self._chart_tab_buttons.items():
                 try:
-                    b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
+                    if txt == name:
+                        b.configure(style="ChartTabSelected.TButton")
+                    else:
+                        # Restore category-specific style when not selected
+                        category = self._coin_categories.get(txt, "active")
+                        if category == "accumulate":
+                            b.configure(style="ChartTabAccumulate.TButton")
+                        elif category == "liquidate":
+                            b.configure(style="ChartTabLiquidate.TButton")
+                        else:
+                            b.configure(style="ChartTab.TButton")
                 except Exception:
                     pass
             
             # Update neural tiles to highlight the selected coin
             if hasattr(self, "neural_tiles"):
                 for coin, tile in self.neural_tiles.items():
+                    # Skip removed coins (still in dict but hidden from display)
+                    if coin not in self.coins:
+                        continue
                     try:
                         tile.set_selected(coin == name)
                     except Exception:
@@ -3531,10 +3809,19 @@ class ApolloHub(tk.Tk):
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
 
+            # Determine button style based on coin category
+            category = self._coin_categories.get(coin, "active")
+            if category == "accumulate":
+                btn_style = "ChartTabAccumulate.TButton"
+            elif category == "liquidate":
+                btn_style = "ChartTabLiquidate.TButton"
+            else:
+                btn_style = "ChartTab.TButton"
+            
             btn = ttk.Button(
                 self.chart_tabs_bar,
                 text=coin,
-                style="ChartTab.TButton",
+                style=btn_style,
                 command=lambda c=coin: self._show_chart_page(c),
             )
             self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
@@ -3992,21 +4279,36 @@ class ApolloHub(tk.Tk):
         except Exception:
             pass
 
-    def start_neural(self) -> None:
-        # Check training status before allowing manual start
-        status_map = self._training_status_map()
-        not_trained = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
-        stale_coins = self._get_stale_coins()
-        
-        all_needs_training = list(set(not_trained + stale_coins))
-        
-        if all_needs_training:
-            messagebox.showwarning(
-                "Training Required",
-                f"Training is stale or missing for: {', '.join(sorted(all_needs_training))}\n\n"
-                f"Use Autopilot to train and start automatically, or train manually first."
-            )
-            return
+    def start_neural(self, skip_training_check: bool = False) -> None:
+        # Check training status before allowing manual start (skip if called from autopilot)
+        if not skip_training_check:
+            status_map = self._training_status_map()
+            not_trained = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
+            trained_coins = [c for c, s in status_map.items() if s == "TRAINED"]
+            stale_coins = self._get_stale_coins()
+            
+            all_needs_training = list(set(not_trained + stale_coins))
+            
+            # Require at least one trained coin to start
+            if all_needs_training and not trained_coins:
+                messagebox.showwarning(
+                    "Training Required",
+                    f"No coins are trained yet.\n\n"
+                    f"Need training: {', '.join(sorted(all_needs_training))}\n\n"
+                    f"Use Autopilot to train and start automatically, or train manually first."
+                )
+                return
+            
+            # Warn about untrained coins that will be skipped
+            if all_needs_training:
+                result = messagebox.askokcancel(
+                    "Start Thinker",
+                    f"Trained coins: {', '.join(sorted(trained_coins))}\n\n"
+                    f"Untrained coins will be skipped: {', '.join(sorted(all_needs_training))}\n\n"
+                    f"Continue?"
+                )
+                if not result:
+                    return
         
         # Reset thinker-ready gate file (prevents stale "ready" from a prior run)
         try:
@@ -4017,21 +4319,36 @@ class ApolloHub(tk.Tk):
 
         self._start_process(self.proc_neural, log_q=self.runner_log_q, prefix="[THINKER] ")
 
-    def start_trader(self) -> None:
-        # Check training status before allowing manual start
-        status_map = self._training_status_map()
-        not_trained = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
-        stale_coins = self._get_stale_coins()
-        
-        all_needs_training = list(set(not_trained + stale_coins))
-        
-        if all_needs_training:
-            messagebox.showwarning(
-                "Training Required",
-                f"Training is stale or missing for: {', '.join(sorted(all_needs_training))}\n\n"
-                f"Use Autopilot to train and start automatically, or train manually first."
-            )
-            return
+    def start_trader(self, skip_training_check: bool = False) -> None:
+        # Check training status before allowing manual start (skip if called from autopilot)
+        if not skip_training_check:
+            status_map = self._training_status_map()
+            not_trained = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
+            trained_coins = [c for c, s in status_map.items() if s == "TRAINED"]
+            stale_coins = self._get_stale_coins()
+            
+            all_needs_training = list(set(not_trained + stale_coins))
+            
+            # Require at least one trained coin to start
+            if all_needs_training and not trained_coins:
+                messagebox.showwarning(
+                    "Training Required",
+                    f"No coins are trained yet.\n\n"
+                    f"Need training: {', '.join(sorted(all_needs_training))}\n\n"
+                    f"Use Autopilot to train and start automatically, or train manually first."
+                )
+                return
+            
+            # Warn about untrained coins that will be skipped
+            if all_needs_training:
+                result = messagebox.askokcancel(
+                    "Start Trader",
+                    f"Trained coins: {', '.join(sorted(trained_coins))}\n\n"
+                    f"Untrained coins will be skipped: {', '.join(sorted(all_needs_training))}\n\n"
+                    f"Continue?"
+                )
+                if not result:
+                    return
         
         self._start_process(self.proc_trader, log_q=self.trader_log_q, prefix="[TRADER] ")
 
@@ -4145,7 +4462,7 @@ class ApolloHub(tk.Tk):
 
             # Start trader if not already running
             if not (self.proc_trader.proc and self.proc_trader.proc.poll() is None):
-                self.start_trader()
+                self.start_trader(skip_training_check=True)  # Skip redundant check (autopilot already validated)
             return
 
         # Not ready yet — keep polling
@@ -4220,13 +4537,15 @@ class ApolloHub(tk.Tk):
         status_map = self._training_status_map()
         needs_training = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
         currently_training = [c for c, s in status_map.items() if s == "TRAINING"]
+        trained_coins = [c for c, s in status_map.items() if s == "TRAINED"]
         
         # Check staleness (always respect staleness_days from training_settings.json)
         stale_coins = self._get_stale_coins()
         
         all_needs_training = list(set(needs_training + stale_coins))
         
-        if all_needs_training or currently_training:
+        # Allow starting if at least one coin is trained (thinker will skip untrained coins)
+        if (all_needs_training or currently_training) and not trained_coins:
             # Phase 1: Training required or already in progress
             self._auto_mode_active = True
             self._auto_mode_phase = "TRAINING"
@@ -4259,11 +4578,22 @@ class ApolloHub(tk.Tk):
             # Poll for training completion
             self.after(2000, self._poll_auto_mode_training)
         else:
-            # Phase 2: Already trained, go straight to thinker→trader
+            # Phase 2: At least one coin trained, start thinker→trader (will skip untrained coins)
             self._auto_mode_active = True
             self._auto_mode_phase = "RUNNING"
             self._auto_start_trader_pending = True
-            self.start_neural()
+            
+            # Warn user about any untrained coins that will be skipped
+            if all_needs_training:
+                messagebox.showinfo(
+                    "🚀 Autopilot: Starting with Trained Coins",
+                    f"Trained coins: {', '.join(sorted(trained_coins))}\n\n"
+                    f"Untrained coins will be skipped: {', '.join(sorted(all_needs_training))}\n\n"
+                    f"The thinker will generate signals only for trained coins.\n"
+                    f"Train the remaining coins when ready."
+                )
+            
+            self.start_neural(skip_training_check=True)  # Skip redundant check (autopilot already validated)
             
             # Wait for runner to signal readiness before starting trader
             try:
@@ -4306,7 +4636,7 @@ class ApolloHub(tk.Tk):
             # All trained! Move to Phase 2: Start thinker→trader
             self._auto_mode_phase = "RUNNING"
             self._auto_start_trader_pending = True
-            self.start_neural()
+            self.start_neural(skip_training_check=True)  # Skip redundant check (autopilot already validated)
             
             # Wait for runner to signal readiness before starting trader
             try:
@@ -5330,7 +5660,86 @@ class ApolloHub(tk.Tk):
                         # Write success message to trader log
                         try:
                             if hasattr(self, 'trader_text') and self.trader_text.winfo_exists():
-                                msg = f"Account connected: ${total_account_value:.2f} (${buying_power:.2f} buying power, ${holdings_sell_value:.2f} in holdings)\n\n"
+                                # Build configuration summary
+                                from datetime import datetime
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                sim_mode = "SIMULATION" if self.settings.get("simulation_mode", False) else "LIVE"
+                                
+                                # Load trading settings
+                                trading_cfg = _load_trading_config()
+                                
+                                # Get coin configuration
+                                coins = self.settings.get("coins", {})
+                                active_coins = coins.get("active", [])
+                                accumulate_coins = coins.get("accumulate", [])
+                                liquidate_coins = coins.get("liquidate", [])
+                                
+                                # Get DCA settings
+                                dca = trading_cfg.get("dca", {})
+                                dca_levels = dca.get("levels", [])
+                                max_buys = dca.get("max_buys_per_window", 0)
+                                window_hours = dca.get("window_hours", 0)
+                                position_mult = dca.get("position_multiplier", 0)
+                                
+                                # Get profit margin settings
+                                profit = trading_cfg.get("profit_margin", {})
+                                trailing_gap = profit.get("trailing_gap_pct", 0)
+                                target_no_dca = profit.get("target_no_dca_pct", 0)
+                                target_with_dca = profit.get("target_with_dca_pct", 0)
+                                stop_loss = profit.get("stop_loss_pct", 0)
+                                
+                                # Get entry/exit signals
+                                entry = trading_cfg.get("entry_signals", {})
+                                exit_sig = trading_cfg.get("exit_signals", {})
+                                long_signal_min = entry.get("long_signal_min", 0)
+                                short_signal_max = entry.get("short_signal_max", 0)
+                                exit_short_min = exit_sig.get("short_signal_min", 0)
+                                exit_long_max = exit_sig.get("long_signal_max", 0)
+                                
+                                # Get position sizing
+                                sizing = trading_cfg.get("position_sizing", {})
+                                initial_alloc = sizing.get("initial_allocation_pct", 0)
+                                min_alloc_usd = sizing.get("min_allocation_usd", 0)
+                                max_positions = sizing.get("max_concurrent_positions", 0)
+                                
+                                # Build configuration message
+                                config_msg = (
+                                    f"Timestamp: {timestamp}\n"
+                                    f"Mode: {sim_mode}\n\n"
+                                    f"--- Coin Configuration ---\n"
+                                    f"  • Active: {', '.join(active_coins) if active_coins else 'None'}\n"
+                                    f"  • Accumulate: {', '.join(accumulate_coins) if accumulate_coins else 'None'}\n"
+                                    f"  • Liquidate: {', '.join(liquidate_coins) if liquidate_coins else 'None'}\n\n"
+                                    f"--- DCA Strategy ---\n"
+                                    f"  • Levels: {', '.join(f'{level}%' for level in dca_levels)}\n"
+                                    f"  • Max Buys: {max_buys} per {window_hours}h window\n"
+                                    f"  • Position Multiplier: {position_mult}x\n\n"
+                                    f"--- Profit Management ---\n"
+                                    f"  • Trailing Gap: {trailing_gap}%\n"
+                                    f"  • Target (no DCA): {target_no_dca}%\n"
+                                    f"  • Target (with DCA): {target_with_dca}%\n"
+                                    f"  • Stop Loss: {stop_loss}%\n\n"
+                                    f"--- Entry & Exit Signals ---\n"
+                                    f"  • Entry Long Signal Min: {long_signal_min}\n"
+                                    f"  • Entry Short Signal Max: {short_signal_max}\n"
+                                    f"  • Exit Short Signal Min: {exit_short_min}\n"
+                                    f"  • Exit Long Signal Max: {exit_long_max}\n\n"
+                                    f"--- Position Sizing ---\n"
+                                    f"  • Initial Allocation: {initial_alloc}% of buying power\n"
+                                    f"  • Minimum Allocation: ${min_alloc_usd}\n"
+                                    f"  • Max Concurrent Positions: {max_positions}\n\n"
+                                    f"--- Risk Management ---\n"
+                                    f"  • Stop Loss: {stop_loss}%\n"
+                                    f"  • Max DCA Levels: {len(dca_levels)}\n"
+                                    f"  • Position Size Cap: ${min_alloc_usd} - {initial_alloc * 100}% buying power\n\n"
+                                )
+                                self.trader_text.insert("end", config_msg)
+                                
+                                # Now the account connected message
+                                msg = (
+                                    f"--- Account Management ---\n"
+                                    f"Account connected: ${total_account_value:.2f} (${buying_power:.2f} buying power, ${holdings_sell_value:.2f} in holdings)\n\n"
+                                )
                                 self.trader_text.insert("end", msg)
                         except Exception:
                             pass
@@ -5590,6 +5999,137 @@ class ApolloHub(tk.Tk):
         except Exception:
             pass  # Outer exception, skip silently
     
+    def _update_coin_list_if_changed(self) -> None:
+        """
+        Hot-reload coin list when settings file changes.
+        
+        - Detects when coins are added/removed from gui_settings.json
+        - Hides chart tabs and neural tiles for removed coins (e.g., dust cleanup)
+        - Re-shows tabs/tiles for re-added coins
+        - Uses mtime caching to avoid unnecessary file reads
+        - Restores selection highlighting after changes
+        """
+        try:
+            # Check if settings file has changed since last reload
+            settings_path = os.path.join(self.project_dir, "gui_settings.json")
+            if not os.path.isfile(settings_path):
+                return
+            
+            current_mtime = os.path.getmtime(settings_path)
+            last_mtime = getattr(self, "_coin_list_mtime", None)
+            
+            if last_mtime is not None and current_mtime == last_mtime:
+                return  # No change, skip
+            
+            # Reload settings file
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+            except Exception:
+                return  # Parse error, skip
+            
+            # Extract coin lists from three categories
+            coins_data = settings.get("coins", {})
+            if isinstance(coins_data, list):
+                # Old format (flat list) - no changes needed
+                new_coins = coins_data
+                new_categories = {}
+            else:
+                # New format (three categories dict)
+                active_coins = coins_data.get("active", [])
+                accumulate_coins = coins_data.get("accumulate", [])
+                liquidate_coins = coins_data.get("liquidate", [])
+                
+                new_coins = active_coins + accumulate_coins + liquidate_coins
+                new_categories = {}
+                for coin in active_coins:
+                    new_categories[coin] = "active"
+                for coin in accumulate_coins:
+                    new_categories[coin] = "accumulate"
+                for coin in liquidate_coins:
+                    new_categories[coin] = "liquidate"
+            
+            # Detect changes
+            old_coins = set(self.coins)
+            new_coins_set = set(new_coins)
+            
+            removed_coins = old_coins - new_coins_set
+            added_coins = new_coins_set - old_coins
+            
+            if not removed_coins and not added_coins:
+                # Coin list unchanged, just update mtime and return
+                self._coin_list_mtime = current_mtime
+                return
+            
+            # Handle removed coins (hide tabs and neural tiles)
+            for coin in removed_coins:
+                # Hide the coin button in chart tabs section
+                if coin in self._chart_tab_buttons:
+                    try:
+                        self._chart_tab_buttons[coin].grid_remove()  # Hide but don't destroy (preserves layout)
+                    except Exception:
+                        pass
+                
+                # Remove the neural tile from Neural Levels section
+                if hasattr(self, 'neural_tiles') and coin in self.neural_tiles:
+                    try:
+                        tile = self.neural_tiles[coin]
+                        # Reset visual state and hide (keep in dict for selection logic)
+                        tile.set_selected(False)
+                        tile.set_hover(False)
+                        tile.grid_forget()
+                        # Remove from WrapFrame's internal items list to hide from display
+                        if hasattr(self, 'neural_wrap') and hasattr(self.neural_wrap, '_items'):
+                            self.neural_wrap._items = [item for item in self.neural_wrap._items if item.w != tile]
+                        if hasattr(self, 'neural_wrap') and hasattr(self.neural_wrap, '_schedule_reflow'):
+                            self.neural_wrap._schedule_reflow()
+                    except Exception:
+                        pass
+            
+            # Update coin list and categories first
+            self.coins = new_coins
+            self._coin_categories = new_categories
+            
+            # Track if we need to delay highlighting restoration
+            needs_rebuild = bool(added_coins)
+            
+            # Handle added coins - rebuild neural overview to create tiles for new coins
+            if added_coins:
+                # Re-show chart buttons for any re-added coins
+                for coin in added_coins:
+                    if coin in self._chart_tab_buttons:
+                        try:
+                            self._chart_tab_buttons[coin].grid()
+                        except Exception:
+                            pass
+                # Note: New coins require Hub restart to create chart tabs
+                
+                # Rebuild entire neural overview to include new coin tiles
+                # Selection state is set automatically in _rebuild_neural_overview
+                if hasattr(self, 'neural_wrap'):
+                    try:
+                        self._rebuild_neural_overview()
+                    except Exception:
+                        pass
+            else:
+                # Handle removed coins only - restore highlighting immediately
+                if hasattr(self, '_current_chart_page') and hasattr(self, 'neural_tiles'):
+                    current_chart = self._current_chart_page
+                    for coin, tile in list(self.neural_tiles.items()):
+                        if coin not in self.coins:
+                            continue
+                        try:
+                            if tile.winfo_exists():
+                                tile.set_selected(coin == current_chart)
+                        except Exception:
+                            pass
+            
+            # Update mtime cache
+            self._coin_list_mtime = current_mtime
+            
+        except Exception:
+            pass  # Silent failure
+    
     def _display_startup_accuracy(self) -> None:
         """Display bounce accuracy and signal accuracy results for all coins on Hub startup."""
         try:
@@ -5626,21 +6166,24 @@ class ApolloHub(tk.Tk):
                         # No pattern-specific accuracy files found - check if coin has training files
                         if not is_coin_trained:
                             # No training data yet - add a helpful message
-                            msg = f"Training Status ({coin})\n"
-                            msg += f"Status: Not yet trained\n\n"
-                            msg += f"ℹ This coin has not been trained yet.\n"
-                            msg += f"Click 'Start Trainer' to begin training for {coin}.\n\n"
+                            from datetime import datetime
+                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            msg = f"Last Training Timestamp: {timestamp}\n\n"
+                            msg += f"--- TRAINING STATUS & PATTERN DATA ---\n"
+                            msg += f"{coin:6} NOT TRAINED\n\n"
                             
                             # Add to history
                             for line in msg.split("\n"):
                                 if line or msg.endswith("\n"):
                                     self.trainer_log_history[coin].append(line)
                             
-                            # Display if this coin is currently selected
+                            # Display if this coin is currently selected (show once at startup)
                             current_coin = (self.trainer_coin_var.get() or "").strip().upper()
                             if coin == current_coin:
                                 self.trainer_text.insert("end", msg)
                                 self.trainer_text.see("end")
+                                # Track that we've displayed this history
+                                self._trainer_log_displayed_lines[coin] = len(self.trainer_log_history[coin])
                                 # Reset scroll flag when loading initial status
                                 self._trainer_log_user_scrolled_away = False
                             
@@ -5650,11 +6193,11 @@ class ApolloHub(tk.Tk):
                             trained_coins_found += 1
                             
                             # Show message that coin is trained but accuracy display unavailable
-                            msg = f"Training Status ({coin})\n"
-                            msg += f"Status: TRAINED\n\n"
-                            msg += f"✓ {coin} has completed training and is ready for trading.\n"
-                            msg += f"ℹ Training accuracy details are not available (trained with older version).\n"
-                            msg += f"Retrain to see detailed accuracy metrics.\n\n"
+                            from datetime import datetime
+                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            msg = f"Last Training Timestamp: {timestamp}\n\n"
+                            msg += f"--- TRAINING STATUS & PATTERN DATA ---\n"
+                            msg += f"{coin:6} TRAINED   (accuracy data unavailable - retrain to see metrics)\n\n"
                             
                             # Add to history
                             for line in msg.split("\n"):
@@ -5666,6 +6209,8 @@ class ApolloHub(tk.Tk):
                             if coin == current_coin:
                                 self.trainer_text.insert("end", msg)
                                 self.trainer_text.see("end")
+                                # Track that we've displayed this history
+                                self._trainer_log_displayed_lines[coin] = len(self.trainer_log_history[coin])
                                 # Reset scroll flag when loading initial status
                                 self._trainer_log_user_scrolled_away = False
                             
@@ -5677,6 +6222,8 @@ class ApolloHub(tk.Tk):
                     
                     # Build message for all pattern sizes (lowest to highest)
                     full_msg = ""
+                    all_timestamps = []
+                    pattern_lines = []
                     
                     for pattern_size in pattern_sizes:
                         try:
@@ -5692,6 +6239,9 @@ class ApolloHub(tk.Tk):
                             
                             # Parse bounce accuracy content
                             timestamp = bounce_lines[0].replace('Last Updated: ', '').strip()
+                            
+                            # Collect all timestamps to find oldest
+                            all_timestamps.append(timestamp)
                             
                             # Skip the "Pattern Size:" line if present, then get average
                             avg_line_idx = 1
@@ -5747,35 +6297,38 @@ class ApolloHub(tk.Tk):
                                 except:
                                     pass  # Signal accuracy not critical, skip if unavailable
                             
-                            # Format and display for this pattern size
-                            msg = f"Training Accuracy Results ({coin}) - Pattern Size {pattern_size}\n"
-                            msg += f"Last trained: {timestamp}\n\n"
-                            msg += f"Average Limit-Breach Accuracy: {bounce_average}\n"
-                            if signal_average:
-                                msg += f"Average Signal Accuracy:       {signal_average}\n"
-                            msg += f"\nPer Timeframe:\n"
+                            # Format and display for this pattern size (compact format)
+                            # Read pattern count if available
+                            pattern_count = 0
+                            try:
+                                pattern_count_file = os.path.join(coin_folder, f'pattern_count_p{pattern_size}.txt')
+                                if os.path.isfile(pattern_count_file):
+                                    with open(pattern_count_file, 'r', encoding='utf-8') as f:
+                                        pattern_count = int(f.read().strip())
+                            except:
+                                pass
                             
-                            # Display per-timeframe results
-                            for tf in sorted(bounce_tf_dict.keys()):
-                                bounce_val = bounce_tf_dict[tf]
-                                if signal_tf_dict and tf in signal_tf_dict:
-                                    signal_val = signal_tf_dict[tf]
-                                    msg += f"  {tf:8} | Limit: {bounce_val:>6} | Signal: {signal_val:>6}\n"
-                                else:
-                                    msg += f"  {tf:8} | Limit: {bounce_val:>6}\n"
-                            msg += "\n"
+                            # Build just the data line (no header/timestamp)
+                            data_line = f"{coin:6} TRAINED   Pattern: {pattern_size}p {pattern_count:,}   Limit-Breach: {bounce_average}   Signal: {signal_average if signal_average else 'N/A'}\n"
+                            pattern_lines.append(data_line)
                             
-                            # Add warning if suspicious accuracy detected
-                            if suspicious_accuracy:
-                                msg += f"⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.\n"
-                                msg += f"⚠ Please verify that training completed properly and memories were saved.\n"
-                                msg += f"\n"
-                            
-                            full_msg += msg + "\n"
+                            # Track suspicious accuracy (will warn after all patterns processed)
+                            if suspicious_accuracy and not hasattr(self, '_suspicious_accuracy_detected'):
+                                self._suspicious_accuracy_detected = True
                         
                         except Exception as e:
                             # Silently skip files that can't be read
                             pass
+                    
+                    # Assemble full message with one header and all pattern lines
+                    if pattern_lines:
+                        # Find oldest timestamp (earliest date)
+                        oldest_timestamp = min(all_timestamps) if all_timestamps else "Unknown"
+                        
+                        full_msg = f"Last Training Timestamp: {oldest_timestamp}\n\n"
+                        full_msg += f"--- TRAINING STATUS & PATTERN DATA ---\n"
+                        full_msg += "".join(pattern_lines)
+                        full_msg += "\n"
                     
                     # Display error if coin is not fully trained
                     if not self._coin_is_trained(coin):
@@ -5793,11 +6346,13 @@ class ApolloHub(tk.Tk):
                         if len(self.trainer_log_history[coin]) > 2500:
                             self.trainer_log_history[coin] = self.trainer_log_history[coin][-2500:]
                         
-                        # Insert into trainer log if this coin is currently selected
+                        # Display if this coin is currently selected
                         current_coin = (self.trainer_coin_var.get() or "").strip().upper()
                         if coin == current_coin:
                             self.trainer_text.insert("end", full_msg)
                             self.trainer_text.see("end")
+                            # Track that we've displayed this history
+                            self._trainer_log_displayed_lines[coin] = len(self.trainer_log_history[coin])
                             # Reset scroll flag when loading initial status
                             self._trainer_log_user_scrolled_away = False
             
@@ -5870,17 +6425,25 @@ class ApolloHub(tk.Tk):
         neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
         trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
 
+        # Cache training status map for this tick (avoid redundant file I/O)
+        status_map = self._training_status_map()
+
         # --- RUNTIME STALENESS CHECK ---
-        # If thinker or trader is running, check if training has become stale
-        # If so, stop everything and notify the user
+        # If thinker or trader is running, check if training has become stale for TRAINED coins
+        # Only stop if a coin that was previously trained has become stale (not coins that were never trained)
         if neural_running or trader_running:
             stale_coins = self._get_stale_coins()
-            if stale_coins:
-                # Training has become stale during runtime - stop everything
+            
+            # Filter: only consider coins that are currently trained (not untrained/error coins)
+            trained_coins = [c for c, s in status_map.items() if s == "TRAINED"]
+            stale_trained_coins = [c for c in stale_coins if c in trained_coins]
+            
+            if stale_trained_coins:
+                # Training has become stale for actively-used coins - stop everything
                 self.stop_all_scripts()
                 messagebox.showwarning(
                     "Training Data Stale",
-                    f"Training data has become stale for: {', '.join(sorted(stale_coins))}\n\n"
+                    f"Training data has become stale for: {', '.join(sorted(stale_trained_coins))}\n\n"
                     f"Thinker and Trader have been stopped.\n\n"
                     f"Use Autopilot to retrain and restart."
                 )
@@ -5899,10 +6462,13 @@ class ApolloHub(tk.Tk):
             auto_retraining = getattr(self, "_auto_retraining_active", False)
             
             if auto_train_enabled and not auto_retraining and (neural_running or trader_running):
-                # Check if any coins have gone stale
+                # Check if any TRAINED coins have gone stale (ignore never-trained coins)
                 stale_coins = self._get_stale_coins()
+                # Use cached status_map from beginning of tick
+                trained_coins = [c for c, s in status_map.items() if s == "TRAINED"]
+                stale_trained_coins = [c for c in stale_coins if c in trained_coins]
                 
-                if stale_coins:
+                if stale_trained_coins:
                     # --- CRITICAL TRADING WINDOW CHECK ---
                     # Before stopping everything, check if any coin is in imminent trade window
                     # If so, delay retraining until all trades complete (safety first)
@@ -5916,11 +6482,13 @@ class ApolloHub(tk.Tk):
                             print(f"[HUB AUTO-RETRAIN] Delaying: priority coin detected (trade imminent)")
                         return  # Exit without retraining - will check again next minute
                     
-                    # At least one coin is stale - batch retrain everything within 24 hours of staleness
+                    # At least one trained coin is stale - batch retrain everything within 24 hours of staleness
                     near_stale = self._get_coins_near_stale(threshold_hours=24.0)
+                    # Only retrain coins that are already trained (not never-trained coins)
+                    near_stale_trained = [c for c in near_stale if c in trained_coins]
                     
                     # Combine stale + near-stale for batch retraining
-                    all_to_retrain = list(set(stale_coins + near_stale))
+                    all_to_retrain = list(set(stale_trained_coins + near_stale_trained))
                     
                     # Training staleness reached - stop, retrain, restart
                     self._auto_retraining_active = True
@@ -5930,8 +6498,8 @@ class ApolloHub(tk.Tk):
                     self.stop_all_scripts()
                     
                     # Show notification
-                    stale_list = ', '.join(sorted(stale_coins))
-                    if near_stale:
+                    stale_list = ', '.join(sorted(stale_trained_coins))
+                    if near_stale_trained:
                         batch_list = ', '.join(sorted(all_to_retrain))
                         messagebox.showinfo(
                             "Auto-Retrain Starting",
@@ -6013,7 +6581,7 @@ class ApolloHub(tk.Tk):
             pass
 
         # --- Auto Mode button state ---
-        status_map = self._training_status_map()
+        # Use cached status_map from beginning of tick
         all_trained = all(v == "TRAINED" for v in status_map.values()) if status_map else False
 
         # Auto Mode is always available when idle (it handles training automatically)
@@ -6311,6 +6879,12 @@ class ApolloHub(tk.Tk):
         # Check if a coin is approaching a trigger and switch chart view automatically
         self._check_auto_switch()
 
+        # Hot-reload coin list to detect additions/removals (throttled to every 5 seconds)
+        last_coin_check = getattr(self, '_last_coin_list_check', 0)
+        if (now - last_coin_check) >= 5.0:
+            self._update_coin_list_if_changed()
+            self._last_coin_list_check = now
+
         self.status.config(text=f"{_now_str()}  |  v{VERSION}  |  {self.settings['main_neural_dir']}")
         self.after(int(float(self.settings.get("ui_refresh_seconds", 1.0)) * 1000), self._tick)
 
@@ -6388,8 +6962,12 @@ class ApolloHub(tk.Tk):
                 quantity = float(pos.get("quantity", 0.0))
                 has_position = quantity > 0
                 
+                # Get coin category for filtering
+                coin_category = self._coin_categories.get(coin, "active")
+                
                 # Condition 1: New buy entry (if signal strong and slots available)
-                if not has_position and slots_available > 0:
+                # Skip liquidation coins (sell-only)
+                if not has_position and slots_available > 0 and coin_category != "liquidate":
                     entry_distance = self._calculate_entry_distance(coin, current_price, long_signal_min)
                     if entry_distance is not None and entry_distance <= threshold:
                         candidates.append({
@@ -6408,20 +6986,21 @@ class ApolloHub(tk.Tk):
                     if avg_cost <= 0:
                         continue
                     
-                    # Condition 2: DCA trigger
-                    dca_line = float(pos.get("dca_line_price", 0.0))
-                    if dca_line > 0:
-                        dca_distance = abs(current_price - dca_line) / current_price * 100.0
-                        if dca_distance <= threshold:
-                            candidates.append({
-                                "coin": coin,
-                                "distance": dca_distance,
-                                "reason": "DCA Trigger",
-                                "priority": 2,  # DCA priority
-                                "position_value": position_value
-                            })
+                    # Condition 2: DCA trigger (skip liquidation coins - they sell but don't buy/DCA)
+                    if coin_category != "liquidate":
+                        dca_line = float(pos.get("dca_line_price", 0.0))
+                        if dca_line > 0:
+                            dca_distance = abs(current_price - dca_line) / current_price * 100.0
+                            if dca_distance <= threshold:
+                                candidates.append({
+                                    "coin": coin,
+                                    "distance": dca_distance,
+                                    "reason": "DCA Trigger",
+                                    "priority": 2,  # DCA priority
+                                    "position_value": position_value
+                                })
                     
-                    # Condition 3: Stop loss
+                    # Condition 3: Stop loss (allowed for all coin types)
                     stop_loss_price = avg_cost * (1.0 + stop_loss_pct / 100.0)
                     stop_distance = abs(current_price - stop_loss_price) / current_price * 100.0
                     if stop_distance <= threshold and current_price <= stop_loss_price * 1.05:  # approaching from above
@@ -6433,19 +7012,20 @@ class ApolloHub(tk.Tk):
                             "position_value": position_value
                         })
                     
-                    # Condition 4: Take profit (trailing stop)
-                    trail_active = pos.get("trail_active", False)
-                    trail_line = float(pos.get("trail_line", 0.0))
-                    if trail_active and trail_line > 0:
-                        trail_distance = abs(current_price - trail_line) / current_price * 100.0
-                        if trail_distance <= threshold:
-                            candidates.append({
-                                "coin": coin,
-                                "distance": trail_distance,
-                                "reason": "Take Profit",
-                                "priority": 4,  # lowest priority
-                                "position_value": position_value
-                            })
+                    # Condition 4: Take profit (skip accumulation coins - they don't sell for profit)
+                    if coin_category != "accumulate":
+                        trail_active = pos.get("trail_active", False)
+                        trail_line = float(pos.get("trail_line", 0.0))
+                        if trail_active and trail_line > 0:
+                            trail_distance = abs(current_price - trail_line) / current_price * 100.0
+                            if trail_distance <= threshold:
+                                candidates.append({
+                                    "coin": coin,
+                                    "distance": trail_distance,
+                                    "reason": "Take Profit",
+                                    "priority": 4,  # lowest priority
+                                    "position_value": position_value
+                                })
             
             # No candidates within threshold
             if not candidates:
@@ -6526,8 +7106,11 @@ class ApolloHub(tk.Tk):
                 quantity = float(pos.get("quantity", 0.0))
                 has_position = quantity > 0
                 
-                # Check 1: New buy entry (if signal strong and slots available)
-                if not has_position and slots_available > 0:
+                # Get coin category for filtering
+                coin_category = self._coin_categories.get(coin, "active")
+                
+                # Check 1: New buy entry (skip liquidation coins - sell-only)
+                if not has_position and slots_available > 0 and coin_category != "liquidate":
                     entry_distance = self._calculate_entry_distance(coin, current_price, long_signal_min)
                     if entry_distance is not None and entry_distance <= threshold_pct:
                         return True
@@ -6538,26 +7121,28 @@ class ApolloHub(tk.Tk):
                     if avg_cost <= 0:
                         continue
                     
-                    # Check 2: DCA trigger
-                    dca_line = float(pos.get("dca_line_price", 0.0))
-                    if dca_line > 0:
-                        dca_distance = abs(current_price - dca_line) / current_price * 100.0
-                        if dca_distance <= threshold_pct:
-                            return True
+                    # Check 2: DCA trigger (skip accumulation coins - they don't sell)
+                    if coin_category != "accumulate":
+                        dca_line = float(pos.get("dca_line_price", 0.0))
+                        if dca_line > 0:
+                            dca_distance = abs(current_price - dca_line) / current_price * 100.0
+                            if dca_distance <= threshold_pct:
+                                return True
                     
-                    # Check 3: Stop loss
+                    # Check 3: Stop loss (allowed for all coin types)
                     stop_loss_price = avg_cost * (1.0 + stop_loss_pct / 100.0)
                     stop_distance = abs(current_price - stop_loss_price) / current_price * 100.0
                     if stop_distance <= threshold_pct and current_price <= stop_loss_price * 1.05:
                         return True
                     
-                    # Check 4: Take profit (trailing stop)
-                    trail_active = pos.get("trail_active", False)
-                    trail_line = float(pos.get("trail_line", 0.0))
-                    if trail_active and trail_line > 0:
-                        trail_distance = abs(current_price - trail_line) / current_price * 100.0
-                        if trail_distance <= threshold_pct:
-                            return True
+                    # Check 4: Take profit (skip accumulation coins - they don't sell for profit)
+                    if coin_category != "accumulate":
+                        trail_active = pos.get("trail_active", False)
+                        trail_line = float(pos.get("trail_line", 0.0))
+                        if trail_active and trail_line > 0:
+                            trail_distance = abs(current_price - trail_line) / current_price * 100.0
+                            if trail_distance <= threshold_pct:
+                                return True
             
             return False
         except Exception:
@@ -7004,8 +7589,24 @@ class ApolloHub(tk.Tk):
           - Chart tabs (Notebook): add/remove tabs to match current coin list
           - Neural overview tiles (new): add/remove tiles to match current coin list
         """
-        # Rebuild dependent pieces
-        self.coins = [c.upper().strip() for c in (self.settings.get("coins") or []) if c.strip()]
+        # Rebuild dependent pieces - combine all three coin categories
+        coins_dict = self.settings.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+        if isinstance(coins_dict, dict):
+            self.coins = (
+                coins_dict.get("active", []) + 
+                coins_dict.get("accumulate", []) + 
+                coins_dict.get("liquidate", [])
+            )
+            # Rebuild category mappings for UI color coding
+            self._coin_categories = {
+                **{c: "active" for c in coins_dict.get("active", [])},
+                **{c: "accumulate" for c in coins_dict.get("accumulate", [])},
+                **{c: "liquidate" for c in coins_dict.get("liquidate", [])}
+            }
+        else:
+            self.coins = []
+            self._coin_categories = {}
+        
         self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
 
         # Refresh coin dropdowns (they don't auto-update)
@@ -7123,6 +7724,15 @@ class ApolloHub(tk.Tk):
 
             self.neural_wrap.add(tile, padx=(0, 6), pady=(0, 6))
             self.neural_tiles[coin] = tile
+
+        # Set selection state on tile matching current chart page (before layout)
+        if hasattr(self, '_current_chart_page'):
+            current_chart = self._current_chart_page
+            for coin, tile in self.neural_tiles.items():
+                try:
+                    tile.set_selected(coin == current_chart)
+                except Exception:
+                    pass
 
         # Layout and scrollbar refresh
         try:
@@ -7245,6 +7855,21 @@ class ApolloHub(tk.Tk):
                 mx = max(mt_candidates)
                 latest_ts = mx if (latest_ts is None or mx > latest_ts) else latest_ts
 
+        # Ensure selection highlighting matches current chart (only update when chart page changes)
+        if hasattr(self, '_current_chart_page'):
+            current_chart = self._current_chart_page
+            last_highlighted_chart = getattr(self, '_last_highlighted_chart', None)
+            
+            if current_chart != last_highlighted_chart:
+                # Chart page changed - update all tile selections
+                for coin, tile in list(self.neural_tiles.items()):
+                    try:
+                        tile.set_selected(coin == current_chart)
+                    except Exception:
+                        pass
+                # Cache the chart page we just highlighted
+                self._last_highlighted_chart = current_chart
+
         # Update "Last:" label
         try:
             if hasattr(self, "lbl_neural_overview_last") and self.lbl_neural_overview_last.winfo_exists():
@@ -7308,7 +7933,17 @@ class ApolloHub(tk.Tk):
 
             for txt, b in self._chart_tab_buttons.items():
                 try:
-                    b.configure(style=("ChartTabSelected.TButton" if txt == name else "ChartTab.TButton"))
+                    if txt == name:
+                        b.configure(style="ChartTabSelected.TButton")
+                    else:
+                        # Restore category-specific style when not selected
+                        category = self._coin_categories.get(txt, "active")
+                        if category == "accumulate":
+                            b.configure(style="ChartTabAccumulate.TButton")
+                        elif category == "liquidate":
+                            b.configure(style="ChartTabLiquidate.TButton")
+                        else:
+                            b.configure(style="ChartTab.TButton")
                 except Exception:
                     pass
 
@@ -7340,10 +7975,19 @@ class ApolloHub(tk.Tk):
             page = ttk.Frame(self.chart_pages_container)
             self.chart_pages[coin] = page
 
+            # Determine button style based on coin category
+            category = self._coin_categories.get(coin, "active")
+            if category == "accumulate":
+                btn_style = "ChartTabAccumulate.TButton"
+            elif category == "liquidate":
+                btn_style = "ChartTabLiquidate.TButton"
+            else:
+                btn_style = "ChartTab.TButton"
+            
             btn = ttk.Button(
                 self.chart_tabs_bar,
                 text=coin,
-                style="ChartTab.TButton",
+                style=btn_style,
                 command=lambda c=coin: self._show_chart_page(c),
             )
             self.chart_tabs_bar.add(btn, padx=(0, 6), pady=(0, 6))
@@ -7494,13 +8138,23 @@ class ApolloHub(tk.Tk):
                 # keep column alignment consistent
                 ttk.Label(parent, text="").grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
 
+        # Reload settings from file to get latest changes (e.g., dust cleanup removing coins)
+        try:
+            with open(os.path.join(self.project_dir, "gui_settings.json"), "r", encoding="utf-8") as f:
+                fresh_settings = json.load(f)
+                self.settings.update(fresh_settings)
+        except Exception:
+            pass
+        
         main_dir_var = tk.StringVar(value=self.settings["main_neural_dir"])
-        coins_var = tk.StringVar(value=",".join(self.settings["coins"]))
+        
+        # Three separate coin category variables
+        coins_dict = self.settings.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+        active_coins_var = tk.StringVar(value=",".join(coins_dict.get("active", [])))
+        accumulate_coins_var = tk.StringVar(value=",".join(coins_dict.get("accumulate", [])))
+        liquidate_coins_var = tk.StringVar(value=",".join(coins_dict.get("liquidate", [])))
+        
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
-
-        neural_script_var = tk.StringVar(value=self.settings["script_neural_runner2"])
-        trainer_script_var = tk.StringVar(value=self.settings.get("script_neural_trainer", "pt_trainer.py"))
-        trader_script_var = tk.StringVar(value=self.settings["script_trader"])
 
         ui_refresh_var = tk.StringVar(value=str(self.settings["ui_refresh_seconds"]))
         chart_refresh_var = tk.StringVar(value=str(self.settings["chart_refresh_seconds"]))
@@ -7508,29 +8162,17 @@ class ApolloHub(tk.Tk):
 
         r = 0
         
-        # Basic Settings Section
-        basic_frame = ttk.LabelFrame(frm, text=" Basic Settings ", padding=15)
-        basic_frame.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 15)); r += 1
-        basic_frame.columnconfigure(0, weight=0)
-        basic_frame.columnconfigure(1, weight=1)
-        basic_frame.columnconfigure(2, weight=0)
+        # Trading Coins Section
+        coins_frame = ttk.LabelFrame(frm, text=" Trading Coins ", padding=15)
+        coins_frame.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 15)); r += 1
+        coins_frame.columnconfigure(0, weight=0)
+        coins_frame.columnconfigure(1, weight=1)
+        coins_frame.columnconfigure(2, weight=0)
         
-        basic_r = 0
-        add_row(basic_frame, basic_r, "Main neural folder:", main_dir_var, browse="dir"); basic_r += 1
-        add_row(basic_frame, basic_r, "Coins (comma):", coins_var); basic_r += 1
-        add_row(basic_frame, basic_r, "Hub data dir (optional):", hub_dir_var, browse="dir"); basic_r += 1
-
-        # Script Paths Section
-        script_frame = ttk.LabelFrame(frm, text=" Script Paths ", padding=15)
-        script_frame.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 15)); r += 1
-        script_frame.columnconfigure(0, weight=0)
-        script_frame.columnconfigure(1, weight=1)
-        script_frame.columnconfigure(2, weight=0)
-        
-        script_r = 0
-        add_row(script_frame, script_r, "pt_thinker.py path:", neural_script_var); script_r += 1
-        add_row(script_frame, script_r, "pt_trainer.py path:", trainer_script_var); script_r += 1
-        add_row(script_frame, script_r, "pt_trader.py path:", trader_script_var); script_r += 1
+        coins_r = 0
+        add_row(coins_frame, coins_r, "Active Trading Coins (comma):", active_coins_var); coins_r += 1
+        add_row(coins_frame, coins_r, "Accumulation Coins (comma):", accumulate_coins_var); coins_r += 1
+        add_row(coins_frame, coins_r, "Liquidation Coins (comma):", liquidate_coins_var); coins_r += 1
 
         # --- Robinhood API setup (writes rh_key.enc + rh_secret.enc using Windows DPAPI encryption) ---
         def _api_paths() -> Tuple[str, str]:
@@ -8141,6 +8783,17 @@ class ApolloHub(tk.Tk):
 
         _refresh_api_status()
 
+        # Directories Section
+        basic_frame = ttk.LabelFrame(frm, text=" Directories ", padding=15)
+        basic_frame.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 15)); r += 1
+        basic_frame.columnconfigure(0, weight=0)
+        basic_frame.columnconfigure(1, weight=1)
+        basic_frame.columnconfigure(2, weight=0)
+        
+        basic_r = 0
+        add_row(basic_frame, basic_r, "Main neural folder:", main_dir_var, browse="dir"); basic_r += 1
+        add_row(basic_frame, basic_r, "Hub data dir (optional):", hub_dir_var, browse="dir"); basic_r += 1
+
         # Display Settings Section
         display_frame = ttk.LabelFrame(frm, text=" Display Settings ", padding=15)
         display_frame.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 15)); r += 1
@@ -8210,14 +8863,23 @@ class ApolloHub(tk.Tk):
         def save():
             try:
                 # Track coins before changes so we can detect newly added coins
-                prev_coins = set([str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()])
+                coins_dict = self.settings.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+                if isinstance(coins_dict, dict):
+                    prev_coins = set(
+                        coins_dict.get("active", []) + 
+                        coins_dict.get("accumulate", []) + 
+                        coins_dict.get("liquidate", [])
+                    )
+                else:
+                    prev_coins = set()
 
                 self.settings["main_neural_dir"] = main_dir_var.get().strip()
-                self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
+                self.settings["coins"] = {
+                    "active": [c.strip().upper() for c in active_coins_var.get().split(",") if c.strip()],
+                    "accumulate": [c.strip().upper() for c in accumulate_coins_var.get().split(",") if c.strip()],
+                    "liquidate": [c.strip().upper() for c in liquidate_coins_var.get().split(",") if c.strip()]
+                }
                 self.settings["hub_data_dir"] = hub_dir_var.get().strip()
-                self.settings["script_neural_runner2"] = neural_script_var.get().strip()
-                self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
-                self.settings["script_trader"] = trader_script_var.get().strip()
 
                 self.settings["ui_refresh_seconds"] = float(ui_refresh_var.get().strip())
                 self.settings["chart_refresh_seconds"] = float(chart_refresh_var.get().strip())
@@ -8247,7 +8909,15 @@ class ApolloHub(tk.Tk):
                 # If new coin(s) were added and their training folder doesn't exist yet,
                 # create the folder and copy neural_trainer.py from MAIN folder into it RIGHT AFTER saving settings.
                 try:
-                    new_coins = [c.strip().upper() for c in (self.settings.get("coins") or []) if c.strip()]
+                    coins_dict = self.settings.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+                    if isinstance(coins_dict, dict):
+                        new_coins = (
+                            coins_dict.get("active", []) + 
+                            coins_dict.get("accumulate", []) + 
+                            coins_dict.get("liquidate", [])
+                        )
+                    else:
+                        new_coins = []
                     added = [c for c in new_coins if c and c not in prev_coins]
 
                     main_dir = self.settings.get("main_neural_dir") or self.project_dir
@@ -8291,13 +8961,19 @@ class ApolloHub(tk.Tk):
                 
                 # Reset Basic Settings
                 main_dir_var.set(defaults.get("main_neural_dir", ""))
-                coins_var.set(",".join(defaults.get("coins", [])))
-                hub_dir_var.set(defaults.get("hub_data_dir", ""))
                 
-                # Reset Script Paths
-                neural_script_var.set(defaults.get("script_neural_runner2", "pt_thinker.py"))
-                trainer_script_var.set(defaults.get("script_neural_trainer", "pt_trainer.py"))
-                trader_script_var.set(defaults.get("script_trader", "pt_trader.py"))
+                # Reset three coin categories
+                default_coins = defaults.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+                if isinstance(default_coins, dict):
+                    active_coins_var.set(",".join(default_coins.get("active", [])))
+                    accumulate_coins_var.set(",".join(default_coins.get("accumulate", [])))
+                    liquidate_coins_var.set(",".join(default_coins.get("liquidate", [])))
+                else:
+                    active_coins_var.set(",".join(default_coins) if isinstance(default_coins, list) else "")
+                    accumulate_coins_var.set("")
+                    liquidate_coins_var.set("")
+                
+                hub_dir_var.set(defaults.get("hub_data_dir", ""))
                 
                 # Reset Display Settings
                 ui_refresh_var.set(str(defaults.get("ui_refresh_seconds", 1.0)))

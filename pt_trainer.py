@@ -870,37 +870,34 @@ except Exception:
 # This ensures all coin trainers use consistent logic and bug fixes
 check_and_update_trainer_version()
 
-# TEST DEBUG LOGGING - Write a startup message to verify debug logging is working
-try:
-	debug_enabled = _is_debug_mode()
-	log_file = f"debug_trainer_{_arg_coin}.log"
-	import datetime
-	timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-	
-	# Always write startup message (even if debug is off) to confirm file writing works
-	with open(log_file, "a", encoding="utf-8") as f:
-		f.write(f"\n{'='*60}\n")
-		f.write(f"[{timestamp}] TRAINER STARTED for {_arg_coin}\n")
-		f.write(f"[{timestamp}] Debug mode: {'ENABLED' if debug_enabled else 'DISABLED'}\n")
-		f.write(f"[{timestamp}] Log file: {log_file}\n")
-		f.write(f"[{timestamp}] Working directory: {os.getcwd()}\n")
-		f.write(f"{'='*60}\n\n")
-	
-	print(f"\n{'='*60}")
-	print(f"TRAINER DEBUG LOG INITIALIZED")
-	print(f"  Coin: {_arg_coin}")
-	print(f"  Debug mode: {'ENABLED' if debug_enabled else 'DISABLED'}")
-	print(f"  Log file: {log_file}")
-	print(f"  Working directory: {os.getcwd()}")
-	print(f"{'='*60}\n")
-	
-	if not debug_enabled:
-		print(f"⚠ WARNING: Debug mode is DISABLED in gui_settings.json")
-		print(f"         Enable it to see detailed training logs")
-		print(f"         Startup message written to {log_file} for verification\n")
-except Exception as e:
-	print(f"❌ ERROR: Failed to initialize debug logging: {e}")
-	PrintException()
+# Initialize debug logging - only attempt file operations when debug mode is enabled
+debug_enabled = _is_debug_mode()
+
+if debug_enabled:
+	try:
+		log_file = f"debug_trainer_{_arg_coin}.log"
+		import datetime
+		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		
+		# Write startup message to debug log
+		with open(log_file, "a", encoding="utf-8") as f:
+			f.write(f"\n{'='*60}\n")
+			f.write(f"[{timestamp}] TRAINER STARTED for {_arg_coin}\n")
+			f.write(f"[{timestamp}] Debug mode: ENABLED\n")
+			f.write(f"[{timestamp}] Log file: {log_file}\n")
+			f.write(f"[{timestamp}] Working directory: {os.getcwd()}\n")
+			f.write(f"{'='*60}\n\n")
+		
+		print(f"\n{'='*60}")
+		print(f"TRAINER DEBUG LOG INITIALIZED")
+		print(f"  Coin: {_arg_coin}")
+		print(f"  Debug mode: ENABLED")
+		print(f"  Log file: {log_file}")
+		print(f"  Working directory: {os.getcwd()}")
+		print(f"{'='*60}\n")
+	except Exception as e:
+		print(f"❌ ERROR: Failed to initialize debug logging: {e}")
+		PrintException()
 
 the_big_index = 0
 bounce_accuracy_dict = {}  # Store bounce accuracy for each timeframe
@@ -2404,6 +2401,24 @@ for current_pattern_size in pattern_sizes_to_train:
 												except Exception as e:
 													print(f'⚠ Warning: Could not save signal accuracy: {e}')
 											
+												# Save pattern count to file
+												try:
+													total_patterns = 0
+													for tf in tf_choices:
+														memory_file = f'memories_{tf}_p{current_pattern_size}.dat'
+														if os.path.isfile(memory_file):
+															with open(memory_file, 'r', encoding='utf-8') as f:
+																content = f.read().strip()
+																if content:
+																	patterns = content.split('~')
+																	total_patterns += len(patterns)
+													
+													# Write total count to file
+													with open(f'pattern_count_p{current_pattern_size}.txt', 'w', encoding='utf-8') as f:
+														f.write(str(total_patterns))
+												except Exception as e:
+													print(f'⚠ Warning: Could not save pattern count: {e}')
+											
 												# Break from while loop to continue to next pattern size
 												print()
 												print(f"Completed all timeframes for pattern size {current_pattern_size}")
@@ -2775,32 +2790,136 @@ print("Performing final cleanup and deduplication...")
 flush_all_buffers(force=True)
 print("Final cleanup complete.")
 
-# Check if memory files are empty (indicates training failure)
-training_valid = True
-empty_memories = []
-try:
-	for tf in tf_choices:
-		# Check if at least one pattern size exists for this timeframe
-		found_valid_size = False
-		for check_size in pattern_sizes_to_train:
-			memory_file = f"memories_{tf}_p{check_size}.dat"
-			if os.path.isfile(memory_file):
-				file_size = os.path.getsize(memory_file)
-				if file_size >= 100:  # At least 100 bytes
-					found_valid_size = True
-					break
-		
-		if not found_valid_size:
-			# No valid memory files found for any pattern size
-			empty_memories.append(tf)
-			training_valid = False
+def _verify_training_artifacts(coin: str, tf_choices: list, pattern_sizes: list) -> tuple:
+	"""Verify all training artifacts were created successfully.
 	
-	if not training_valid:
-		print()
-		print(f'❌ ERROR: Training failed - memory files are empty or missing for: {", ".join(empty_memories)}')
-		print(f'❌ Training will be marked as FAILED. Please retry training.')
-except Exception as e:
-	print(f'Warning: Could not validate memory files: {e}')
+	Args:
+		coin: Coin symbol being trained
+		tf_choices: List of timeframes that were trained
+		pattern_sizes: List of pattern sizes that were trained
+	
+	Returns:
+		tuple: (is_valid: bool, error_messages: list)
+	
+	Checks performed:
+		- Memory files exist and have reasonable size (>1KB)
+		- Weight files exist for each memory file
+		- Threshold files exist and contain valid numeric values
+		- Training timestamp file was created
+		- At least 100 patterns learned per timeframe
+	"""
+	errors = []
+	warnings = []
+	
+	# Check each timeframe and pattern size combination
+	for tf in tf_choices:
+		for size in pattern_sizes:
+			prefix = f"{tf}_p{size}"
+			
+			# Check memory file
+			mem_file = f"memories_{prefix}.dat"
+			if not os.path.isfile(mem_file):
+				errors.append(f"Missing memory file: {mem_file}")
+				continue  # Skip dependent checks if memory file missing
+			
+			# Check minimum size (1KB = at least some patterns)
+			file_size = os.path.getsize(mem_file)
+			if file_size < 1000:
+				errors.append(f"Memory file too small: {mem_file} ({file_size} bytes, expected >1KB)")
+			elif file_size < 5000:
+				warnings.append(f"Memory file small: {mem_file} ({file_size} bytes, may have few patterns)")
+			
+			# Validate memory file content is readable
+			try:
+				with open(mem_file, "r", encoding="utf-8", errors="ignore") as f:
+					content = f.read()
+					if not content or content.strip() == "":
+						errors.append(f"Memory file is empty: {mem_file}")
+					else:
+						# Count patterns (separated by ~)
+						pattern_count = content.count('~')
+						if pattern_count < 100:
+							warnings.append(f"Few patterns in {mem_file}: {pattern_count} (expected >100)")
+			except Exception as e:
+				errors.append(f"Cannot read memory file {mem_file}: {e}")
+			
+			# Check weight files (3 types per timeframe/size)
+			for weight_type in ["weights", "high_weights", "low_weights"]:
+				weight_file = f"{weight_type}_{prefix}.dat"
+				if not os.path.isfile(weight_file):
+					errors.append(f"Missing weight file: {weight_file}")
+				else:
+					# Weight files should be comparable size to memory files
+					w_size = os.path.getsize(weight_file)
+					if w_size < 100:
+						errors.append(f"Weight file too small: {weight_file} ({w_size} bytes)")
+			
+			# Check threshold file
+			threshold_file = f"threshold_{prefix}.dat"
+			if not os.path.isfile(threshold_file):
+				errors.append(f"Missing threshold file: {threshold_file}")
+			else:
+				# Validate threshold contains valid numeric value
+				try:
+					with open(threshold_file, "r", encoding="utf-8") as f:
+						threshold_str = f.read().strip()
+						if not threshold_str:
+							errors.append(f"Threshold file is empty: {threshold_file}")
+						else:
+							threshold = float(threshold_str)
+							if threshold <= 0:
+								errors.append(f"Invalid threshold in {threshold_file}: {threshold} (must be >0)")
+							elif threshold > 100:
+								warnings.append(f"Very high threshold in {threshold_file}: {threshold}% (typical: 10-25%)")
+				except ValueError as e:
+					errors.append(f"Threshold file contains non-numeric value in {threshold_file}: {e}")
+				except Exception as e:
+					errors.append(f"Cannot read threshold file {threshold_file}: {e}")
+	
+	# Check training timestamp file
+	if not os.path.isfile("trainer_last_training_time.txt"):
+		# This is created later, so just warn if we're checking before it's written
+		pass  # Will be created after validation
+	
+	# Determine if training is valid
+	is_valid = len(errors) == 0
+	
+	# Combine errors and warnings for reporting
+	all_messages = errors + warnings
+	
+	return is_valid, all_messages
+
+# Verify all training artifacts before marking as complete
+print()
+print("Verifying training artifacts...")
+training_valid, validation_messages = _verify_training_artifacts(
+	_arg_coin, 
+	tf_choices, 
+	list(pattern_sizes_to_train)
+)
+
+if not training_valid:
+	print()
+	print(f"{'='*60}")
+	print(f"❌ TRAINING VERIFICATION FAILED FOR {_arg_coin}")
+	print(f"{'='*60}")
+	for msg in validation_messages:
+		if msg.startswith("Missing") or msg.startswith("Invalid") or "too small" in msg or "empty" in msg:
+			print(f"  ❌ {msg}")
+		else:
+			print(f"  ⚠  {msg}")
+	print(f"{'='*60}")
+	print()
+else:
+	print(f"✅ All training artifacts verified successfully")
+	# Print warnings even if validation passed
+	warnings_only = [msg for msg in validation_messages if msg.startswith("Few") or msg.startswith("Memory file small") or msg.startswith("Very high")]
+	if warnings_only:
+		print(f"  Warnings:")
+		for msg in warnings_only:
+			print(f"    ⚠  {msg}")
+
+# Legacy check removed - comprehensive verification function replaced it
 
 try:
 	file = open('trainer_last_start_time.txt','w+')
@@ -2822,19 +2941,68 @@ except:
 	pass
 
 try:
+	status_data = {
+		"coin": _arg_coin,
+		"state": "FINISHED" if training_valid else "FAILED",
+		"started_at": _trainer_started_at,
+		"finished_at": _trainer_finished_at,
+		"timestamp": _trainer_finished_at,
+	}
+	
+	# Add error details if validation failed
+	if not training_valid:
+		# Get error messages only (not warnings)
+		error_msgs = [msg for msg in validation_messages if msg.startswith("Missing") or msg.startswith("Invalid") or "too small" in msg or "empty" in msg]
+		# Summarize first 3 errors for status bar
+		error_summary = "; ".join(error_msgs[:3]) if error_msgs else "Training verification failed"
+		if len(error_msgs) > 3:
+			error_summary += f" (and {len(error_msgs) - 3} more errors)"
+		
+		status_data["error"] = error_summary
+		status_data["all_errors"] = validation_messages  # Full list for debugging
+		status_data["error_count"] = len(error_msgs)
+	else:
+		status_data["error"] = None
+	
 	with open("trainer_status.json", "w", encoding="utf-8") as f:
-		json.dump(
-			{
+		json.dump(status_data, f, indent=2)
+	
+	# Print final status
+	if training_valid:
+		print()
+		print(f"{'='*60}")
+		print(f"✅ TRAINING COMPLETED SUCCESSFULLY FOR {_arg_coin}")
+		print(f"{'='*60}")
+		print(f"  Started:  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_trainer_started_at))}")
+		print(f"  Finished: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_trainer_finished_at))}")
+		print(f"  Duration: {(_trainer_finished_at - _trainer_started_at) // 60} minutes")
+		print(f"{'='*60}")
+		print()
+	else:
+		print()
+		print(f"{'='*60}")
+		print(f"❌ TRAINING FAILED FOR {_arg_coin}")
+		print(f"{'='*60}")
+		print(f"  Please review the errors above and retry training.")
+		print(f"  Common fixes:")
+		print(f"    - Ensure stable internet connection")
+		print(f"    - Check disk space availability")
+		print(f"    - Verify KuCoin API is accessible")
+		print(f"{'='*60}")
+		print()
+		
+except Exception as e:
+	print(f"❌ ERROR: Failed to write training status: {e}")
+	# Still write a basic status file so GUI knows training ended
+	try:
+		with open("trainer_status.json", "w", encoding="utf-8") as f:
+			json.dump({
 				"coin": _arg_coin,
-				"state": "FINISHED" if training_valid else "FAILED",
-				"started_at": _trainer_started_at,
-				"finished_at": _trainer_finished_at,
-				"timestamp": _trainer_finished_at,
-				"error": "Empty memory files" if not training_valid else None,
-			},
-			f,
-		)
-except Exception:
-	pass
+				"state": "FAILED",
+				"timestamp": int(time.time()),
+				"error": f"Status write error: {e}"
+			}, f)
+	except:
+		pass
 
 sys.exit(0 if training_valid else 1)

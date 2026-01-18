@@ -16,15 +16,24 @@ Original Author: Stephen Hughes (garagesteve1155)
 
 Key behavioral notes (informational only):
 
+- Coin Categories:
+    Trades are governed by coin category (active/accumulate/liquidate) from gui_settings.json:
+    * Active Trading: Full buy/sell automation, counts toward max_concurrent_positions limit
+    * Accumulation: Buy-only (entry + DCA allowed), sells only on stop-loss, unlimited positions
+    * Liquidation: Sell-only (no entry/DCA), auto-removes from list at dust threshold, unlimited positions
+    Non-listed coins are completely ignored (safety feature).
+
 - Entry signal (long positions):
     Start trades when long_signal >= entry_signals.long_signal_min (default 4)
     AND short_signal <= entry_signals.short_signal_max (default 0).
+    Blocked for liquidation coins (sell-only).
 
 - Exit signal (MTF confirmation):
     Trailing profit margin triggers sell when price crosses below trailing line,
     BUT requires multi-timeframe confirmation: short_signal >= exit_signals.short_signal_min
     (default 4) AND long_signal <= exit_signals.long_signal_max (default 0).
-    Stop-loss (-40%) ALWAYS executes, bypassing MTF check for safety.
+    Blocked for accumulation coins (buy-only), except stop-loss.
+    Stop-loss (-40%) ALWAYS executes for all categories, bypassing MTF check for safety.
 
 - DCA rules:
     DCA uses the AI's per-level price lines or a hardcoded drawdown % for
@@ -209,15 +218,17 @@ _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 
 _gui_settings_cache = {
 	"mtime": None,
-	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
+	"coins": ['ETH', 'SOL', 'XRP', 'LINK', 'BTC', 'DOGE'],  # fallback defaults (all categories combined)
 	"main_neural_dir": None,
+	"coin_categories": {"ETH": "active", "SOL": "active", "XRP": "active", "LINK": "active", "BTC": "accumulate", "DOGE": "liquidate"},
 }
 
 def _load_gui_settings() -> dict:
 	"""
 	Reads gui_settings.json and returns a dict with:
-	- coins: uppercased list
+	- coins: uppercased list (all three categories combined)
 	- main_neural_dir: string (may be None)
+	- coin_categories: dict mapping coin to category ("active", "accumulate", "liquidate")
 	Caches by mtime so it is cheap to call frequently.
 	"""
 	try:
@@ -231,15 +242,41 @@ def _load_gui_settings() -> dict:
 		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
 			data = json.load(f) or {}
 
-		coins = data.get("coins", None)
-		if not isinstance(coins, list) or not coins:
+		main_neural_dir = data.get("main_neural_dir", "")
+		# Handle new three-category structure or legacy list format
+		coins_raw = data.get("coins", None)
+		if isinstance(coins_raw, dict):
+			# New format: combine all three categories
+			all_coins = (
+				coins_raw.get("active", []) + 
+				coins_raw.get("accumulate", []) + 
+				coins_raw.get("liquidate", [])
+			)
+			coins = [str(c).strip().upper() for c in all_coins if str(c).strip()]
+			
+			# Build category mapping
+			coin_categories = {}
+			for c in coins_raw.get("active", []):
+				if c.strip():
+					coin_categories[c.upper().strip()] = "active"
+			for c in coins_raw.get("accumulate", []):
+				if c.strip():
+					coin_categories[c.upper().strip()] = "accumulate"
+			for c in coins_raw.get("liquidate", []):
+				if c.strip():
+					coin_categories[c.upper().strip()] = "liquidate"
+		elif isinstance(coins_raw, list):
+			# Legacy format: all coins are active
+			coins = [str(c).strip().upper() for c in coins_raw if str(c).strip()]
+			coin_categories = {c: "active" for c in coins}
+		else:
+			# Fallback
 			coins = list(_gui_settings_cache["coins"])
-		coins = [str(c).strip().upper() for c in coins if str(c).strip()]
+			coin_categories = _gui_settings_cache.get("coin_categories", {})
+		
 		if not coins:
 			coins = list(_gui_settings_cache["coins"])
-
-		main_neural_dir = data.get("main_neural_dir", None)
-		if isinstance(main_neural_dir, str):
+			coin_categories = _gui_settings_cache.get("coin_categories", {})
 			main_neural_dir = main_neural_dir.strip() or None
 		else:
 			main_neural_dir = None
@@ -247,11 +284,13 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
 		_gui_settings_cache["main_neural_dir"] = main_neural_dir
+		_gui_settings_cache["coin_categories"] = coin_categories
 
 		return {
 			"mtime": mtime,
 			"coins": list(coins),
 			"main_neural_dir": main_neural_dir,
+			"coin_categories": dict(coin_categories),
 		}
 	except Exception:
 		return dict(_gui_settings_cache)
@@ -274,7 +313,8 @@ def _build_base_paths(main_dir_in: str, coins_in: list) -> dict:
 	return out
 
 # Live globals (will be refreshed inside manage_trades())
-crypto_symbols = ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE']
+crypto_symbols = ['ETH', 'SOL', 'XRP', 'LINK', 'BTC', 'DOGE']
+coin_categories = {"ETH": "active", "SOL": "active", "XRP": "active", "LINK": "active", "BTC": "accumulate", "DOGE": "liquidate"}
 
 # Default main_dir behavior if settings are missing
 main_dir = os.getcwd()
@@ -285,9 +325,9 @@ _last_settings_mtime = None
 def _refresh_paths_and_symbols():
 	"""
 	Hot-reload coins + main_neural_dir while trader is running.
-	Updates globals: crypto_symbols, main_dir, base_paths
+	Updates globals: crypto_symbols, main_dir, base_paths, coin_categories
 	"""
-	global crypto_symbols, main_dir, base_paths, _last_settings_mtime
+	global crypto_symbols, main_dir, base_paths, coin_categories, _last_settings_mtime
 
 	s = _load_gui_settings()
 	mtime = s.get("mtime", None)
@@ -303,51 +343,197 @@ def _refresh_paths_and_symbols():
 
 	coins = s.get("coins") or list(crypto_symbols)
 	mndir = s.get("main_neural_dir") or main_dir
+	categories = s.get("coin_categories", {})
 
 	# Keep it safe if folder isn't real on this machine
 	if not os.path.isdir(mndir):
 		mndir = os.getcwd()
 
 	crypto_symbols = list(coins)
+	coin_categories = dict(categories)
 	main_dir = mndir
 	base_paths = _build_base_paths(main_dir, crypto_symbols)
 
-#API STUFF - Read encrypted keys
+def _load_and_validate_api_credentials() -> tuple:
+	"""Load and validate Robinhood API credentials with strict format checking.
+	
+	Returns:
+		tuple: (api_key: str, base64_private_key: str)
+	
+	Raises:
+		FileNotFoundError: If credential files don't exist
+		ValueError: If credentials are invalid format
+		RuntimeError: If decryption fails
+	
+	Validation checks:
+		- Files exist and are readable
+		- Decryption succeeds
+		- API key length >= 20 characters (minimum for valid Robinhood key)
+		- API key has no leading/trailing whitespace
+		- Private key is valid base64
+		- Private key decodes to exactly 32 bytes (Ed25519 requirement)
+	"""
+	key_file = 'rh_key.enc'
+	secret_file = 'rh_secret.enc'
+	
+	# Step 1: Check file existence first
+	if not os.path.exists(key_file):
+		raise FileNotFoundError(
+			f"API key file '{key_file}' not found.\n"
+			"Open the GUI and go to Settings → Robinhood API → Setup / Update."
+		)
+	
+	if not os.path.exists(secret_file):
+		raise FileNotFoundError(
+			f"Private key file '{secret_file}' not found.\n"
+			"Open the GUI and go to Settings → Robinhood API → Setup / Update."
+		)
+	
+	# Step 2: Decrypt credentials
+	try:
+		with open(key_file, 'rb') as f:
+			encrypted_key = f.read()
+			if not encrypted_key:
+				raise ValueError(f"File '{key_file}' is empty")
+			api_key = _decrypt_with_dpapi(encrypted_key).strip()
+	except Exception as e:
+		raise RuntimeError(f"Failed to decrypt API key from '{key_file}': {e}")
+	
+	try:
+		with open(secret_file, 'rb') as f:
+			encrypted_secret = f.read()
+			if not encrypted_secret:
+				raise ValueError(f"File '{secret_file}' is empty")
+			base64_private_key = _decrypt_with_dpapi(encrypted_secret).strip()
+	except Exception as e:
+		raise RuntimeError(f"Failed to decrypt private key from '{secret_file}': {e}")
+	
+	# Step 3: Validate API key format
+	if not api_key or len(api_key) == 0:
+		raise ValueError("API key is empty after decryption")
+	
+	if len(api_key) < 20:
+		raise ValueError(f"API key too short ({len(api_key)} chars, minimum 20 required)")
+	
+	if len(api_key) > 200:
+		raise ValueError(f"API key too long ({len(api_key)} chars, maximum 200)")
+	
+	# Check for whitespace that would break authentication
+	if api_key != api_key.strip():
+		raise ValueError("API key contains leading or trailing whitespace")
+	
+	# Check for null bytes or control characters
+	if '\x00' in api_key:
+		raise ValueError("API key contains null bytes (corrupted)")
+	
+	# Check for newlines or tabs that could break API calls
+	if '\n' in api_key or '\r' in api_key or '\t' in api_key:
+		raise ValueError("API key contains newline or tab characters (corrupted)")
+	
+	# Validate character set (alphanumeric, hyphens, underscores are typical)
+	import string
+	allowed_chars = string.ascii_letters + string.digits + '-_'
+	invalid_chars = [c for c in api_key if c not in allowed_chars]
+	if invalid_chars:
+		# Show first few invalid characters for debugging
+		sample = ''.join(invalid_chars[:5])
+		raise ValueError(f"API key contains invalid characters: {repr(sample)}")
+	
+	# Step 4: Validate private key format (must be valid base64)
+	if not base64_private_key or len(base64_private_key) == 0:
+		raise ValueError("Private key is empty after decryption")
+	
+	# Check for null bytes or control characters
+	if '\x00' in base64_private_key:
+		raise ValueError("Private key contains null bytes (corrupted)")
+	
+	# Check for newlines/whitespace that could break base64 decoding
+	if '\n' in base64_private_key or '\r' in base64_private_key or '\t' in base64_private_key:
+		raise ValueError("Private key contains newline or tab characters (corrupted)")
+	
+	# Validate base64 character set (A-Z, a-z, 0-9, +, /, =)
+	import string
+	base64_chars = string.ascii_letters + string.digits + '+/='
+	invalid_chars = [c for c in base64_private_key if c not in base64_chars]
+	if invalid_chars:
+		sample = ''.join(set(invalid_chars[:5]))
+		raise ValueError(f"Private key contains invalid base64 characters: {repr(sample)}")
+	
+	# Attempt to decode base64
+	try:
+		decoded_key = base64.b64decode(base64_private_key, validate=True)
+	except Exception as e:
+		raise ValueError(f"Private key is not valid base64 encoding: {e}")
+	
+	if len(decoded_key) != 32:
+		raise ValueError(
+			f"Private key must decode to exactly 32 bytes for Ed25519, got {len(decoded_key)} bytes"
+		)
+	
+	# Verify decoded bytes are not all zeros (would be invalid key)
+	if all(b == 0 for b in decoded_key):
+		raise ValueError("Private key decodes to all zeros (invalid Ed25519 key)")
+	
+	# Step 5: Test that private key can create a SigningKey (final validation)
+	try:
+		from nacl.signing import SigningKey
+		test_key = SigningKey(decoded_key)
+		# If we get here, key is valid
+	except Exception as e:
+		raise ValueError(f"Private key cannot create valid SigningKey: {e}")
+	
+	return api_key, base64_private_key
+
+#API STUFF - Read and validate encrypted keys
 API_KEY = ""
 BASE64_PRIVATE_KEY = ""
 
-# Read encrypted API credentials
+# Load and validate API credentials with comprehensive format checking
 try:
-    if os.path.exists('rh_key.enc'):
-        with open('rh_key.enc', 'rb') as f:
-            API_KEY = _decrypt_with_dpapi(f.read()).strip()
-    else:
-        API_KEY = ""
+    API_KEY, BASE64_PRIVATE_KEY = _load_and_validate_api_credentials()
+    print(f"✅ API credentials loaded and validated successfully")
+except FileNotFoundError as e:
+    print(f"\n{'='*60}")
+    print(f"❌ API CREDENTIAL ERROR: Files Not Found")
+    print(f"{'='*60}")
+    print(f"{e}")
+    print(f"\nOpen the GUI and go to:")
+    print(f"  Settings → Robinhood API → Setup / Update")
+    print(f"{'='*60}\n")
+    raise SystemExit(1)
+except ValueError as e:
+    print(f"\n{'='*60}")
+    print(f"❌ API CREDENTIAL ERROR: Invalid Format")
+    print(f"{'='*60}")
+    print(f"{e}")
+    print(f"\nYour credential files may be corrupted.")
+    print(f"To fix:")
+    print(f"  1. Open the GUI")
+    print(f"  2. Go to Settings → Robinhood API → Setup / Update")
+    print(f"  3. Re-generate your credentials")
+    print(f"{'='*60}\n")
+    raise SystemExit(1)
+except RuntimeError as e:
+    print(f"\n{'='*60}")
+    print(f"❌ API CREDENTIAL ERROR: Decryption Failed")
+    print(f"{'='*60}")
+    print(f"{e}")
+    print(f"\nThis can happen if:")
+    print(f"  - Files were encrypted by a different Windows user")
+    print(f"  - Files were copied from another machine")
+    print(f"  - Windows user profile was recreated")
+    print(f"\nTo fix, re-generate credentials on THIS machine:")
+    print(f"  Settings → Robinhood API → Setup / Update")
+    print(f"{'='*60}\n")
+    raise SystemExit(1)
 except Exception as e:
-    print(f"\n{'!'*60}")
-    print(f"❌ ERROR: Failed to read API key: {e}")
-    print(f"{'!'*60}\n")
-    API_KEY = ""
-
-try:
-    if os.path.exists('rh_secret.enc'):
-        with open('rh_secret.enc', 'rb') as f:
-            BASE64_PRIVATE_KEY = _decrypt_with_dpapi(f.read()).strip()
-    else:
-        BASE64_PRIVATE_KEY = ""
-except Exception as e:
-    print(f"\n{'!'*60}")
-    print(f"❌ ERROR: Failed to read private key: {e}")
-    print(f"{'!'*60}\n")
-    BASE64_PRIVATE_KEY = ""
-
-if not API_KEY or not BASE64_PRIVATE_KEY:
-    print(
-        "\n[ApolloTrader] Robinhood API credentials not found.\n"
-        "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
-        "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
-        "and will save rh_key.enc + rh_secret.enc (encrypted) so this trader can authenticate.\n"
-    )
+    print(f"\n{'='*60}")
+    print(f"❌ API CREDENTIAL ERROR: Unexpected Error")
+    print(f"{'='*60}")
+    print(f"{e}")
+    print(f"\nPlease report this error and re-generate credentials:")
+    print(f"  Settings → Robinhood API → Setup / Update")
+    print(f"{'='*60}\n")
     raise SystemExit(1)
 
 # Note: the script intentionally exits if Robinhood credentials are missing.
@@ -438,6 +624,9 @@ class CryptoAPITrading:
         # Keep a copy of the folder map so we can locate per-coin data files (memories, signals, etc.)
         # This mirrors the path resolution used in pt_trainer.py and pt_thinker.py
         self.path_map = dict(base_paths)
+        
+        # Store coin categories for buy/sell filtering
+        self.coin_categories = dict(coin_categories)
 
         # Initialize Robinhood API credentials from encrypted key files
         self.api_key = API_KEY
@@ -685,6 +874,62 @@ class CryptoAPITrading:
         return s
 
     @staticmethod
+    def _read_validated_signal(
+        file_path: str, 
+        signal_name: str,
+        min_value: int = 0,
+        max_value: int = 10,
+        default_value: int = 0
+    ) -> int:
+        """Read and validate a neural signal from file with range checking.
+        
+        Args:
+            file_path: Path to signal file
+            signal_name: Name for logging (e.g., "long_dca_signal")
+            min_value: Minimum valid signal value (default 0)
+            max_value: Maximum valid signal value (default 10 for 7 timeframes + buffer)
+            default_value: Value to return on error or invalid range (default 0)
+        
+        Returns:
+            Validated signal value or default_value if invalid
+        
+        Validation checks:
+            - File exists and is readable
+            - Content is parseable as integer
+            - Value is within [min_value, max_value] range
+            - Handles corrupt/malformed files gracefully
+        """
+        try:
+            if not os.path.isfile(file_path):
+                debug_print(f"[DEBUG] TRADER: Signal file not found: {file_path}, using default {default_value}")
+                return default_value
+            
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            
+            if not raw:
+                debug_print(f"[DEBUG] TRADER: Empty signal file: {file_path}, using default {default_value}")
+                return default_value
+            
+            # Parse as integer (handle float strings like "4.0")
+            try:
+                signal = int(float(raw))
+            except ValueError as e:
+                debug_print(f"[WARNING] TRADER: Invalid {signal_name} format '{raw}' in {file_path}: {e}, using default {default_value}")
+                return default_value
+            
+            # Validate range
+            if not (min_value <= signal <= max_value):
+                debug_print(f"[WARNING] TRADER: {signal_name} value {signal} outside valid range [{min_value}, {max_value}] in {file_path}, using default {default_value}")
+                return default_value
+            
+            return signal
+            
+        except Exception as e:
+            debug_print(f"[ERROR] TRADER: Failed to read {signal_name} from {file_path}: {e}, using default {default_value}")
+            return default_value
+
+    @staticmethod
     def _read_long_dca_signal(symbol: str) -> int:
         """
         Reads long_dca_signal.dat from the per-coin folder (same folder rules as trader.py).
@@ -692,17 +937,20 @@ class CryptoAPITrading:
         Used for:
         - Start gate: start trades when signal >= entry_signals.long_signal_min (default 4)
         - DCA assist: stages offset from entry (e.g., if entry=4: stage 0 at L4, stage 1 at L5)
+        
+        Returns:
+            Validated signal value (0-10 range) or 0 if invalid/missing
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, os.path.join(main_dir, sym))
         path = os.path.join(folder, "long_dca_signal.dat")
-        try:
-            with open(path, "r") as f:
-                raw = f.read().strip()
-            val = int(float(raw))
-            return val
-        except Exception:
-            return 0
+        return CryptoAPITrading._read_validated_signal(
+            path, 
+            f"{sym}_long_dca_signal",
+            min_value=0,
+            max_value=10,
+            default_value=0
+        )
 
     @staticmethod
     def _read_short_dca_signal(symbol: str) -> int:
@@ -712,17 +960,20 @@ class CryptoAPITrading:
         Used for:
         - Start gate: start trades when signal <= entry_signals.short_signal_max (default 0)
         - DCA assist: levels map to trader DCA stages for short positions
+        
+        Returns:
+            Validated signal value (0-10 range) or 0 if invalid/missing
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, os.path.join(main_dir, sym))
         path = os.path.join(folder, "short_dca_signal.dat")
-        try:
-            with open(path, "r") as f:
-                raw = f.read().strip()
-            val = int(float(raw))
-            return val
-        except Exception:
-            return 0
+        return CryptoAPITrading._read_validated_signal(
+            path, 
+            f"{sym}_short_dca_signal",
+            min_value=0,
+            max_value=10,
+            default_value=0
+        )
 
     @staticmethod
     def _read_long_price_levels(symbol: str) -> list:
@@ -1714,6 +1965,7 @@ class CryptoAPITrading:
         try:
             _refresh_paths_and_symbols()
             self.path_map = dict(base_paths)
+            self.coin_categories = dict(coin_categories)
         except Exception:
             pass
 
@@ -2213,6 +2465,15 @@ class CryptoAPITrading:
                                     )
                                     debug_print(f"[DEBUG] TRADER: MTF exit confirmation passed for {symbol}")
                             
+                            # Check coin category - block profit sells for accumulation coins
+                            coin_category = self.coin_categories.get(symbol, "active")
+                            if coin_category == "accumulate":
+                                print(f"[{symbol}] Trailing PM sell skipped: Accumulation coin (no profit sells)")
+                                debug_print(f"[DEBUG] TRADER: Blocking trailing PM sell for {symbol} - accumulation coin")
+                                # Reset was_above to prevent repeated attempts
+                                state["was_above"] = False
+                                continue
+                            
                             # MTF check passed or stop-loss - execute sell
                             print(f"[{symbol}] Trailing PM triggered: Price ${current_sell_price:.8f} fell below line ${state['line']:.8f}")
                             print(f"[{symbol}] Expected P&L: {expected_pnl_pct:+.2f}%{sim_prefix()}")
@@ -2304,8 +2565,13 @@ class CryptoAPITrading:
                 dca_amount = value * dca_multiplier
                 print(f"[{symbol}] Current Value: ${value:.2f} | DCA Amount: ${dca_amount:.2f} | Buying Power: ${buying_power:.2f}")
 
-                recent_dca = self._dca_window_count(symbol)
-                if recent_dca >= int(getattr(self, "max_dca_buys_per_window", 2)):
+                # Check coin category - skip DCA for liquidation coins (sell-only)
+                coin_category = self.coin_categories.get(symbol, "active")
+                if coin_category == "liquidate":
+                    print(f"[{symbol}] DCA skipped: Liquidation coin (sell-only)")
+                    debug_print(f"[DEBUG] TRADER: Skipping DCA for {symbol} - liquidation coin")
+                elif self._dca_window_count(symbol) >= int(getattr(self, "max_dca_buys_per_window", 2)):
+                    recent_dca = self._dca_window_count(symbol)
                     print(f"[{symbol}] DCA skipped: {recent_dca} buys in last {self.dca_window_seconds/3600:.0f}h (max {self.max_dca_buys_per_window})")
 
                 elif dca_amount <= buying_power:
@@ -2421,13 +2687,19 @@ class CryptoAPITrading:
                 start_index += 1
                 continue
 
-            # Check max concurrent positions limit
+            # Check max concurrent positions limit (only count active trading coins)
             trading_cfg = _load_trading_config()
             max_positions = trading_cfg.get("position_sizing", {}).get("max_concurrent_positions", 3)
-            current_positions = len([h for h in holdings.get("results", []) if h.get("asset_code") != "USDC"])
             
-            if current_positions >= max_positions:
-                debug_print(f"[DEBUG] TRADER: Skipping {base_symbol} entry - at max positions ({current_positions}/{max_positions})")
+            # Only count active trading coins in position limit (exclude accumulate & liquidate)
+            active_positions = len([
+                h for h in holdings.get("results", []) 
+                if h.get("asset_code") != "USDC" 
+                and self.coin_categories.get(h.get("asset_code", ""), "active") == "active"
+            ])
+            
+            if active_positions >= max_positions:
+                debug_print(f"[DEBUG] TRADER: Skipping {base_symbol} entry - at max active positions ({active_positions}/{max_positions})")
                 start_index += 1
                 continue
 
@@ -2461,6 +2733,14 @@ class CryptoAPITrading:
                         f"[DEBUG] TRADER: Entry blocked for {base_symbol} - "
                         f"excessive bearish signals ({sell_count} > {short_max})"
                     )
+                start_index += 1
+                continue
+            
+            # Check coin category - block entry for liquidation coins (sell-only)
+            coin_category = self.coin_categories.get(base_symbol, "active")
+            if coin_category == "liquidate":
+                print(f"[{base_symbol}] Entry blocked: Liquidation coin (sell-only)")
+                debug_print(f"[DEBUG] TRADER: Blocking entry for {base_symbol} - liquidation coin")
                 start_index += 1
                 continue
             
@@ -2509,6 +2789,59 @@ class CryptoAPITrading:
             debug_print("[DEBUG] TRADER: Trades made this cycle, reinitializing DCA levels...")
             self.initialize_dca_levels()
 
+        # Step 8: Dust cleanup for liquidation coins - auto-remove when balance drops below dust threshold
+        try:
+            # Dust threshold: remove when balance < $0.50 (true dust / fully liquidated)
+            # This is separate from min_allocation_usd (which is for opening new positions)
+            dust_threshold = 0.50
+            
+            # Check each liquidation coin for dust threshold
+            for coin_symbol, category in self.coin_categories.items():
+                if category != "liquidate":
+                    continue
+                
+                # Get current balance for this liquidation coin
+                pos = positions.get(coin_symbol)
+                balance_usd = 0.0 if not pos else float(pos.get("value_usd", 0.0))
+                
+                # If balance is below dust threshold (including $0), remove from liquidation list
+                if balance_usd < dust_threshold:
+                    print(f"[{coin_symbol}] Dust cleanup: Balance ${balance_usd:.2f} below dust threshold (${dust_threshold:.2f}), removing from liquidation list")
+                    
+                    # Remove from coin_categories and update settings
+                    try:
+                        # Load current GUI settings file directly (not through cache which flattens the structure)
+                        with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                            full_settings = json.load(f) or {}
+                        
+                        coins_dict = full_settings.get("coins", {"active": [], "accumulate": [], "liquidate": []})
+                        
+                        if isinstance(coins_dict, dict) and coin_symbol in coins_dict.get("liquidate", []):
+                            # Remove from liquidation list
+                            coins_dict["liquidate"] = [c for c in coins_dict.get("liquidate", []) if c != coin_symbol]
+                            
+                            # Update settings file
+                            full_settings["coins"] = coins_dict
+                            
+                            with open(_GUI_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                                json.dump(full_settings, f, indent=2)
+                            
+                            # Update local cache
+                            self.coin_categories.pop(coin_symbol, None)
+                            
+                            # Force immediate reload of coin list to stop monitoring this coin
+                            try:
+                                _refresh_paths_and_symbols()
+                                self.coin_categories = dict(coin_categories)
+                            except Exception:
+                                pass
+                            
+                            print(f"[{coin_symbol}] ✓ Removed from liquidation list (fully liquidated)")
+                    except Exception as e:
+                        print(f"[{coin_symbol}] ERROR: Failed to remove from liquidation list: {e}")
+        except Exception:
+            pass
+        
         # Write combined holdings and zero-holdings status for GUI hub display
         try:
             status = {

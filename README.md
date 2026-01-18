@@ -2,9 +2,19 @@
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
 
 **Version:** Apollo Trader 26 
-**Features:** Debug mode, simulation mode, configurable themes, enhanced error handling, and comprehensive settings system.
+**Features:** Three-category coin management, debug mode, simulation mode, configurable themes, enhanced error handling, and comprehensive settings system.
 
 ## Recent Updates
+
+**Three-Category Coin Management System:**
+- **Active Trading Coins**: Full buy/sell automation with position limits (default: ETH, SOL, XRP, LINK)
+- **Accumulation Coins**: Buy-only strategy for long-term holding, stop-loss only sells, unlimited positions (default: BTC)
+- **Liquidation Coins**: Sell-only to exit unwanted positions, auto-removes at dust threshold (default: DOGE)
+- **Visual Feedback**: Color-coded coin buttons (green for accumulate, red for liquidate) in chart tabs
+- **Position Limit Fix**: Only active trading coins count toward max concurrent positions
+- **Auto-Cleanup**: Liquidation coins automatically removed when balance drops below minimum trade size
+- **Safety**: System never touches coins not listed in any category
+- **Hot-Reload**: Category changes take effect immediately without restart
 
 **Enhanced AI Pattern Matching:**
 - **Kernel-Weighted Predictions**: AI now uses exponential distance weighting (e^(-diff/threshold)) where closer pattern matches contribute more to predictions. This significantly improves prediction accuracy by prioritizing the most similar historical patterns.
@@ -90,7 +100,9 @@ The Hub menu bar contains:
 
 To configure settings, click **Settings → Hub Settings** and configure:
 
-- **Coins (comma-separated)**: Start with **BTC** for your first run. Add more coins later (ETH, XRP, BNB, DOGE, etc.).
+- **Active Trading Coins (comma-separated)**: Coins for full buy/sell trading (default: ETH, SOL, XRP, LINK). Start with one or two coins for your first run.
+- **Accumulation Coins (comma-separated)**: Buy-only coins for long-term holding (default: BTC). System will buy on signals and DCA, but only sell on stop-loss.
+- **Liquidation Coins (comma-separated)**: Sell-only coins to exit positions (default: DOGE). System will sell on profit/stop-loss but never buy. Auto-removes from list when balance drops below minimum trade size.
 - **Main neural folder**: Already set to your ApolloTrader directory by default.
 - **Robinhood API**: Click **Setup Wizard** and follow these steps:
   1. Click **Generate Keys**.
@@ -131,6 +143,44 @@ ApolloTrader includes customizable settings so you can tune the bot to your pref
 - Auto-retrain option (future feature)
 
 All settings have built-in validation and save instantly. Changes to trading settings take effect immediately (no restart needed). The white marker lines on the Neural Signal display update automatically when you change entry signal thresholds.
+
+### Understanding Coin Categories
+
+ApolloTrader organizes coins into three strategic categories, each with different trading behavior:
+
+#### Active Trading Coins
+**Full automated trading** - The system will both buy and sell based on AI signals:
+- **Buys**: Opens positions when entry signals meet threshold (default: LONG ≥4, SHORT ≤0)
+- **DCA**: Adds to positions on drawdowns using neural levels or hardcoded percentages
+- **Sells**: Exits on trailing profit margin or stop-loss
+- **Position Limits**: Counts toward max concurrent positions limit (default: 3)
+- **Use Case**: Coins you want to actively trade for profit
+
+#### Accumulation Coins  
+**Buy-only strategy** - Build long-term positions without selling:
+- **Buys**: Opens positions on entry signals, same as active trading
+- **DCA**: Adds to positions on drawdowns to lower cost basis
+- **Sells**: **Only on stop-loss** (default: -40%) for emergency exit
+- **Position Limits**: Does NOT count toward position limits (unlimited accumulation)
+- **Use Case**: Coins you believe in long-term and want to accumulate (e.g., BTC, ETH)
+- **Chart Display**: Shown in **green** in coin list above charts
+
+#### Liquidation Coins
+**Sell-only strategy** - Exit unwanted positions:
+- **Buys**: **Blocked** - system will never open new positions
+- **DCA**: **Blocked** - will not add to existing positions  
+- **Sells**: Exits on trailing profit margin or stop-loss
+- **Position Limits**: Does NOT count toward position limits
+- **Auto-Cleanup**: Automatically removed from list when balance drops below minimum trade size (dust threshold)
+- **Use Case**: Coins you want to exit but don't want to market dump (e.g., meme coins, failed trades)
+- **Chart Display**: Shown in **red** in coin list above charts
+
+**Safety Feature**: The system will NEVER touch coins not listed in any of these three categories. This protects holdings you may have that you don't want the bot to trade.
+
+**Example Configuration**:
+- **Active**: ETH, SOL, XRP, LINK (day trading)
+- **Accumulation**: BTC (long-term HODLing)
+- **Liquidation**: DOGE (exiting old position)
 
 ---
 
@@ -335,7 +385,8 @@ If a coin shows "NOT TRAINED / OUTDATED", run training before starting the bot.
 ### Hot-Reload Configuration
 All configuration changes take effect without restarting:
 - Trading parameters update immediately (trader checks config every loop)
-- Coin list changes are detected on-the-fly (both hub and trader)
+- Coin list and category changes are detected on-the-fly (both hub and trader)
+- Moving coins between categories takes effect immediately
 - Theme updates apply after Hub reload
 - Debug mode toggles instantly
 - Entry signal thresholds update Neural Signal display markers in real-time
@@ -345,10 +396,15 @@ All configuration changes take effect without restarting:
 ## Adding more coins (later)
 
 1. Open **Settings → Hub Settings**
-2. Add one new coin
-3. Save
+2. Add coins to the appropriate category:
+   - **Active Trading Coins**: For full buy/sell trading
+   - **Accumulation Coins**: For buy-only long-term holding
+   - **Liquidation Coins**: For sell-only position exits
+3. Save (the system will create folders and copy trainers for new coins)
 4. Click **Train All**, wait for training to complete
 5. Click **Start All**
+
+**Note**: You can move coins between categories at any time. The trader will adapt to the new behavior on the next trading cycle (no restart needed). Existing positions remain intact when you change categories.
 
 ---
 
@@ -406,6 +462,7 @@ All improvements maintain 100% backward compatibility with the original trading 
 **Original Author:** Stephen Hughes (garagesteve1155)
 
 This fork includes substantial improvements including:
+- Three-category coin management (Active/Accumulation/Liquidation)
 - Configurable training parameters via GUI
 - Enhanced error handling and debugging systems
 - Performance optimizations and code cleanup

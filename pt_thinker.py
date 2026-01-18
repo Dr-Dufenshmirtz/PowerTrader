@@ -83,6 +83,7 @@ import json
 import uuid
 import logging
 import math
+import threading
 from contextlib import contextmanager
 
 # Ensure clean console output (avoid encoding issues)
@@ -210,40 +211,178 @@ class RobinhoodMarketData:
 		
 		return price
 
+def _load_and_validate_thinker_credentials(base_dir: str) -> tuple:
+	"""Load and validate Robinhood API credentials for Thinker with strict format checking.
+	
+	Args:
+		base_dir: Directory containing the credential files
+	
+	Returns:
+		tuple: (api_key: str, base64_private_key: str)
+	
+	Raises:
+		FileNotFoundError: If credential files don't exist
+		ValueError: If credentials are invalid format
+		RuntimeError: If decryption fails
+	
+	Validation checks:
+		- Files exist and are readable
+		- Decryption succeeds
+		- API key length >= 20 characters
+		- Private key is valid base64 (32 bytes decoded)
+		- Private key can create valid SigningKey
+	"""
+	key_path = os.path.join(base_dir, "rh_key.enc")
+	secret_path = os.path.join(base_dir, "rh_secret.enc")
+	
+	# Step 1: Check file existence
+	if not os.path.isfile(key_path):
+		raise FileNotFoundError(
+			f"API key file not found: {key_path}\n"
+			"Open the Hub and go to Settings → Robinhood API → Setup / Update."
+		)
+	
+	if not os.path.isfile(secret_path):
+		raise FileNotFoundError(
+			f"Private key file not found: {secret_path}\n"
+			"Open the Hub and go to Settings → Robinhood API → Setup / Update."
+		)
+	
+	# Step 2: Decrypt credentials
+	try:
+		with open(key_path, "rb") as f:
+			encrypted_key = f.read()
+			if not encrypted_key:
+				raise ValueError(f"File '{key_path}' is empty")
+			api_key = _decrypt_with_dpapi(encrypted_key).strip()
+	except Exception as e:
+		raise RuntimeError(f"Failed to decrypt API key: {e}")
+	
+	try:
+		with open(secret_path, "rb") as f:
+			encrypted_secret = f.read()
+			if not encrypted_secret:
+				raise ValueError(f"File '{secret_path}' is empty")
+			base64_private_key = _decrypt_with_dpapi(encrypted_secret).strip()
+	except Exception as e:
+		raise RuntimeError(f"Failed to decrypt private key: {e}")
+	
+	# Step 3: Validate API key format
+	if not api_key or len(api_key) == 0:
+		raise ValueError("API key is empty after decryption")
+	
+	if len(api_key) < 20:
+		raise ValueError(f"API key too short ({len(api_key)} chars, minimum 20 required)")
+	
+	if len(api_key) > 200:
+		raise ValueError(f"API key too long ({len(api_key)} chars, maximum 200)")
+	
+	if api_key != api_key.strip():
+		raise ValueError("API key contains leading or trailing whitespace")
+	
+	# Check for null bytes or control characters
+	if '\x00' in api_key:
+		raise ValueError("API key contains null bytes (corrupted)")
+	
+	# Check for newlines or tabs that could break API calls
+	if '\n' in api_key or '\r' in api_key or '\t' in api_key:
+		raise ValueError("API key contains newline or tab characters (corrupted)")
+	
+	# Validate character set (alphanumeric, hyphens, underscores)
+	import string
+	allowed_chars = string.ascii_letters + string.digits + '-_'
+	invalid_chars = [c for c in api_key if c not in allowed_chars]
+	if invalid_chars:
+		sample = ''.join(invalid_chars[:5])
+		raise ValueError(f"API key contains invalid characters: {repr(sample)}")
+	
+	# Step 4: Validate private key format
+	if not base64_private_key or len(base64_private_key) == 0:
+		raise ValueError("Private key is empty after decryption")
+	
+	# Check for null bytes or control characters
+	if '\x00' in base64_private_key:
+		raise ValueError("Private key contains null bytes (corrupted)")
+	
+	# Check for newlines/whitespace that could break base64 decoding
+	if '\n' in base64_private_key or '\r' in base64_private_key or '\t' in base64_private_key:
+		raise ValueError("Private key contains newline or tab characters (corrupted)")
+	
+	# Validate base64 character set
+	import string
+	base64_chars = string.ascii_letters + string.digits + '+/='
+	invalid_chars = [c for c in base64_private_key if c not in base64_chars]
+	if invalid_chars:
+		sample = ''.join(set(invalid_chars[:5]))
+		raise ValueError(f"Private key contains invalid base64 characters: {repr(sample)}")
+	
+	# Attempt to decode base64 with validation
+	try:
+		import base64 as b64
+		decoded_key = b64.b64decode(base64_private_key, validate=True)
+	except Exception as e:
+		raise ValueError(f"Private key is not valid base64: {e}")
+	
+	if len(decoded_key) != 32:
+		raise ValueError(f"Private key must be 32 bytes for Ed25519, got {len(decoded_key)} bytes")
+	
+	# Verify decoded bytes are not all zeros (invalid key)
+	if all(b == 0 for b in decoded_key):
+		raise ValueError("Private key decodes to all zeros (invalid Ed25519 key)")
+	
+	# Step 5: Test SigningKey creation
+	try:
+		from nacl.signing import SigningKey
+		test_key = SigningKey(decoded_key)
+	except Exception as e:
+		raise ValueError(f"Private key cannot create valid SigningKey: {e}")
+	
+	return api_key, base64_private_key
+
 def robinhood_current_ask(symbol: str) -> float:
     """
     Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
     Reads encrypted creds from rh_key.enc and rh_secret.enc in the same folder as this script.
+    
+    Credentials are validated on first use:
+        - File existence
+        - Decryption success
+        - Format validation (API key length, base64 private key)
+        - Ed25519 key compatibility
     """
     global _RH_MD
     if _RH_MD is None:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "rh_key.enc")
-        secret_path = os.path.join(base_dir, "rh_secret.enc")
-
-        api_key = None
-        priv_b64 = None
         
-        # Read encrypted files
+        # Load and validate credentials with comprehensive checking
         try:
-            if os.path.isfile(key_path):
-                with open(key_path, "rb") as f:
-                    api_key = _decrypt_with_dpapi(f.read())
-        except Exception as e:
-            print(f"⚠ [Thinker] Warning: Failed to read encrypted API key: {e}", flush=True)
-        
-        try:
-            if os.path.isfile(secret_path):
-                with open(secret_path, "rb") as f:
-                    priv_b64 = _decrypt_with_dpapi(f.read())
-        except Exception as e:
-            print(f"⚠ [Thinker] Warning: Failed to read encrypted private key: {e}", flush=True)
-
-        if not api_key or not priv_b64:
-            raise RuntimeError(
-                "Missing rh_key.enc and/or rh_secret.enc next to pt_thinker.py. "
-                "Open the Hub and go to Settings → Robinhood API → Setup / Update to configure encrypted keys."
-            )
+            api_key, priv_b64 = _load_and_validate_thinker_credentials(base_dir)
+            debug_print("[DEBUG] THINKER: API credentials loaded and validated successfully")
+        except FileNotFoundError as e:
+            print(f"\n{'='*60}", flush=True)
+            print(f"❌ [Thinker] API Credentials Not Found", flush=True)
+            print(f"{'='*60}", flush=True)
+            print(f"{e}", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            raise
+        except ValueError as e:
+            print(f"\n{'='*60}", flush=True)
+            print(f"❌ [Thinker] Invalid API Credential Format", flush=True)
+            print(f"{'='*60}", flush=True)
+            print(f"{e}", flush=True)
+            print(f"\nYour credential files may be corrupted.", flush=True)
+            print(f"Re-generate via Hub: Settings → Robinhood API → Setup / Update", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            raise
+        except RuntimeError as e:
+            print(f"\n{'='*60}", flush=True)
+            print(f"❌ [Thinker] API Credential Decryption Failed", flush=True)
+            print(f"{'='*60}", flush=True)
+            print(f"{e}", flush=True)
+            print(f"\nFiles may be from different Windows user or machine.", flush=True)
+            print(f"Re-generate via Hub: Settings → Robinhood API → Setup / Update", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            raise
 
         _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
 
@@ -438,22 +577,40 @@ def _load_gui_coins() -> list:
 	Returns:
 		List of uppercased coin symbols to track (e.g., ['BTC', 'ETH', 'XRP'])
 	"""
+	debug_print("[DEBUG] _load_gui_coins() called")
+	debug_print(f"[DEBUG] _GUI_SETTINGS_PATH = {_GUI_SETTINGS_PATH}")
 	try:
 		if not os.path.isfile(_GUI_SETTINGS_PATH):
+			debug_print(f"[DEBUG] gui_settings.json not found, returning cached: {_gui_settings_cache['coins']}")
 			return list(_gui_settings_cache["coins"])
 
 		mtime = os.path.getmtime(_GUI_SETTINGS_PATH)
 		if _gui_settings_cache["mtime"] == mtime:
 			return list(_gui_settings_cache["coins"])
 
+		debug_print(f"[DEBUG] Reading gui_settings.json")
 		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
 			data = json.load(f) or {}
+		debug_print(f"[DEBUG] JSON loaded successfully")
 
-		coins = data.get("coins", None)
-		if not isinstance(coins, list) or not coins:
+		# Handle new three-category structure or legacy list format
+		coins_raw = data.get("coins", None)
+		debug_print(f"[DEBUG] coins_raw type: {type(coins_raw)}, value: {coins_raw}")
+		if isinstance(coins_raw, dict):
+			# New format: combine all three categories
+			all_coins = (
+				coins_raw.get("active", []) + 
+				coins_raw.get("accumulate", []) + 
+				coins_raw.get("liquidate", [])
+			)
+			coins = [str(c).strip().upper() for c in all_coins if str(c).strip()]
+		elif isinstance(coins_raw, list):
+			# Legacy format: list of coins
+			coins = [str(c).strip().upper() for c in coins_raw if str(c).strip()]
+		else:
+			# Fallback
 			coins = list(_gui_settings_cache["coins"])
-
-		coins = [str(c).strip().upper() for c in coins if str(c).strip()]
+		
 		if not coins:
 			coins = list(_gui_settings_cache["coins"])
 
@@ -463,25 +620,37 @@ def _load_gui_coins() -> list:
 		
 		# Validate coin symbols for safety (prevent path traversal, ensure proper format)
 		valid_coins = []
+		debug_print(f"[DEBUG] Validating {len(coins)} coins: {coins}")
 		for coin in coins:
 			if _is_valid_coin_symbol(coin):
 				valid_coins.append(coin)
+				debug_print(f"[DEBUG] Coin {coin} passed validation")
 			else:
+				print(f"[SECURITY] Rejected invalid coin symbol: {repr(coin)}", flush=True)
 				debug_print(f"[SECURITY] Rejected invalid coin symbol: {repr(coin)}")
 		
+		debug_print(f"[DEBUG] After validation: {len(valid_coins)} valid coins")
 		if not valid_coins:
+			print("[SECURITY] No valid coins after validation, using cached defaults", flush=True)
 			debug_print("[SECURITY] No valid coins after validation, using cached defaults")
 			valid_coins = list(_gui_settings_cache["coins"])
 
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = valid_coins
+		debug_print(f"[DEBUG] _load_gui_coins() returning: {valid_coins}")
 		return list(valid_coins)
-	except Exception:
+	except Exception as e:
+		debug_print(f"[DEBUG] _load_gui_coins() exception: {e}")
 		return list(_gui_settings_cache["coins"])
 
 # Initial coin list (will be kept live via _sync_coins_from_settings())
 COIN_SYMBOLS = _load_gui_coins()
 CURRENT_COINS = list(COIN_SYMBOLS)
+print(f"Loaded {len(CURRENT_COINS)} coins: {COIN_SYMBOLS}", flush=True)
+if not CURRENT_COINS:
+	print("WARNING: No coins loaded! Using fallback defaults", flush=True)
+	CURRENT_COINS = ['BTC', 'ETH', 'SOL']
+	COIN_SYMBOLS = list(CURRENT_COINS)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -521,14 +690,21 @@ def coin_directory(sym: str):
 	Ensures CWD is always restored even if an exception occurs.
 	Creates the directory if it doesn't exist.
 	"""
+	debug_print(f"[DEBUG] coin_directory({sym}) - Entry")
 	old_dir = os.getcwd()
+	debug_print(f"[DEBUG] coin_directory({sym}) - Current dir: {old_dir}")
 	try:
 		folder = coin_folder(sym)
+		debug_print(f"[DEBUG] coin_directory({sym}) - Target folder: {folder}")
 		# Ensure folder exists before attempting to cd
 		os.makedirs(folder, exist_ok=True)
+		debug_print(f"[DEBUG] coin_directory({sym}) - About to chdir")
 		os.chdir(folder)
+		debug_print(f"[DEBUG] coin_directory({sym}) - Changed to {folder}, yielding")
 		yield
+		debug_print(f"[DEBUG] coin_directory({sym}) - Returning from yield")
 	finally:
+		debug_print(f"[DEBUG] coin_directory({sym}) - Finally block, restoring dir to {old_dir}")
 		os.chdir(old_dir)
 
 
@@ -626,6 +802,143 @@ except Exception:
 
 RUNNER_READY_PATH = os.path.join(HUB_DIR, "runner_ready.json")
 
+class FileOperationTimeout(Exception):
+	"""Raised when a file operation exceeds timeout."""
+	pass
+
+def _run_with_timeout(func, args: tuple, kwargs: dict, timeout_seconds: float):
+	"""Run a function with timeout protection using threading (Windows-compatible).
+	
+	Args:
+		func: Function to execute
+		args: Positional arguments for function
+		kwargs: Keyword arguments for function
+		timeout_seconds: Maximum execution time in seconds
+	
+	Returns:
+		Result from function if successful
+	
+	Raises:
+		FileOperationTimeout: If function exceeds timeout
+		Exception: Any exception raised by the function
+	"""
+	result = [None]
+	exception = [None]
+	
+	def wrapper():
+		try:
+			result[0] = func(*args, **kwargs)
+		except Exception as e:
+			exception[0] = e
+	
+	thread = threading.Thread(target=wrapper, daemon=True)
+	thread.start()
+	thread.join(timeout_seconds)
+	
+	if thread.is_alive():
+		# Thread still running after timeout
+		raise FileOperationTimeout(f"File operation exceeded {timeout_seconds}s timeout")
+	
+	if exception[0]:
+		raise exception[0]
+	
+	return result[0]
+
+def _atomic_write_json_safe(path: str, data: dict, timeout: float = 5.0, max_retries: int = 3) -> None:
+	"""Atomic write for JSON files with timeout and retry protection.
+	
+	Args:
+		path: Target file path
+		data: Dictionary to write as JSON
+		timeout: Maximum seconds per write attempt (default 5.0)
+		max_retries: Maximum retry attempts on timeout/error (default 3)
+	
+	Raises:
+		FileOperationTimeout: If all retries exceed timeout
+		Exception: If all retries fail with other errors
+	"""
+	for attempt in range(max_retries):
+		try:
+			# Use unique temp file name to avoid conflicts
+			tmp = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+			
+			def write_op():
+				with open(tmp, "w", encoding="utf-8") as f:
+					json.dump(data, f, indent=2)
+				os.replace(tmp, path)
+			
+			_run_with_timeout(write_op, (), {}, timeout)
+			return  # Success
+			
+		except FileOperationTimeout:
+			debug_print(f"[WARNING] THINKER: JSON write timeout on attempt {attempt + 1}/{max_retries}: {path}")
+			if attempt == max_retries - 1:
+				debug_print(f"[ERROR] THINKER: All JSON write attempts timed out for: {path}")
+				raise
+			time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+			
+		except Exception as e:
+			debug_print(f"[WARNING] THINKER: JSON write error on attempt {attempt + 1}/{max_retries}: {e}")
+			if attempt == max_retries - 1:
+				debug_print(f"[ERROR] THINKER: All JSON write attempts failed for: {path}")
+				raise
+			time.sleep(0.5 * (attempt + 1))
+		finally:
+			# Clean up temp file if it exists
+			try:
+				if os.path.exists(tmp):
+					os.remove(tmp)
+			except:
+				pass
+
+def _atomic_write_text_safe(path: str, content: str, timeout: float = 5.0, max_retries: int = 3) -> None:
+	"""Atomic write for text files with timeout and retry protection.
+	
+	Args:
+		path: Target file path
+		content: String content to write
+		timeout: Maximum seconds per write attempt (default 5.0)
+		max_retries: Maximum retry attempts on timeout/error (default 3)
+	
+	Raises:
+		FileOperationTimeout: If all retries exceed timeout
+		Exception: If all retries fail with other errors
+	"""
+	for attempt in range(max_retries):
+		try:
+			# Use unique temp file name to avoid conflicts
+			tmp = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+			
+			def write_op():
+				with open(tmp, "w", encoding="utf-8") as f:
+					f.write(content)
+				os.replace(tmp, path)
+			
+			_run_with_timeout(write_op, (), {}, timeout)
+			return  # Success
+			
+		except FileOperationTimeout:
+			debug_print(f"[WARNING] THINKER: Text write timeout on attempt {attempt + 1}/{max_retries}: {path}")
+			if attempt == max_retries - 1:
+				debug_print(f"[ERROR] THINKER: All text write attempts timed out for: {path}")
+				raise
+			time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+			
+		except Exception as e:
+			debug_print(f"[WARNING] THINKER: Text write error on attempt {attempt + 1}/{max_retries}: {e}")
+			if attempt == max_retries - 1:
+				debug_print(f"[ERROR] THINKER: All text write attempts failed for: {path}")
+				raise
+			time.sleep(0.5 * (attempt + 1))
+		finally:
+			# Clean up temp file if it exists
+			try:
+				if os.path.exists(tmp):
+					os.remove(tmp)
+			except:
+				pass
+
+# Legacy atomic write functions (kept for backward compatibility, no timeout protection)
 def _atomic_write_json(path: str, data: dict) -> None:
 	try:
 		tmp = path + ".tmp"
@@ -897,8 +1210,11 @@ class APIRateLimiter:
 _rate_limiter = APIRateLimiter()
 
 # Ensure folders exist for the current configured coins so signal files can be written
+debug_print(f"[DEBUG] Creating folders for coins: {CURRENT_COINS}")
 for _sym in CURRENT_COINS:
+	debug_print(f"[DEBUG] Creating folder for: {_sym}")
 	os.makedirs(coin_folder(_sym), exist_ok=True)
+debug_print(f"[DEBUG] Folder creation complete")
 
 # Required timeframes that the Thinker uses for multi-timeframe predictions and neural level signals.
 # All seven timeframes MUST be trained before the Thinker can produce valid trading signals. The
@@ -934,6 +1250,7 @@ try:
 		KERNEL_BANDWIDTH = BASE_KERNEL_BANDWIDTH * enforcement_value
 		
 		print(f"Loaded pattern_size={PATTERN_SIZE}, enable_pattern_fallback={ENABLE_PATTERN_FALLBACK}, threshold_enforcement={threshold_enforcement} (cutoff={MAX_CUTOFF_MULTIPLIER:.2f}x, perfect={PERFECT_MATCH_MULTIPLIER:.2f}x, kernel={KERNEL_BANDWIDTH:.2f}x) from training_settings.json", flush=True)
+		debug_print(f"[DEBUG] Training settings loaded successfully")
 except Exception as e:
 	# Print error immediately (before any other initialization) so Hub can capture it
 	print(f"FATAL ERROR: Failed to load training_settings.json: {e}", flush=True)
@@ -1229,7 +1546,13 @@ def _sync_coins_from_settings():
 _write_runner_ready(False, stage="starting", ready_coins=[], total_coins=len(CURRENT_COINS))
 
 def init_coin(sym: str):
+	debug_print(f"[DEBUG] init_coin({sym}) - Entry point reached")
+	try:
+		debug_print(f"[DEBUG] init_coin({sym}) - About to enter coin_directory context")
+	except Exception as e:
+		print(f"[ERROR] Failed to print debug message: {e}", flush=True)
 	with coin_directory(sym):
+		debug_print(f"[DEBUG] Changed to coin directory for {sym}")
 
 		# per-coin "version" + on/off files (no collisions between coins)
 		_atomic_write_text('alerts_version.dat', '5/3/2022/9am')
@@ -1239,6 +1562,7 @@ def init_coin(sym: str):
 		st = new_coin_state()
 
 		coin = sym + '-USDT'
+		debug_print(f"[DEBUG] Fetching history for {coin}, starting with timeframe index 0")
 		ind = 0
 		tf_times_local = []
 		while True:
@@ -1251,18 +1575,27 @@ def init_coin(sym: str):
 					# The KuCoin client sometimes returns nested lists without a
 					# trailing comma; replace() calls normalize the string so the
 					# subsequent split() yields consistent elements.
+					debug_print(f"[DEBUG] Fetching kline: coin={coin}, tf={tf_choices[ind]}, attempt {init_retry_count + 1}")
 					_rate_limiter.wait_if_needed('kucoin')
+					debug_print(f"[DEBUG] About to call market.get_kline()")
 					history = str(market.get_kline(coin, tf_choices[ind])).replace(']]', '], ').replace('[[', '[')
+					debug_print(f"[DEBUG] Received kline data, validating...")
 					is_valid, history_list, error_msg = _validate_kline_response(history, coin, tf_choices[ind], 2)
 					if not is_valid:
+						print(f"[VALIDATION ERROR] {error_msg}", flush=True)
 						debug_print(f"[VALIDATION] {error_msg}")
 						raise ValueError(error_msg)
+					debug_print(f"[DEBUG] Kline validation passed for {coin} {tf_choices[ind]}")
 					break
 				except Exception as e:
 					init_retry_count += 1
+					print(f"[ERROR] Exception during kline fetch: {type(e).__name__}: {str(e)[:200]}", flush=True)
 					if init_retry_count >= init_max_retries:
 						debug_print(f"[DEBUG] {sym}: init_coin failed after {init_max_retries} retries on timeframe {tf_choices[ind]}")
-						handle_network_error(f"init_coin for {sym} (timeframe {tf_choices[ind]})", e)
+						print(f"WARNING: Failed to initialize {sym} after {init_max_retries} retries - skipping this coin", flush=True)
+						print(f"Last error: {type(e).__name__}: {str(e)}", flush=True)
+						raise  # Re-raise to be caught by outer try/except
+					debug_print(f"[DEBUG] Retry {init_retry_count}/{init_max_retries}, sleeping {_get_sleep_timing('sleep_api_retry')}s")
 					time.sleep(_get_sleep_timing("sleep_api_retry"))
 					if 'Requests' in str(e):
 						pass
@@ -1281,8 +1614,15 @@ def init_coin(sym: str):
 		states[sym] = st
 
 # init all coins once (from GUI settings)
+print(f"\nInitializing {len(CURRENT_COINS)} coins: {CURRENT_COINS}", flush=True)
 for _sym in CURRENT_COINS:
-	init_coin(_sym)
+	try:
+		print(f"Initializing coin: {_sym}", flush=True)
+		init_coin(_sym)
+		print(f"Successfully initialized: {_sym}", flush=True)
+	except Exception as e:
+		print(f"WARNING: Failed to initialize {_sym}: {e}", flush=True)
+		print(f"Continuing with remaining coins...", flush=True)
 
 # restore CWD to base after init
 os.chdir(BASE_DIR)
@@ -1369,12 +1709,15 @@ def step_coin(sym: str):
 		with coin_directory(sym):
 			try:
 				# Prevent new trades (and DCA) by forcing signals to 0 and keeping PM at baseline.
-				_atomic_write_text('futures_long_profit_margin.dat', str(MIN_PROFIT_MARGIN))
-				_atomic_write_text('futures_short_profit_margin.dat', str(MIN_PROFIT_MARGIN))
-				_atomic_write_text('long_dca_signal.dat', '0')
-				_atomic_write_text('short_dca_signal.dat', '0')
-			except Exception:
-				pass
+				# Use timeout-protected writes to prevent hangs on disk issues
+				_atomic_write_text_safe('futures_long_profit_margin.dat', str(MIN_PROFIT_MARGIN), timeout=3.0)
+				_atomic_write_text_safe('futures_short_profit_margin.dat', str(MIN_PROFIT_MARGIN), timeout=3.0)
+				_atomic_write_text_safe('long_dca_signal.dat', '0', timeout=3.0)
+				_atomic_write_text_safe('short_dca_signal.dat', '0', timeout=3.0)
+			except FileOperationTimeout as e:
+				debug_print(f"[ERROR] THINKER: Timeout writing untrained status for {sym}: {e}")
+			except Exception as e:
+				debug_print(f"[ERROR] THINKER: Failed writing untrained status for {sym}: {e}")
 		try:
 			display_cache[sym] = (
 				f"[{sym}] NOT TRAINED / OUTDATED\n"
@@ -1385,7 +1728,7 @@ def step_coin(sym: str):
 			pass
 		try:
 			_ready_coins.discard(sym)
-			all_ready = len(_ready_coins) >= len(CURRENT_COINS)
+			all_ready = len(_ready_coins) > 0  # At least one coin trained
 			_write_runner_ready(
 				all_ready,
 				stage=("real_predictions" if all_ready else "training_required"),
@@ -2147,13 +2490,25 @@ def step_coin(sym: str):
 			high_content = ' '.join(high_labeled)
 			last_bounds = _last_written_bounds.get(sym, {})
 			if last_bounds.get('low') != low_content or last_bounds.get('high') != high_content:
-				_atomic_write_text('low_bound_prices.dat', low_content)
-				_atomic_write_text('high_bound_prices.dat', high_content)
-				_last_written_bounds[sym] = {'low': low_content, 'high': high_content}
+				try:
+					# Use timeout-protected writes for critical trading data
+					_atomic_write_text_safe('low_bound_prices.dat', low_content, timeout=3.0)
+					_atomic_write_text_safe('high_bound_prices.dat', high_content, timeout=3.0)
+					_last_written_bounds[sym] = {'low': low_content, 'high': high_content}
+				except FileOperationTimeout as e:
+					debug_print(f"[ERROR] THINKER: Timeout writing price bounds for {sym}: {e}")
+					# Don't update cache so we retry next cycle
+				except Exception as e:
+					debug_print(f"[ERROR] THINKER: Failed writing price bounds for {sym}: {e}")
 
 			# Write prediction candles for Hub chart visualization
 			if prediction_candles:
-				_atomic_write_json('prediction_candles.json', prediction_candles)
+				try:
+					_atomic_write_json_safe('prediction_candles.json', prediction_candles, timeout=3.0)
+				except FileOperationTimeout as e:
+					debug_print(f"[ERROR] THINKER: Timeout writing prediction candles for {sym}: {e}")
+				except Exception as e:
+					debug_print(f"[ERROR] THINKER: Failed writing prediction candles for {sym}: {e}")
 			
 			# Save prediction candles back to state and reset for next cycle
 			st['prediction_candles'] = {}
@@ -2321,7 +2676,7 @@ def step_coin(sym: str):
 				else:
 					_ready_coins.discard(sym)
 
-				all_ready = len(_ready_coins) >= len(COIN_SYMBOLS)
+				all_ready = len(_ready_coins) > 0  # At least one coin trained
 				_write_runner_ready(
 					all_ready,
 					stage=("real_predictions" if all_ready else "warming_up"),
@@ -2349,8 +2704,14 @@ def step_coin(sym: str):
 				except Exception:
 					pm = MIN_PROFIT_MARGIN
 
-				_atomic_write_text('futures_long_profit_margin.dat', str(pm))
-				_atomic_write_text('long_dca_signal.dat', str(longs))
+				# Use timeout-protected writes for critical trading signals
+				try:
+					_atomic_write_text_safe('futures_long_profit_margin.dat', str(pm), timeout=3.0)
+					_atomic_write_text_safe('long_dca_signal.dat', str(longs), timeout=3.0)
+				except FileOperationTimeout as e:
+					debug_print(f"[ERROR] THINKER: Timeout writing long signals for {sym}: {e}")
+				except Exception as e:
+					debug_print(f"[ERROR] THINKER: Failed writing long signals for {sym}: {e}")
 
 				# short pm
 				current_pms = [m for m in margins if m != 0]
@@ -2364,8 +2725,14 @@ def step_coin(sym: str):
 				except Exception:
 					pm = MIN_PROFIT_MARGIN
 
-				_atomic_write_text('futures_short_profit_margin.dat', str(abs(pm)))
-				_atomic_write_text('short_dca_signal.dat', str(shorts))
+				# Use timeout-protected writes for critical trading signals
+				try:
+					_atomic_write_text_safe('futures_short_profit_margin.dat', str(abs(pm)), timeout=3.0)
+					_atomic_write_text_safe('short_dca_signal.dat', str(shorts), timeout=3.0)
+				except FileOperationTimeout as e:
+					debug_print(f"[ERROR] THINKER: Timeout writing short signals for {sym}: {e}")
+				except Exception as e:
+					debug_print(f"[ERROR] THINKER: Failed writing short signals for {sym}: {e}")
 				
 				# Write inactive count for visual indication in hub
 				_atomic_write_text('inactive_count.dat', str(inactives))
@@ -2440,7 +2807,7 @@ _startup_message_shown = False
 _first_run = True
 _last_training_warning_time = 0.0  # Throttle training warnings to once per 60 seconds
 
-print("Starting main loop...\n", flush=True)
+print("Starting main loop...", flush=True)
 
 try:
 	while True:
@@ -2479,7 +2846,7 @@ try:
 		time_since_last_warning = current_time - _last_training_warning_time
 		
 		if training_warnings and time_since_last_warning >= 60.0:
-			print("⚠ WARNING: INCOMPLETE TRAINING DETECTED", flush=True)
+			print("\nWARNING: INCOMPLETE TRAINING DETECTED", flush=True)
 			for warning in training_warnings:
 				print(f"  {warning}", flush=True)
 			print(f"Required timeframes: {', '.join(REQUIRED_THINKER_TIMEFRAMES)}", flush=True)
@@ -2533,7 +2900,7 @@ try:
 			if valid_summaries:
 				print("", flush=True)
 				current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-				print(f"=== Thinking Summary {current_time} ===", flush=True)
+				print(f"--- Thinking Summary {current_time} ---", flush=True)
 				for _sym in coins_this_iteration:
 					summary = summary_cache.get(_sym)
 					if summary and 'price_str' in summary:
